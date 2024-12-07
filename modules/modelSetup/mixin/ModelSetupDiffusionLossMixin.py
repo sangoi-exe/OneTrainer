@@ -207,6 +207,59 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             snr += 1.0
         snr_weight = (min_snr_gamma / snr).to(device)
         return snr_weight
+    
+    """
+    This is where the __min_snr_weight function was originally, but because I didn't use it, 
+    I replaced it with my custom loss function, for laziness and convenience. But if you know 
+    what you're doing, you can put it in any other place, or even modify the OT code enough 
+    to add the function and activate it through the UI.
+    """
+
+    def __sangoi_loss_modifier(self, timesteps: Tensor, predicted: Tensor, target: Tensor, gamma: float, device: torch.device) -> Tensor:
+        """
+        Source: https://github.com/sangoi-exe/sangoi-loss-function
+
+        Computes a loss modifier based on the Mean Absolute Percentage Error (MAPE) and the Signal-to-Noise Ratio (SNR).
+        This modifier adjusts the loss according to the prediction accuracy and the difficulty of the prediction task.
+
+        Args:
+            timesteps (Tensor): The current training step's timesteps.
+            predicted (Tensor): Predicted values from the neural network.
+            target (Tensor): Ground truth target values.
+            gamma (float): A scaling factor (unused in this function).
+            device (torch.device): The device on which tensors are allocated.
+
+        Returns:
+            Tensor: A tensor of weights per example to modify the loss.
+        """
+
+        # Define minimum and maximum SNR values to clamp extreme values
+        #min_snr = 1e-4
+        #max_snr = 100
+
+        # Obtain the SNR for each timestep
+        snr = self.__snr(timesteps, device)
+        # Clamp the SNR values to the defined range to avoid extreme values
+        #snr = torch.clamp(snr, min=min_snr, max=max_snr)
+
+        # Define a small epsilon to prevent division by zero
+        epsilon = 1e-8
+        # Compute the Mean Absolute Percentage Error (MAPE)
+        mape = torch.abs((target - predicted) / (target + epsilon))
+        # Normalize MAPE values between 0 and 1
+        mape = torch.clamp(mape, min=0, max=1)
+        # Calculate the average MAPE per example across spatial dimensions
+        mape = mape.mean(dim=[1, 2, 3])
+
+        # Compute the SNR weight using the natural logarithm (adding 1 to avoid log(0))
+        snr_weight = torch.log(snr + 1)
+        # Invert MAPE to represent accuracy instead of error
+        mape_reward = 1 - mape
+        # Calculate the combined weight using the negative exponential of the product of MAPE reward and SNR weight
+        combined_weight = torch.exp(-mape_reward * snr_weight)
+
+        # Return the tensor of weights per example to modify the loss
+        return combined_weight
 
     def __debiased_estimation_weight(
         self,
@@ -286,7 +339,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             v_pred = data.get('prediction_type', '') == 'v_prediction'
             match config.loss_weight_fn:
                 case LossWeight.MIN_SNR_GAMMA:
-                    losses *= self.__min_snr_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
+                    losses *= self.__sangoi_loss_modifier(
+                        data["timestep"], data["predicted"], data["target"], config.loss_weight_strength, losses.device                    )
                 case LossWeight.DEBIASED_ESTIMATION:
                     losses *= self.__debiased_estimation_weight(data['timestep'], v_pred, losses.device)
                 case LossWeight.P2:
