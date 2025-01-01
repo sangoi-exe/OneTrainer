@@ -2,8 +2,10 @@ import json
 import os
 import traceback
 from collections.abc import Callable
+from contextlib import suppress
 
 from modules.util import path_util
+from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -154,10 +156,23 @@ class TopBar:
     def __save_to_file(self, name) -> str:
         name = path_util.safe_filename(name)
         path = path_util.canonical_join("training_presets", f"{name}.json")
+
+        config_dict = self.train_config.to_dict()
+        if 'secrets' in config_dict:
+            config_dict.pop('secrets')
+
         with open(path, "w") as f:
-            json.dump(self.train_config.to_dict(), f, indent=4)
+            json.dump(config_dict, f, indent=4)
 
         return path
+
+    def __save_secrets(self, path) -> str:
+        with open(path, "w") as f:
+            json.dump(self.train_config.secrets.to_dict(), f, indent=4)
+        return path
+
+    def open_wiki(self):
+        webbrowser.open("https://github.com/Nerogar/OneTrainer/wiki", new=0, autoraise=False)
 
     def __save_new_config(self, name):
         path = self.__save_to_file(name)
@@ -201,6 +216,10 @@ class TopBar:
                     loaded_dict["__version"] = default_config.config_version
                 loaded_config = default_config.from_dict(loaded_dict).to_unpacked_config()
 
+            with suppress(FileNotFoundError), open("secrets.json", "r") as f:
+                secrets_dict=json.load(f)
+                loaded_config.secrets = SecretsConfig.default_values().from_dict(secrets_dict)
+
             self.train_config.from_dict(loaded_config.to_dict())
             self.ui_state.update(loaded_config)
 
@@ -219,3 +238,4 @@ class TopBar:
 
     def save_default(self):
         self.__save_to_file("#")
+        self.__save_secrets("secrets.json")
