@@ -98,6 +98,7 @@ from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer.adafactor_extensions import patch_adafactor
 from modules.util.optimizer.adam_extensions import patch_adam
 from modules.util.optimizer.adamw_extensions import patch_adamw
+from modules.util.optimizer.prodigy_extensions import patch_prodigy
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -830,6 +831,8 @@ def create_optimizer(
                 growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else float('inf'),
                 fsdp_in_use=optimizer_config.fsdp_in_use if optimizer_config.fsdp_in_use is not None else False,
             )
+            if optimizer_config.stochastic_rounding:
+                patch_prodigy(optimizer, optimizer_config.stochastic_rounding)
 
         # ADAFactor Optimizer
         case Optimizer.ADAFACTOR:

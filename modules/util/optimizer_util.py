@@ -259,6 +259,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "d0": 1e-6,
         "d_coef": 1.0,
         "growth_rate": float('inf'),
+        "stochastic_rounding": False,
         "fsdp_in_use": False,
     },
     Optimizer.DADAPT_ADA_GRAD: {

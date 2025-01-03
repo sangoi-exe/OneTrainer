@@ -68,6 +68,7 @@ class GenericTrainer(BaseTrainer):
         self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, get_string_timestamp()))
         if config.tensorboard:
             tensorboard_executable = os.path.join(os.path.dirname(sys.executable), "tensorboard")
+            print("abluble", tensorboard_executable)
 
             tensorboard_args = [
                 tensorboard_executable,
@@ -82,6 +83,7 @@ class GenericTrainer(BaseTrainer):
                 tensorboard_args.append("--bind_all")
 
             self.tensorboard_subprocess = subprocess.Popen(tensorboard_args)
+            print("abluble", self.tensorboard_subprocess)
 
         self.model = None
         self.one_step_trained = False
@@ -675,7 +677,7 @@ class GenericTrainer(BaseTrainer):
                 with TorchMemoryRecorder(enabled=False):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress)
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
