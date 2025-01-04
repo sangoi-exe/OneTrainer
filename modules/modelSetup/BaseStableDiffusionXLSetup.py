@@ -21,6 +21,7 @@ from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 from torch import Tensor
@@ -544,13 +545,15 @@ class BaseStableDiffusionXLSetup(
             batch: dict,
             data: dict,
             config: TrainConfig,
-            progress: TrainProgress
+            progress: TrainProgress,
+            tensorboard: SummaryWriter
     ) -> Tensor:
         return self._diffusion_losses(
             batch=batch,
             data=data,
             config=config,
             progress=progress,
+            tensorboard=tensorboard,
             train_device=self.train_device,
             betas=model.noise_scheduler.betas.to(device=self.train_device),
         ).mean()

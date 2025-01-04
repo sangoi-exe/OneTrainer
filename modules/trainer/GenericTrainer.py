@@ -677,7 +677,7 @@ class GenericTrainer(BaseTrainer):
                 with TorchMemoryRecorder(enabled=False):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress)
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
