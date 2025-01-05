@@ -12,6 +12,7 @@ from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.LossMode import LossMode
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.optimizer_util import change_optimizer
@@ -189,37 +190,42 @@ class TrainingTab:
         components.label(frame, 3, 0, "Learning Rate Warmup Steps",
                          tooltip="The number of steps it takes to gradually increase the learning rate from 0 to the specified learning rate. Values >1 are interpeted as a fixed number of steps, values <=1 are intepreted as a percentage of the total training steps (ex. 0.2 = 20% of the total step count)")
         components.entry(frame, 3, 1, self.ui_state, "learning_rate_warmup_steps")
+        
+        # learning rate min factor
+        components.label(frame, 4, 0, "Learning Rate Min Factor",
+                         tooltip="Unit = float. Method = percentage. For a factor of 0.1, the final LR will be 10% of the initial LR. If the initial LR is 1e-4, the final LR will be 1e-5.")
+        components.entry(frame, 4, 1, self.ui_state, "learning_rate_min_factor")
 
         # learning rate cycles
-        components.label(frame, 4, 0, "Learning Rate Cycles",
+        components.label(frame, 5, 0, "Learning Rate Cycles",
                          tooltip="The number of learning rate cycles. This is only applicable if the learning rate scheduler supports cycles")
-        components.entry(frame, 4, 1, self.ui_state, "learning_rate_cycles")
+        components.entry(frame, 5, 1, self.ui_state, "learning_rate_cycles")
 
         # epochs
-        components.label(frame, 5, 0, "Epochs",
+        components.label(frame, 6, 0, "Epochs",
                          tooltip="The number of epochs for a full training run")
-        components.entry(frame, 5, 1, self.ui_state, "epochs")
+        components.entry(frame, 6, 1, self.ui_state, "epochs")
 
         # batch size
-        components.label(frame, 6, 0, "Batch Size",
+        components.label(frame, 7, 0, "Batch Size",
                          tooltip="The batch size of one training step")
-        components.entry(frame, 6, 1, self.ui_state, "batch_size")
+        components.entry(frame, 7, 1, self.ui_state, "batch_size")
 
         # accumulation steps
-        components.label(frame, 7, 0, "Accumulation Steps",
+        components.label(frame, 8, 0, "Accumulation Steps",
                          tooltip="Number of accumulation steps. Increase this number to trade batch size for training speed")
-        components.entry(frame, 7, 1, self.ui_state, "gradient_accumulation_steps")
+        components.entry(frame, 8, 1, self.ui_state, "gradient_accumulation_steps")
 
         # Learning Rate Scaler
-        components.label(frame, 8, 0, "Learning Rate Scaler",
+        components.label(frame, 9, 0, "Learning Rate Scaler",
                          tooltip="Selects the type of learning rate scaling to use during training. Functionally equated as: LR * SQRT(selection)")
-        components.options(frame, 8, 1, [str(x) for x in list(LearningRateScaler)], self.ui_state,
+        components.options(frame, 9, 1, [str(x) for x in list(LearningRateScaler)], self.ui_state,
                            "learning_rate_scaler")
 
         # clip grad norm
-        components.label(frame, 9, 0, "Clip Grad Norm",
+        components.label(frame, 10, 0, "Clip Grad Norm",
                          tooltip="Clips the gradient norm. Leave empty to disable gradient clipping.")
-        components.entry(frame, 9, 1, self.ui_state, "clip_grad_norm")
+        components.entry(frame, 10, 1, self.ui_state, "clip_grad_norm")
 
     def __create_base2_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
@@ -680,41 +686,46 @@ class TrainingTab:
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
         frame.grid_columnconfigure(0, weight=1)
 
+        # Loss Mode function
+        components.label(frame, 0, 0, "Loss Mode",
+                         tooltip="Choice of loss mode function. Can help the model learn details more accurately.")
+        components.options(frame, 0, 1, [str(x) for x in list(LossMode)], self.ui_state, "loss_mode_fn")
+
         # MSE Strength
-        components.label(frame, 0, 0, "MSE Strength",
+        components.label(frame, 1, 0, "MSE Strength",
                          tooltip="Mean Squared Error strength for custom loss settings. MAE + MSE Strengths generally should sum to 1.")
-        components.entry(frame, 0, 1, self.ui_state, "mse_strength")
+        components.entry(frame, 1, 1, self.ui_state, "mse_strength")
 
         # MAE Strength
-        components.label(frame, 1, 0, "MAE Strength",
+        components.label(frame, 2, 0, "MAE Strength",
                          tooltip="Mean Absolute Error strength for custom loss settings. MAE + MSE Strengths generally should sum to 1.")
-        components.entry(frame, 1, 1, self.ui_state, "mae_strength")
+        components.entry(frame, 2, 1, self.ui_state, "mae_strength")
 
         # log-cosh Strength
-        components.label(frame, 2, 0, "log-cosh Strength",
+        components.label(frame, 3, 0, "log-cosh Strength",
                          tooltip="Log - Hyperbolic cosine Error strength for custom loss settings.")
-        components.entry(frame, 2, 1, self.ui_state, "log_cosh_strength")
+        components.entry(frame, 3, 1, self.ui_state, "log_cosh_strength")
 
         if supports_vb_loss:
             # VB Strength
-            components.label(frame, 3, 0, "VB Strength",
+            components.label(frame, 4, 0, "VB Strength",
                              tooltip="Variational lower-bound strength for custom loss settings. Should be set to 1 for variational diffusion models")
-            components.entry(frame, 3, 1, self.ui_state, "vb_loss_strength")
+            components.entry(frame, 4, 1, self.ui_state, "vb_loss_strength")
 
         # Loss Weight function
-        components.label(frame, 4, 0, "Loss Weight Function",
+        components.label(frame, 5, 0, "Loss Weight Function",
                          tooltip="Choice of loss weight function. Can help the model learn details more accurately.")
-        components.options(frame, 4, 1, [str(x) for x in list(LossWeight)], self.ui_state, "loss_weight_fn")
+        components.options(frame, 5, 1, [str(x) for x in list(LossWeight)], self.ui_state, "loss_weight_fn")
 
         # Loss weight strength
-        components.label(frame, 5, 0, "Gamma",
+        components.label(frame, 6, 0, "Gamma",
                          tooltip="Inverse strength of loss weighting. Range: 1-20, only applies to Min SNR and P2.")
-        components.entry(frame, 5, 1, self.ui_state, "loss_weight_strength")
+        components.entry(frame, 6, 1, self.ui_state, "loss_weight_strength")
 
         # Loss Scaler
-        components.label(frame, 6, 0, "Loss Scaler",
+        components.label(frame, 7, 0, "Loss Scaler",
                          tooltip="Selects the type of loss scaling to use during training. Functionally equated as: Loss * selection")
-        components.options(frame, 6, 1, [str(x) for x in list(LossScaler)], self.ui_state, "loss_scaler")
+        components.options(frame, 7, 1, [str(x) for x in list(LossScaler)], self.ui_state, "loss_scaler")
 
     def __open_optimizer_params_window(self):
         window = OptimizerParamsWindow(self.master, self.train_config, self.ui_state)

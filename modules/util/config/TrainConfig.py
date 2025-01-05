@@ -18,6 +18,7 @@ from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.LossMode import LossMode
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
@@ -270,6 +271,7 @@ class TrainConfig(BaseConfig):
     learning_rate: float
     learning_rate_warmup_steps: float
     learning_rate_cycles: float
+    learning_rate_min_factor: float
     epochs: int
     batch_size: int
     gradient_accumulation_steps: int
@@ -292,6 +294,7 @@ class TrainConfig(BaseConfig):
     align_prop_steps: int
     align_prop_truncate_steps: float
     align_prop_cfg_scale: float
+    loss_mode_fn: LossMode
     mse_strength: float
     mae_strength: float
     log_cosh_strength: float
@@ -723,6 +726,7 @@ class TrainConfig(BaseConfig):
         data.append(("learning_rate", 3e-6, float, False))
         data.append(("learning_rate_warmup_steps", 200.0, float, False))
         data.append(("learning_rate_cycles", 1.0, float, False))
+        data.append(("learning_rate_min_factor", 1.0, float, False))
         data.append(("epochs", 100, int, False))
         data.append(("batch_size", 1, int, False))
         data.append(("gradient_accumulation_steps", 1, int, False))
@@ -745,6 +749,8 @@ class TrainConfig(BaseConfig):
         data.append(("align_prop_steps", 20, int, False))
         data.append(("align_prop_truncate_steps", 0.5, float, False))
         data.append(("align_prop_cfg_scale", 7.0, float, False))
+        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
+        data.append(("mse_strength", 1.0, float, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("log_cosh_strength", 0.0, float, False))

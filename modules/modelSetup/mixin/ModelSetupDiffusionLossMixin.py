@@ -33,19 +33,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		self.__sigmas = None
 		self.tensorboard = None
 		self.progress = None
+		self.config = None
 		self.loss_tracker = LossTracker(window_size=100, use_mad=False)
-		# Dynamic loss weighting
-		self.dynamic_loss_strengthing = DynamicLossStrength(
-			use_ema=False,
-			ema_decay=0.9,
-			outlier_threshold=3.0,
-			mae_start=0.6,
-			mae_end=0.2,
-			mse_start=0.2,
-			mse_end=0.6,
-			log_start=0.2,
-			log_end=0.2,
-		)
+		self.dynamic_loss_strengthing = DynamicLossStrength()
 
 	def __align_prop_losses(
 		self,
@@ -106,7 +96,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
 
 		# MSE/L2 Loss
-		if config.mse_strength != 0:
+		if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
 			mse_loss = masked_losses(
 				losses=F.mse_loss(
 					data["predicted"].to(dtype=torch.float32),
@@ -119,7 +109,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			).mean([1, 2, 3])
 
 		# MAE/L1 Loss
-		if config.mae_strength != 0:
+		if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
 			mae_loss = masked_losses(
 				losses=F.l1_loss(
 					data["predicted"].to(dtype=torch.float32),
@@ -132,7 +122,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			).mean([1, 2, 3])
 
 		# log-cosh Loss
-		if config.log_cosh_strength != 0:
+		if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
 			log_cosh_loss = masked_losses(
 				losses=self.__log_cosh_loss(
 					data["predicted"].to(dtype=torch.float32),
@@ -142,60 +132,60 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 				unmasked_weight=config.unmasked_weight,
 				normalize_masked_area_loss=config.normalize_masked_area_loss,
 			).mean([1, 2, 3])
-		
-		# Update LossTracker
-		self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
 
-		# Compute z-scores
-		mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
-			mse_loss, mae_loss, log_cosh_loss
-		)
+		match config.loss_mode_fn:
+			case config.loss_mode_fn.ORIGINAL:
+				losses = (
+					mse_loss * config.mse_strength +
+					mae_loss * config.mae_strength +
+					log_cosh_loss * config.log_cosh_strength
+				)
 
-		# Ajusta pesos dinamicamente + scheduler de prioridades
-		mse_weight, mae_weight, log_cosh_weight = (
-			self.dynamic_loss_strengthing.adjust_weights(
-				mse_z, mae_z, log_cosh_z, config, progress
-			)
-		)
+				# VB loss
+				if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
+					losses += masked_losses(
+						losses=vb_losses(
+							coefficients=self.__coefficients,
+							x_0=data['scaled_latent_image'].to(dtype=torch.float32),
+							x_t=data['noisy_latent_image'].to(dtype=torch.float32),
+							t=data['timestep'],
+							predicted_eps=data['predicted'].to(dtype=torch.float32),
+							predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
+						),
+						mask=batch['latent_mask'].to(dtype=torch.float32),
+						unmasked_weight=config.unmasked_weight,
+						normalize_masked_area_loss=config.normalize_masked_area_loss,
+					).mean([1, 2, 3]) * config.vb_loss_strength			
 
-		if self.tensorboard != None:
-			self.tensorboard.add_scalar(
-				"sangoi/7mse",
-				mse_weight,
-				progress.global_step,
-			)
-			self.tensorboard.add_scalar(
-				"sangoi/8mae",
-				mae_weight,
-				progress.global_step,
-			)
-			self.tensorboard.add_scalar(
-				"sangoi/9log_cosh",
-				log_cosh_weight,
-				progress.global_step,
-			)
+			case config.loss_mode_fn.SANGOI:
+				# Update LossTracker
+				self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
 
-		losses = (
-			mse_loss * mse_weight * config.mse_strength
-			+ mae_loss * mae_weight * config.mae_strength
-			+ log_cosh_loss * log_cosh_weight * config.log_cosh_strength
-		)
+				# Compute z-scores
+				mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
 
-		# VB loss
-		if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
-			losses += masked_losses(
-				losses=vb_losses(
-					coefficients=self.__coefficients,
-					x_0=data['scaled_latent_image'].to(dtype=torch.float32),
-					x_t=data['noisy_latent_image'].to(dtype=torch.float32),
-					t=data['timestep'],
-					predicted_eps=data['predicted'].to(dtype=torch.float32),
-					predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
-				),
-				mask=batch['latent_mask'].to(dtype=torch.float32),
-				unmasked_weight=config.unmasked_weight,
-				normalize_masked_area_loss=config.normalize_masked_area_loss,
-			).mean([1, 2, 3]) * config.vb_loss_strength
+				# Ajusta pesos dinamicamente + scheduler de prioridades
+				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
+					mse_z, mae_z, log_cosh_z, config, progress
+				)
+				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
+
+				if self.tensorboard != None:
+					self.tensorboard.add_scalar(
+						"sangoi/7mse",
+						mse_weight,
+						progress.global_step,
+					)
+					self.tensorboard.add_scalar(
+						"sangoi/8mae",
+						mae_weight,
+						progress.global_step,
+					)
+					self.tensorboard.add_scalar(
+						"sangoi/9log_cosh",
+						log_cosh_weight,
+						progress.global_step,
+					)
 
 		return losses
 
@@ -214,7 +204,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
 
 		# MSE/L2 Loss
-		if config.mse_strength != 0:
+		if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
 			mse_loss = F.mse_loss(
 				data["predicted"].to(dtype=torch.float32),
 				data["target"].to(dtype=torch.float32),
@@ -222,7 +212,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			).mean([1, 2, 3])
 
 		# MAE/L1 Loss
-		if config.mae_strength != 0:
+		if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
 			mae_loss = F.l1_loss(
 				data["predicted"].to(dtype=torch.float32),
 				data["target"].to(dtype=torch.float32),
@@ -230,50 +220,65 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			).mean([1, 2, 3])
 
 		# log-cosh Loss
-		if config.log_cosh_strength != 0:
+		if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
 			log_cosh_loss = self.__log_cosh_loss(
 				data["predicted"].to(dtype=torch.float32),
 				data["target"].to(dtype=torch.float32),
 			).mean([1, 2, 3])
 		
-		# Update LossTracker
-		self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
+		match config.loss_mode_fn:
+			case config.loss_mode_fn.ORIGINAL:
+				losses = (
+					mse_loss * config.mse_strength +
+					mae_loss * config.mae_strength +
+					log_cosh_loss * config.log_cosh_strength
+				)
 
-		# Compute z-scores
-		mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
-			mse_loss, mae_loss, log_cosh_loss
-		)
+				# VB loss
+				if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
+					losses += masked_losses(
+						losses=vb_losses(
+							coefficients=self.__coefficients,
+							x_0=data['scaled_latent_image'].to(dtype=torch.float32),
+							x_t=data['noisy_latent_image'].to(dtype=torch.float32),
+							t=data['timestep'],
+							predicted_eps=data['predicted'].to(dtype=torch.float32),
+							predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
+						),
+						mask=batch['latent_mask'].to(dtype=torch.float32),
+						unmasked_weight=config.unmasked_weight,
+						normalize_masked_area_loss=config.normalize_masked_area_loss,
+					).mean([1, 2, 3]) * config.vb_loss_strength			
 
-		# Ajusta pesos dinamicamente + scheduler de prioridades
-		mse_weight, mae_weight, log_cosh_weight = (
-			self.dynamic_loss_strengthing.adjust_weights(
-				mse_z, mae_z, log_cosh_z, config, progress
-			)
-		)
+			case config.loss_mode_fn.SANGOI:
+				# Update LossTracker
+				self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
 
-		# Aplica os strengths do config DEPOIS de multiplicar pelos pesos
-		losses = (
-			mse_loss * mse_weight * config.mse_strength
-			+ mae_loss * mae_weight * config.mae_strength
-			+ log_cosh_loss * log_cosh_weight * config.log_cosh_strength
-		)
+				# Compute z-scores
+				mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
 
-		# VB loss
-		if config.vb_loss_strength != 0 and "predicted_var_values" in data:
-			vb_loss = (
-				vb_losses(
-					coefficients=self.__coefficients,
-					x_0=data["scaled_latent_image"].to(dtype=torch.float32),
-					x_t=data["noisy_latent_image"].to(dtype=torch.float32),
-					t=data["timestep"],
-					predicted_eps=data["predicted"].to(dtype=torch.float32),
-					predicted_var_values=data["predicted_var_values"].to(
-						dtype=torch.float32
-					),
-				).mean([1, 2, 3])
-				* config.vb_loss_strength
-			)
-			losses += vb_loss
+				# Ajusta pesos dinamicamente + scheduler de prioridades
+				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
+					mse_z, mae_z, log_cosh_z, config, progress
+				)
+				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
+
+				if self.tensorboard != None:
+					self.tensorboard.add_scalar(
+						"sangoi/7mse",
+						mse_weight,
+						progress.global_step,
+					)
+					self.tensorboard.add_scalar(
+						"sangoi/8mae",
+						mae_weight,
+						progress.global_step,
+					)
+					self.tensorboard.add_scalar(
+						"sangoi/9log_cosh",
+						log_cosh_weight,
+						progress.global_step,
+					)
 		
 		if config.masked_training and config.normalize_masked_area_loss:
 			clamped_mask = torch.clamp(batch["latent_mask"], config.unmasked_weight, 1)
@@ -356,26 +361,70 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
 		self.tensorboard = tensorboard
 		progress = self.progress
+		config = self.config
 
-		# 1) Cálculo base do combined_weight (sem clamp de gamma nem de 1):
-		snr = self.__snr(timesteps, device)
+		# 1) Cálculo do snr "padrão"
+		snr = self.__snr(timesteps, device)        # (batch, ...)
 		epsilon = 1e-8
 
+		# 2) Cálculo do MAPE (já presente)
 		mape = torch.abs((target - predicted) / (target + epsilon))
 		mape = torch.clamp(mape, min=0, max=1).mean(dim=[1, 2, 3])
 
-		snr_weight = torch.log(snr + 1)
+		# -----------------------------------------------------------------------
+		# CÁLCULO DO FATOR DE PROGRESSO
+		# -----------------------------------------------------------------------
+		# Se total_epochs = N, progress.epoch vai de 0 até N-1 (ou 1 até N, depende do trainer).
+		# Ajuste conforme o comportamento real do seu `progress.epoch`.
+		total_epochs = config.epochs
+		current_epoch = progress.epoch  # verifique se vai de 0 a N-1 ou 1 a N
+		# Fazemos um clamp para evitar divisões por zero em caso de 1 época só:
+		if total_epochs <= 1:
+			alpha = 1.0
+		else:
+			alpha = current_epoch / float(total_epochs - 1)  # varia de 0 até 1
+
+		# -----------------------------------------------------------------------
+		# CRIANDO DOIS "EXTREMOS" DE PESO PARA O SNR
+		# -----------------------------------------------------------------------
+		# A ideia é que no início do treino (alpha ~ 0),
+		# queremos enfatizar cenários de SNR baixo como "mais difíceis".
+		# No fim do treino (alpha ~ 1), enfatizamos cenários de SNR alto como "mais difíceis".
+		#
+		# Aqui vai um exemplo de forma de interpolar:
+		# snr_weight_low_first  => enfatiza SNR BAIXO como "mais difícil"
+		# snr_weight_high_first => enfatiza SNR ALTO  como "mais difícil"
+		#
+		# Você pode escolher a fórmula que fizer mais sentido para o seu caso.
+		#
+		# Exemplo de uma forma simples:
+		#  - Se snr estiver alto, snr_weight_low_first deve ser PEQUENO.
+		#  - Se snr estiver baixo, snr_weight_low_first deve ser MAIOR.
+		#
+		# Uma abordagem é usar: snr_weight_low_first = log(1 + 1/(snr+eps)),
+		# pois, para snr grande, 1/(snr+eps) ≈ 0, resultando em log(1)≈0 (cenário "fácil").
+		# E para snr pequeno, 1/(snr+eps) é grande, resultando em log(...) maior (cenário "difícil").
+		#
+		# Por outro lado, snr_weight_high_first = log(1 + snr)
+		# faz o contrário: para snr grande, o log é grande; para snr pequeno, o log é pequeno.
+		#
+		# Depois, interpolamos linearmente entre esses dois extremos pelo fator alpha.
+
+		snr_weight_low_first = torch.log(1.0 + 1.0 / (snr + epsilon))  # enfatiza SNR baixo
+		snr_weight_high_first = torch.log(snr + 1.0)                   # enfatiza SNR alto
+
+		# Interpolação linear:
+		# alpha=0 => weight = snr_weight_low_first
+		# alpha=1 => weight = snr_weight_high_first
+		scenario_snr_weight = (1.0 - alpha) * snr_weight_low_first + alpha * snr_weight_high_first
 		mape_reward = 1 - mape
-		raw_reward = torch.exp(-mape_reward * snr_weight)
+		raw_reward = torch.exp(-mape_reward * scenario_snr_weight)
 		# Ex: pode dar valores na casa de 0.08, 0.2, 1.1, etc.
 
-		# 2) Clampar para [0, 1].
-		#    - Se ficar acima de 1, virará 1 (sem redução de loss).
-		#    - Se ficar abaixo de 0, virará 0 (caso improvável, mas é segurança).
+		# 2) Clampar para [0, 1]
 		clamped_reward = torch.clamp(raw_reward, min=0.0, max=1.0)
 
-		# 3) Reescalar [0,1] para [gamma,1].
-		#    Se gamma=0.5, então 0 -> 0.5, 1 -> 1, 0.2 -> 0.6, etc.
+		# 3) Reescalar [0,1] para [gamma,1]
 		reward = gamma + (1.0 - gamma) * clamped_reward
 
 		# Logging no TensorBoard
@@ -383,18 +432,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			"sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step
 		)
 		tensorboard.add_scalar(
-			"sangoi/2raw_reward",
-			raw_reward.mean().item(),
-			progress.global_step,
+			"sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step
 		)
 		tensorboard.add_scalar(
-			"sangoi/3clamped_reward",
-			clamped_reward.mean().item(),
-			progress.global_step,
+			"sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step
 		)
 		tensorboard.add_scalar(
-			"sangoi/4reward",
-			reward.mean().item(),
+			"sangoi/4reward", reward.mean().item(), progress.global_step
+		)
+		tensorboard.add_scalar(
+			"sangoi/alpha", alpha, progress.global_step
+		)
+		tensorboard.add_scalar(
+			"sangoi/scenario_snr_weight_mean",
+			scenario_snr_weight.mean().item(),
 			progress.global_step,
 		)
 
@@ -413,6 +464,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 	) -> Tensor:
 		
 		self.progress = progress
+		self.config = config
 		
 		loss_weight = batch["loss_weight"]
 
