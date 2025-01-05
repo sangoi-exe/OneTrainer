@@ -1,3 +1,6 @@
+> [!IMPORTANT] 
+> This repository is a fork. Here I create, implement, and test my ideas. If something makes sense for the original repository, I submit a PR.
+
 # OneTrainer
 
 OneTrainer is a one-stop solution for all your stable diffusion training needs.
