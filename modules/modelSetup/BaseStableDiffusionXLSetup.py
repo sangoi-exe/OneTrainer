@@ -22,6 +22,7 @@ from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import LRScheduler
 
 import torch
 from torch import Tensor
@@ -544,16 +545,18 @@ class BaseStableDiffusionXLSetup(
             model: StableDiffusionXLModel,
             batch: dict,
             data: dict,
-            config: TrainConfig,
             progress: TrainProgress,
-            tensorboard: SummaryWriter
+            config: TrainConfig,
+            tensorboard: SummaryWriter,
+            epoch_length: float
     ) -> Tensor:
         return self._diffusion_losses(
             batch=batch,
             data=data,
-            config=config,
             progress=progress,
+            config=config,
             tensorboard=tensorboard,
+            epoch_length=epoch_length,
             train_device=self.train_device,
             betas=model.noise_scheduler.betas.to(device=self.train_device),
         ).mean()

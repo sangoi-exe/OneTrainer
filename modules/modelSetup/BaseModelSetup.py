@@ -73,7 +73,16 @@ class BaseModelSetup(
         pass
 
     @abstractmethod
-    def calculate_loss(self, model: BaseModel, batch: dict, data: dict, config: TrainConfig, progress: TrainProgress, tensorboard: SummaryWriter) -> Tensor:
+    def calculate_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        data: dict,
+        progress: TrainProgress,
+        config: TrainConfig,
+        tensorboard: SummaryWriter,
+        epoch_length: float
+    ) -> Tensor:
         pass
 
     @abstractmethod

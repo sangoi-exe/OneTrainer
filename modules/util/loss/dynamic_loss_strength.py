@@ -9,7 +9,7 @@ class LossTracker:
     Pode usar média/desvio ou mediana/MAD.
     """
 
-    def __init__(self, window_size=100, use_mad=False):
+    def __init__(self, window_size=100, use_mad=True):
         self.window_size = window_size
         self.use_mad = use_mad
 
@@ -18,43 +18,62 @@ class LossTracker:
         self.log_cosh_losses = deque(maxlen=window_size)
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor):
-        # Armazena o item() de cada perda
-        self.mse_losses.append(mse_loss.item())
-        self.mae_losses.append(mae_loss.item())
-        self.log_cosh_losses.append(log_cosh_loss.item())
+        self.mse_losses.append(mse_loss.detach())  # .detach() só para segurança
+        self.mae_losses.append(mae_loss.detach())
+        self.log_cosh_losses.append(log_cosh_loss.detach())
 
-    def compute_stats(self, values_list):
+    def compute_stats(self, values_tensor: Tensor):
         """
-        Se use_mad=False -> retorna (mean, std)
-        Se use_mad=True -> retorna (median, MAD)
+        Se self.use_mad=False -> retorna (mean, std)
+        Se self.use_mad=True  -> retorna (median, MAD)
         """
-        if len(values_list) < 2:
-            # Evita problemas no início do treino
-            return 0.0, 1e-8
+        # Se você quiser tratar cada 'batch element' separadamente, pode concatenar
+        # a deque num grande tensor. Ex.: torch.cat(list_of_tensors).
+        # Abaixo assumimos que cada loss na deque seja 0-D (scalar) ou shape [1].
+        # Caso contrário, você pode querer concatenar e flatten:
+        #
+        # values_tensor = torch.cat(list(self.mse_losses)).view(-1)
+        #
+        # e assim por diante.
 
-        arr = torch.tensor(values_list, dtype=torch.float32)
+        # Verifica se há pelo menos 2 itens
+        if values_tensor.numel() < 2:
+
+            return torch.tensor(0.0, device=values_tensor.device), torch.tensor(
+                1e-8, device=values_tensor.device
+            )  # Evita problemas no início do treino
+
         if not self.use_mad:
-            mean_val = arr.mean()
-            std_val = arr.std(unbiased=False)
-            return mean_val.item(), max(std_val.item(), 1e-8)
+            mean_val = values_tensor.mean()
+            std_val = values_tensor.std(unbiased=False)
+            std_val = torch.clamp(std_val, min=1e-8)  # evita zero
+            return mean_val, std_val
         else:
-            median_val = arr.median()
-            abs_dev = torch.abs(arr - median_val)
+            median_val = values_tensor.median()
+            abs_dev = torch.abs(values_tensor - median_val)
             mad_val = abs_dev.median()
-            return median_val.item(), max(mad_val.item(), 1e-8)
+            mad_val = torch.clamp(mad_val, min=1e-8)  # evita zero
+            return median_val, mad_val
 
     def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor):
         """
         Retorna (mse_z, mae_z, log_cosh_z) usando media+std ou mediana+MAD,
         dependendo de self.use_mad.
         """
-        mse_center, mse_scale = self.compute_stats(self.mse_losses)
-        mae_center, mae_scale = self.compute_stats(self.mae_losses)
-        log_cosh_center, log_cosh_scale = self.compute_stats(self.log_cosh_losses)
+        # Aqui, a deque armazena vários tensores (cada update).
+        # Precisamos converter numa única lista/tensor para computar estatísticas.
+        # Se cada item já for 0-D, podemos empilhar (stack). Se for shape [batch], concat.
+        mse_hist = torch.stack(list(self.mse_losses)).to(mse_loss.device)
+        mae_hist = torch.stack(list(self.mae_losses)).to(mae_loss.device)
+        log_hist = torch.stack(list(self.log_cosh_losses)).to(log_cosh_loss.device)
 
-        mse_z = (mse_loss.item() - mse_center) / mse_scale
-        mae_z = (mae_loss.item() - mae_center) / mae_scale
-        log_cosh_z = (log_cosh_loss.item() - log_cosh_center) / log_cosh_scale
+        mse_center, mse_scale = self.compute_stats(mse_hist)
+        mae_center, mae_scale = self.compute_stats(mae_hist)
+        log_cosh_center, log_cosh_scale = self.compute_stats(log_hist)
+
+        mse_z = (mse_loss - mse_center) / mse_scale
+        mae_z = (mae_loss - mae_center) / mae_scale
+        log_cosh_z = (log_cosh_loss - log_cosh_center) / log_cosh_scale
 
         return (mse_z, mae_z, log_cosh_z)
 
@@ -62,28 +81,13 @@ class LossTracker:
 class DynamicLossStrength:
     def __init__(
         self,
-        use_ema=False,
+        use_ema=True,
         ema_decay=0.9,
-        outlier_threshold=3.0,
-        # Caso queira já passar valores default para a schedule
-        mae_start=0.6,
-        mae_end=0.2,
-        mse_start=0.2,
-        mse_end=0.6,
-        log_start=0.2,
-        log_end=0.2,
+        outlier_threshold=2.0,
     ):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.outlier_threshold = outlier_threshold
-
-        # Guardar parâmetros de schedule
-        self.mae_start = mae_start
-        self.mae_end = mae_end
-        self.mse_start = mse_start
-        self.mse_end = mse_end
-        self.log_start = log_start
-        self.log_end = log_end
 
         # Estados para EMA
         self.mse_weight_ema = 1.0
@@ -91,92 +95,132 @@ class DynamicLossStrength:
         self.log_cosh_weight_ema = 1.0
         self.initialized = False
 
-    def adjust_weights(self, mse_z: float, mae_z: float, log_cosh_z: float, config, progress):
+    def adjust_weights(
+        self,
+        mse_z: torch.Tensor,
+        mae_z: torch.Tensor,
+        log_cosh_z: torch.Tensor,
+        config,
+        progress,
+        epoch_length,
+        loss_tracker: LossTracker = None,
+    ):
         """
         Retorna (mse_weight, mae_weight, log_cosh_weight).
         Aplica:
-        1) Clamping do z-score em outlier_threshold
+        1) Clamping do z-score em outlier_threshold (elementwise se tiver shape)
         2) Inverse z-scores
         3) Normalização
         4) (Opcional) EMA
         5) Scheduler (prioridade ao MAE no início e MSE no final)
         """
 
-        # 1) Clamping
-        z_mse = min(abs(mse_z), self.outlier_threshold)
-        z_mae = min(abs(mae_z), self.outlier_threshold)
-        z_log = min(abs(log_cosh_z), self.outlier_threshold)
+        # 1) Clamping elementwise (se mse_z for multi-element)
+        # Se for apenas 1 valor (0-D), clamp() ainda funciona do mesmo jeito.
+        z_mse = torch.clamp(mse_z.abs(), max=self.outlier_threshold)
+        z_mae = torch.clamp(mae_z.abs(), max=self.outlier_threshold)
+        z_log = torch.clamp(log_cosh_z.abs(), max=self.outlier_threshold)
 
+        # Se z_mse for um escalar 0-D, 'z_mse + z_mae + z_log' também será 0-D.
         total_z = z_mse + z_mae + z_log
-        if total_z < 1e-8:
-            total_z = 1.0
+        total_z = torch.clamp(total_z, min=1e-8)
 
         # 2) inverse z-scores
         inv_mse = (total_z - z_mse) / total_z
         inv_mae = (total_z - z_mae) / total_z
         inv_log = (total_z - z_log) / total_z
 
+        # soma dos inversos
         sum_inv = inv_mse + inv_mae + inv_log
-        if sum_inv < 1e-8:
-            sum_inv = 1.0
+        sum_inv = torch.clamp(sum_inv, min=1e-8)
 
-        # pesos normalizados baseados em z-score
+        # pesos normalizados
         mse_weight = inv_mse / sum_inv
         mae_weight = inv_mae / sum_inv
         log_cosh_weight = inv_log / sum_inv
 
         # 3) EMA (se habilitado)
         if self.use_ema:
+            # Precisamos converter para float se for 0-D
+            mse_val = mse_weight.item() if mse_weight.numel() == 1 else float(mse_weight.mean())
+            mae_val = mae_weight.item() if mae_weight.numel() == 1 else float(mae_weight.mean())
+            log_val = log_cosh_weight.item() if log_cosh_weight.numel() == 1 else float(log_cosh_weight.mean())
+
             if not self.initialized:
-                # primeira chamada
-                self.mse_weight_ema = mse_weight
-                self.mae_weight_ema = mae_weight
-                self.log_cosh_weight_ema = log_cosh_weight
+                self.mse_weight_ema = mse_val
+                self.mae_weight_ema = mae_val
+                self.log_cosh_weight_ema = log_val
                 self.initialized = True
             else:
                 alpha = 1.0 - self.ema_decay
-                self.mse_weight_ema = (1 - alpha) * self.mse_weight_ema + alpha * mse_weight
-                self.mae_weight_ema = (1 - alpha) * self.mae_weight_ema + alpha * mae_weight
-                self.log_cosh_weight_ema = (1 - alpha) * self.log_cosh_weight_ema + alpha * log_cosh_weight
+                self.mse_weight_ema = (1 - alpha) * self.mse_weight_ema + alpha * mse_val
+                self.mae_weight_ema = (1 - alpha) * self.mae_weight_ema + alpha * mae_val
+                self.log_cosh_weight_ema = (1 - alpha) * self.log_cosh_weight_ema + alpha * log_val
 
             # Normaliza a soma do EMA
             sum_ema = self.mse_weight_ema + self.mae_weight_ema + self.log_cosh_weight_ema
             if sum_ema < 1e-8:
                 sum_ema = 1.0
+
             self.mse_weight_ema /= sum_ema
             self.mae_weight_ema /= sum_ema
             self.log_cosh_weight_ema /= sum_ema
 
-            mse_weight = self.mse_weight_ema
-            mae_weight = self.mae_weight_ema
-            log_cosh_weight = self.log_cosh_weight_ema
+            # Retorna como tensores 0-D
+            mse_weight = torch.tensor(self.mse_weight_ema, device=mse_weight.device)
+            mae_weight = torch.tensor(self.mae_weight_ema, device=mae_weight.device)
+            log_cosh_weight = torch.tensor(self.log_cosh_weight_ema, device=log_cosh_weight.device)
 
-        # 4) Scheduler de prioridade ao longo das épocas
-        # fração do treino (0.0 no começo, 1.0 no final)
-        if config.epochs > 1:
-            frac = progress.epoch / float(config.epochs - 1)
+        # 4) Scheduler de prioridade ao longo das épocas/steps
+        total_steps = config.epochs * epoch_length
+        if total_steps > 0:
+            frac = (progress.epoch * epoch_length + progress.epoch_step) / float(total_steps)
+            frac = max(0.0, min(frac, 1.0))
         else:
             frac = 0.0
-        frac = max(0.0, min(frac, 1.0))  # clamp
 
-        # Interpolar: MAE = 0.6 -> 0.2, MSE = 0.2 -> 0.6, log = 0.2 -> 0.2
-        mae_sched = self.mae_start * (1 - frac) + self.mae_end * frac
-        mse_sched = self.mse_start * (1 - frac) + self.mse_end * frac
-        log_sched = self.log_start * (1 - frac) + self.log_end * frac
+        if frac < 0.5:
+            # até 50% do treino
+            self.use_ema = True
+            if loss_tracker is not None:
+                loss_tracker.use_mad = True
+        else:
+            # depois de 50% do treino
+            self.use_ema = False
+            if loss_tracker is not None:
+                loss_tracker.use_mad = False
 
-        # Multiplica os pesos dinâmicos pelos fatores de schedule
-        mse_weight *= mse_sched
-        mae_weight *= mae_sched
-        log_cosh_weight *= log_sched
+        if frac < 0.25:
+            mae_sched = 0.5
+            log_sched = 0.5
+            mse_sched = 0.0
+        elif frac < 0.50:
+            mae_sched = 0.0
+            log_sched = 1.0
+            mse_sched = 0.0
+        elif frac < 0.75:
+            mae_sched = 0.0
+            log_sched = 0.5
+            mse_sched = 0.5
+        else:
+            # aqui a parte final do agendamento
+            local_frac = (frac - 0.75) / 0.25
+            mae_sched = 0.0
+            log_sched = 0.5 * (1 - local_frac)
+            mse_sched = 0.5 + 0.5 * local_frac
 
-        # Renormaliza, se quiser manter a soma = 1
-        sum_sch = mse_weight + mae_weight + log_cosh_weight
-        if sum_sch < 1e-8:
-            sum_sch = 1.0
+        # Multiplicar
+        # Se forem 0-D, ok. Se forem multi-element, multiplicação elementwise
+        mse_weight = mse_weight * mse_sched
+        mae_weight = mae_weight * mae_sched
+        log_cosh_weight = log_cosh_weight * log_sched
 
-        mse_weight /= sum_sch
-        mae_weight /= sum_sch
-        log_cosh_weight /= sum_sch
+        # Renormaliza (opcional)
+        sum_w = mse_weight + mae_weight + log_cosh_weight
+        sum_w = torch.clamp(sum_w, min=1e-8)
 
-        # Retorna pesos finais
+        mse_weight = mse_weight / sum_w
+        mae_weight = mae_weight / sum_w
+        log_cosh_weight = log_cosh_weight / sum_w
+
         return mse_weight, mae_weight, log_cosh_weight

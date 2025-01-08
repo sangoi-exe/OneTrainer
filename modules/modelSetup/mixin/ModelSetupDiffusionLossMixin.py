@@ -12,6 +12,7 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses
 from modules.util.loss.vb_loss import vb_losses
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import LRScheduler
 
 from torch import Tensor
 from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength
@@ -31,10 +32,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		self.__coefficients = None
 		self.__alphas_cumprod_fun = None
 		self.__sigmas = None
-		self.tensorboard = None
+		self.scheduler = None
 		self.progress = None
 		self.config = None
-		self.loss_tracker = LossTracker(window_size=100, use_mad=False)
+		self.tensorboard = None
+		self.loss_tracker = LossTracker(window_size=100, use_mad=True)
 		self.dynamic_loss_strengthing = DynamicLossStrength()
 
 	def __align_prop_losses(
@@ -89,6 +91,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 	):
 		
 		progress = self.progress
+		epoch_length = self.epoch_length
 		losses = 0
 
 		mse_loss = torch.tensor(0.0, device=data["predicted"].device)
@@ -166,24 +169,23 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
 				# Ajusta pesos dinamicamente + scheduler de prioridades
 				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
-					mse_z, mae_z, log_cosh_z, config, progress
+					mse_z, mae_z, log_cosh_z, config, progress, epoch_length
 				)
 				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
-
 				if self.tensorboard != None:
 					self.tensorboard.add_scalar(
 						"sangoi/7mse",
-						mse_weight,
+						mse_weight.mean().item(),
 						progress.global_step,
 					)
 					self.tensorboard.add_scalar(
 						"sangoi/8mae",
-						mae_weight,
+						mae_weight.mean().item(),
 						progress.global_step,
 					)
 					self.tensorboard.add_scalar(
 						"sangoi/9log_cosh",
-						log_cosh_weight,
+						log_cosh_weight.mean().item(),
 						progress.global_step,
 					)
 
@@ -197,6 +199,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 	):
 		
 		progress = self.progress
+		epoch_length = self.epoch_length
 		losses = 0
 
 		mse_loss = torch.tensor(0.0, device=data["predicted"].device)
@@ -259,24 +262,24 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
 				# Ajusta pesos dinamicamente + scheduler de prioridades
 				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
-					mse_z, mae_z, log_cosh_z, config, progress
+					mse_z, mae_z, log_cosh_z, config, progress, epoch_length
 				)
 				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
 
 				if self.tensorboard != None:
 					self.tensorboard.add_scalar(
 						"sangoi/7mse",
-						mse_weight,
+						mse_weight.mean().item(),
 						progress.global_step,
 					)
 					self.tensorboard.add_scalar(
 						"sangoi/8mae",
-						mae_weight,
+						mae_weight.mean().item(),
 						progress.global_step,
 					)
 					self.tensorboard.add_scalar(
 						"sangoi/9log_cosh",
-						log_cosh_weight,
+						log_cosh_weight.mean().item(),
 						progress.global_step,
 					)
 		
@@ -363,11 +366,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		progress = self.progress
 		config = self.config
 
-		# 1) Cálculo do snr "padrão"
-		snr = self.__snr(timesteps, device)        # (batch, ...)
+		snr = self.__snr(timesteps, device)
 		epsilon = 1e-8
 
-		# 2) Cálculo do MAPE (já presente)
 		mape = torch.abs((target - predicted) / (target + epsilon))
 		mape = torch.clamp(mape, min=0, max=1).mean(dim=[1, 2, 3])
 
@@ -454,10 +455,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 	def _diffusion_losses(
 		self,
 		batch: dict,
-		data: dict,
-		config: TrainConfig,
+		data: dict,		
 		progress: TrainProgress,
+		config: TrainConfig,
 		tensorboard: SummaryWriter,
+		epoch_length: float,
 		train_device: torch.device,
 		betas: Tensor | None = None,
 		alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None = None,
@@ -465,6 +467,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		
 		self.progress = progress
 		self.config = config
+		self.epoch_length = epoch_length
 		
 		loss_weight = batch["loss_weight"]
 
