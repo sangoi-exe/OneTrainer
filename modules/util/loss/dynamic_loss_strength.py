@@ -204,7 +204,7 @@ class DynamicLossStrength:
             mse_sched = 0.5
         else:
             # aqui a parte final do agendamento
-            local_frac = (frac - 0.60) / 0.40
+            local_frac = (frac - 0.75) / 0.25
             mae_sched = 0.0
             log_sched = 0.5 * (1 - local_frac)
             mse_sched = 0.5 + 0.5 * local_frac
