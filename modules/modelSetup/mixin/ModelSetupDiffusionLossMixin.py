@@ -12,7 +12,6 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses
 from modules.util.loss.vb_loss import vb_losses
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import LRScheduler
 
 from torch import Tensor
 from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength

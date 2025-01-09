@@ -82,8 +82,8 @@ class DynamicLossStrength:
     def __init__(
         self,
         use_ema=True,
-        ema_decay=0.9,
-        outlier_threshold=2.0,
+        ema_decay=0.7,
+        outlier_threshold=3.0,
     ):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
@@ -179,32 +179,32 @@ class DynamicLossStrength:
         else:
             frac = 0.0
 
-        if frac < 0.5:
-            # até 50% do treino
+        if frac < 0.3:
+            # até 30% do treino
             self.use_ema = True
             if loss_tracker is not None:
                 loss_tracker.use_mad = True
         else:
-            # depois de 50% do treino
+            # depois de 70% do treino
             self.use_ema = False
             if loss_tracker is not None:
                 loss_tracker.use_mad = False
 
-        if frac < 0.25:
+        if frac < 0.20:
             mae_sched = 0.5
             log_sched = 0.5
             mse_sched = 0.0
-        elif frac < 0.50:
+        elif frac < 0.40:
             mae_sched = 0.0
             log_sched = 1.0
             mse_sched = 0.0
-        elif frac < 0.75:
+        elif frac < 0.60:
             mae_sched = 0.0
             log_sched = 0.5
             mse_sched = 0.5
         else:
             # aqui a parte final do agendamento
-            local_frac = (frac - 0.75) / 0.25
+            local_frac = (frac - 0.60) / 0.40
             mae_sched = 0.0
             log_sched = 0.5 * (1 - local_frac)
             mse_sched = 0.5 + 0.5 * local_frac
