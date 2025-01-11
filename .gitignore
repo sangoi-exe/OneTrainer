@@ -1,0 +1,25 @@
+!venv/Lib/site-packages/prodigyopt/prodigy.py
+.idea
+.python-version
+/.venv*
+/venv*
+/conda_env*
+/debug*
+/workspace*
+/models*
+/training_concepts
+/training_samples
+/training_user_settings
+/external
+debug*.py
+debug*.ipynb
+train.bat
+config.json
+*.pyc
+*.bak
+/src
+# pixi environments
+.pixi
+pixi.lock
+pixi.toml
+*.egg-info
