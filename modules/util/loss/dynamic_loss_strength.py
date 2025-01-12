@@ -1,35 +1,57 @@
 import torch
 from torch import Tensor
 from collections import deque
+from typing import Tuple, List, Dict
 
 
 class LossTracker:
     """
-    Armazena e gera 'estatísticas' das últimas N perdas para MSE, MAE e log-cosh.
-    Pode usar média/desvio ou mediana/MAD.
+    Tracks and generates statistics for the latest N loss values for MSE, MAE, and log-cosh.
+    It can use mean/std or median/MAD for statistics.
     """
 
-    def __init__(self, window_size=100, use_mad=False):
-        self.window_size = window_size
-        self.use_mad = use_mad
+    def __init__(self, window_size: int = 100, use_mad: bool = False) -> None:
+        """
+        Initializes the LossTracker.
 
-        self.mse_losses = deque(maxlen=window_size)
-        self.mae_losses = deque(maxlen=window_size)
-        self.log_cosh_losses = deque(maxlen=window_size)
+        Args:
+            window_size (int): The number of recent loss values to track.
+            use_mad (bool): If True, use median and MAD instead of mean and std.
+        """
+        self.window_size: int = window_size
+        self.use_mad: bool = use_mad
 
-    def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor):
-        # Armazena o item() de cada perda
+        self.mse_losses: deque = deque(maxlen=window_size)
+        self.mae_losses: deque = deque(maxlen=window_size)
+        self.log_cosh_losses: deque = deque(maxlen=window_size)
+
+    def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
+        """
+        Updates the loss trackers with new loss values.
+
+        Args:
+            mse_loss (Tensor): The Mean Squared Error loss.
+            mae_loss (Tensor): The Mean Absolute Error loss.
+            log_cosh_loss (Tensor): The log-cosh loss.
+        """
+        # Store the scalar value of each loss
         self.mse_losses.append(mse_loss.item())
         self.mae_losses.append(mae_loss.item())
         self.log_cosh_losses.append(log_cosh_loss.item())
 
-    def compute_stats(self, values_list):
+    def compute_stats(self, values_list: List[float]) -> Tuple[float, float]:
         """
-        Se use_mad=False -> retorna (mean, std)
-        Se use_mad=True -> retorna (median, MAD)
+        Computes statistics for a list of loss values.
+
+        Args:
+            values_list (List[float]): The list of loss values.
+
+        Returns:
+            Tuple[float, float]: If use_mad is False, returns (mean, std).
+                                 If use_mad is True, returns (median, MAD).
         """
         if len(values_list) < 2:
-            # Evita problemas no início do treino
+            # Avoid issues at the beginning of training
             return 0.0, 1e-8
 
         arr = torch.tensor(values_list, dtype=torch.float32)
@@ -43,10 +65,17 @@ class LossTracker:
             mad_val = abs_dev.median()
             return median_val.item(), max(mad_val.item(), 1e-8)
 
-    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor):
+    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> Tuple[float, float, float]:
         """
-        Retorna (mse_z, mae_z, log_cosh_z) usando media+std ou mediana+MAD,
-        dependendo de self.use_mad.
+        Computes z-scores for the given loss values.
+
+        Args:
+            mse_loss (Tensor): The Mean Squared Error loss.
+            mae_loss (Tensor): The Mean Absolute Error loss.
+            log_cosh_loss (Tensor): The log-cosh loss.
+
+        Returns:
+            Tuple[float, float, float]: The z-scores for MSE, MAE, and log-cosh losses.
         """
         mse_center, mse_scale = self.compute_stats(self.mse_losses)
         mae_center, mae_scale = self.compute_stats(self.mae_losses)
@@ -56,127 +85,161 @@ class LossTracker:
         mae_z = (mae_loss.item() - mae_center) / mae_scale
         log_cosh_z = (log_cosh_loss.item() - log_cosh_center) / log_cosh_scale
 
-        return (mse_z, mae_z, log_cosh_z)
+        return mse_z, mae_z, log_cosh_z
 
 
 class DynamicLossStrength:
+    """
+    Dynamically adjusts the weights of different loss components based on their z-scores.
+    It can optionally use Exponential Moving Average (EMA) and applies a scheduling mechanism
+    to prioritize different losses over the course of training.
+    """
+
     def __init__(
         self,
-        use_ema=False,
-        ema_decay=0.9,
-        outlier_threshold=3.0,
-        # Caso queira já passar valores default para a schedule
-        mae_start=0.6,
-        mae_end=0.2,
-        mse_start=0.2,
-        mse_end=0.6,
-        log_start=0.2,
-        log_end=0.2,
-    ):
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-        self.outlier_threshold = outlier_threshold
-
-        # Guardar parâmetros de schedule
-        self.mae_start = mae_start
-        self.mae_end = mae_end
-        self.mse_start = mse_start
-        self.mse_end = mse_end
-        self.log_start = log_start
-        self.log_end = log_end
-
-        # Estados para EMA
-        self.mse_weight_ema = 1.0
-        self.mae_weight_ema = 1.0
-        self.log_cosh_weight_ema = 1.0
-        self.initialized = False
-
-    def adjust_weights(self, mse_z: float, mae_z: float, log_cosh_z: float, config, progress):
+        use_ema: bool = False,
+        ema_decay: float = 0.9,
+        outlier_threshold: float = 3.0,
+        schedule_params: Dict[str, Dict[str, float]] = None,
+    ) -> None:
         """
-        Retorna (mse_weight, mae_weight, log_cosh_weight).
-        Aplica:
-        1) Clamping do z-score em outlier_threshold
-        2) Inverse z-scores
-        3) Normalização
-        4) (Opcional) EMA
-        5) Scheduler (prioridade ao MAE no início e MSE no final)
+        Initializes the DynamicLossStrength.
+
+        Args:
+            use_ema (bool): Whether to use Exponential Moving Average for weights.
+            ema_decay (float): Decay rate for EMA.
+            outlier_threshold (float): Threshold to clamp z-scores.
+            schedule_params (Dict[str, Dict[str, float]]): Scheduling parameters for each loss.
+                Expected format:
+                {
+                    'mae': {'start': float, 'end': float},
+                    'mse': {'start': float, 'end': float},
+                    'log_cosh': {'start': float, 'end': float}
+                }
+                If None, default values will be used.
         """
+        self.use_ema: bool = use_ema
+        self.ema_decay: float = ema_decay
+        self.outlier_threshold: float = outlier_threshold
 
-        # 1) Clamping
-        z_mse = min(abs(mse_z), self.outlier_threshold)
-        z_mae = min(abs(mae_z), self.outlier_threshold)
-        z_log = min(abs(log_cosh_z), self.outlier_threshold)
+        # Initialize scheduling parameters
+        self.schedule_params: Dict[str, Dict[str, float]] = self._initialize_schedule_params(schedule_params)
 
-        total_z = z_mse + z_mae + z_log
+        # EMA state
+        self.ema_weights: Dict[str, float] = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
+        self.initialized: bool = False
+
+    def _initialize_schedule_params(self, schedule_params: Dict[str, Dict[str, float]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Initializes the scheduling parameters.
+
+        Args:
+            schedule_params (Dict[str, Dict[str, float]], optional):
+                User-provided scheduling parameters.
+
+        Returns:
+            Dict[str, Dict[str, float]]: Initialized scheduling parameters.
+        """
+        default_params = {
+            "mae": {"start": 0.6, "end": 0.0},
+            "mse": {"start": 0.2, "end": 0.6},
+            "log_cosh": {"start": 0.2, "end": 0.4},
+        }
+        if schedule_params is not None:
+            # Merge user-provided parameters with defaults
+            for loss_type, params in default_params.items():
+                if loss_type in schedule_params:
+                    default_params[loss_type].update(schedule_params[loss_type])
+        return default_params
+
+    def adjust_weights(
+        self,
+        mse_z: float,
+        mae_z: float,
+        log_cosh_z: float,
+        config,
+        progress,
+    ) -> Tuple[float, float, float]:
+        """
+        Adjusts the weights for MSE, MAE, and log-cosh losses based on their z-scores.
+
+        The adjustment process includes:
+        1) Clamping z-scores to the outlier threshold.
+        2) Inverting z-scores.
+        3) Normalizing the inverted z-scores.
+        4) Applying Exponential Moving Average (if enabled).
+        5) Scheduling weight priorities over training epochs.
+
+        Args:
+            mse_z (float): Z-score for MSE loss.
+            mae_z (float): Z-score for MAE loss.
+            log_cosh_z (float): Z-score for log-cosh loss.
+            config: Configuration object containing training parameters (e.g., total epochs).
+            progress: Progress object containing current epoch information.
+
+        Returns:
+            Tuple[float, float, float]: The adjusted weights for MSE, MAE, and log-cosh losses.
+        """
+        # 1) Clamping z-scores to the outlier threshold
+        z_scores = {
+            "mse": min(abs(mse_z), self.outlier_threshold),
+            "mae": min(abs(mae_z), self.outlier_threshold),
+            "log_cosh": min(abs(log_cosh_z), self.outlier_threshold),
+        }
+
+        total_z = sum(z_scores.values())
         if total_z < 1e-8:
             total_z = 1.0
 
-        # 2) inverse z-scores
-        inv_mse = (total_z - z_mse) / total_z
-        inv_mae = (total_z - z_mae) / total_z
-        inv_log = (total_z - z_log) / total_z
+        # 2) Inverting z-scores
+        inverted_z = {loss: (total_z - z) / total_z for loss, z in z_scores.items()}
 
-        sum_inv = inv_mse + inv_mae + inv_log
+        sum_inv = sum(inverted_z.values())
         if sum_inv < 1e-8:
             sum_inv = 1.0
 
-        # pesos normalizados baseados em z-score
-        mse_weight = inv_mse / sum_inv
-        mae_weight = inv_mae / sum_inv
-        log_cosh_weight = inv_log / sum_inv
+        # 3) Normalizing inverted z-scores to obtain base weights
+        base_weights = {loss: inv_z / sum_inv for loss, inv_z in inverted_z.items()}
 
-        # 3) EMA (se habilitado)
+        # 4) Apply Exponential Moving Average (if enabled)
         if self.use_ema:
             if not self.initialized:
-                # primeira chamada
-                self.mse_weight_ema = mse_weight
-                self.mae_weight_ema = mae_weight
-                self.log_cosh_weight_ema = log_cosh_weight
+                # Initialize EMA with current weights
+                for loss in self.ema_weights:
+                    self.ema_weights[loss] = base_weights[loss]
                 self.initialized = True
             else:
                 alpha = 1.0 - self.ema_decay
-                self.mse_weight_ema = (1 - alpha) * self.mse_weight_ema + alpha * mse_weight
-                self.mae_weight_ema = (1 - alpha) * self.mae_weight_ema + alpha * mae_weight
-                self.log_cosh_weight_ema = (1 - alpha) * self.log_cosh_weight_ema + alpha * log_cosh_weight
+                for loss in self.ema_weights:
+                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
 
-            # Normaliza a soma do EMA
-            sum_ema = self.mse_weight_ema + self.mae_weight_ema + self.log_cosh_weight_ema
+            # Normalize EMA weights
+            sum_ema = sum(self.ema_weights.values())
             if sum_ema < 1e-8:
                 sum_ema = 1.0
-            self.mse_weight_ema /= sum_ema
-            self.mae_weight_ema /= sum_ema
-            self.log_cosh_weight_ema /= sum_ema
+            normalized_ema_weights = {loss: weight / sum_ema for loss, weight in self.ema_weights.items()}
+            base_weights = normalized_ema_weights
 
-            mse_weight = self.mse_weight_ema
-            mae_weight = self.mae_weight_ema
-            log_cosh_weight = self.log_cosh_weight_ema
-
-        # 4) Scheduler de prioridade ao longo das épocas
-        # fração do treino (0.0 no começo, 1.0 no final)
+        # 5) Apply scheduling to prioritize different losses over epochs
         if config.epochs > 1:
             frac = progress.epoch / float(config.epochs - 1)
         else:
             frac = 0.0
-        frac = max(0.0, min(frac, 1.0))  # clamp
+        frac = max(0.0, min(frac, 1.0))  # Clamp fraction between 0 and 1
 
-        # Interpolar: MAE = 0.6 -> 0.2, MSE = 0.2 -> 0.6, log = 0.2 -> 0.2
-        mae_sched = self.mae_start * (1 - frac) + self.mae_end * frac
-        mse_sched = self.mse_start * (1 - frac) + self.mse_end * frac
-        log_sched = self.log_start * (1 - frac) + self.log_end * frac
+        # Interpolate scheduling factors for each loss
+        scheduled_factors = {}
+        for loss, params in self.schedule_params.items():
+            scheduled_factors[loss] = params["start"] * (1 - frac) + params["end"] * frac
 
-        # Multiplica os pesos dinâmicos pelos fatores de schedule
-        mse_weight *= mse_sched
-        mae_weight *= mae_sched
-        log_cosh_weight *= log_sched
+        # Multiply base weights by scheduling factors
+        weighted_weights = {loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights}
 
-        # Renormaliza, se quiser manter a soma = 1
-        sum_sch = mse_weight + mae_weight + log_cosh_weight
-        if sum_sch < 1e-8:
-            sum_sch = 1.0
+        # Normalize the scheduled weights
+        sum_weighted = sum(weighted_weights.values())
+        if sum_weighted < 1e-8:
+            sum_weighted = 1.0
+        final_weights = {loss: weight / sum_weighted for loss, weight in weighted_weights.items()}
 
-        mse_weight /= sum_sch
-        mae_weight /= sum_sch
-        log_cosh_weight /= sum_sch
-
-        # Retorna pesos finais
-        return mse_weight, mae_weight, log_cosh_weight
+        # Return the final adjusted weights in the order of MSE, MAE, log-cosh
+        return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]

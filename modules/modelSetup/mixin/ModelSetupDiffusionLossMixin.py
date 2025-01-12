@@ -168,7 +168,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
 					mse_z, mae_z, log_cosh_z, config, progress
 				)
-				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
+				losses = (
+					mse_loss * mse_weight * config.mse_strength
+					+ mae_loss * mae_weight * config.mae_strength
+					+ log_cosh_loss * log_cosh_weight * config.log_cosh_strength
+				)
 
 				if self.tensorboard != None:
 					self.tensorboard.add_scalar(
@@ -261,7 +265,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 				mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
 					mse_z, mae_z, log_cosh_z, config, progress
 				)
-				losses = mse_loss * mse_weight + mae_loss * mae_weight + log_cosh_loss * log_cosh_weight
+				losses = (
+					mse_loss * mse_weight * config.mse_strength
+					+ mae_loss * mae_weight * config.mae_strength
+					+ log_cosh_loss * log_cosh_weight * config.log_cosh_strength
+				)
 
 				if self.tensorboard != None:
 					self.tensorboard.add_scalar(
