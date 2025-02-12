@@ -1,8 +1,16 @@
 import torch
 from torch import Tensor
 from collections import deque
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Union
 
+###############################################################################
+# NOVO: Variável global para controlar o modo (scalar vs. batch)
+###############################################################################
+BATCH_MODE = True
+"""
+Se BATCH_MODE for False, comporta-se como no código original (usa .item()).
+Se BATCH_MODE for True, as operações são feitas usando Tensores em lote (batch).
+"""
 
 class LossTracker:
     """
@@ -21,6 +29,7 @@ class LossTracker:
         self.window_size: int = window_size
         self.use_mad: bool = use_mad
 
+        # As filas continuarão existindo, mas podem armazenar floats ou Tensores
         self.mse_losses: deque = deque(maxlen=window_size)
         self.mae_losses: deque = deque(maxlen=window_size)
         self.log_cosh_losses: deque = deque(maxlen=window_size)
@@ -34,27 +43,45 @@ class LossTracker:
             mae_loss (Tensor): The Mean Absolute Error loss.
             log_cosh_loss (Tensor): The log-cosh loss.
         """
-        # Store the scalar value of each loss
-        self.mse_losses.append(mse_loss.item())
-        self.mae_losses.append(mae_loss.item())
-        self.log_cosh_losses.append(log_cosh_loss.item())
+        if not BATCH_MODE:
+            # Modo original (scalar)
+            self.mse_losses.append(mse_loss.item())
+            self.mae_losses.append(mae_loss.item())
+            self.log_cosh_losses.append(log_cosh_loss.item())
+        else:
+            # Modo batch: podemos armazenar o Tensor inteiro,
+            # ou apenas a média do batch, dependendo da sua necessidade.
+            # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach) 
+            # para depois concatenar na hora de computar estatísticas.
+            self.mse_losses.append(mse_loss.detach())
+            self.mae_losses.append(mae_loss.detach())
+            self.log_cosh_losses.append(log_cosh_loss.detach())
 
-    def compute_stats(self, values_list: List[float]) -> Tuple[float, float]:
+    def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
         """
         Computes statistics for a list of loss values.
 
         Args:
-            values_list (List[float]): The list of loss values.
+            values_list (List[float or Tensor]): The list of loss values (scalar ou Tensor).
 
         Returns:
             Tuple[float, float]: If use_mad is False, returns (mean, std).
                                  If use_mad is True, returns (median, MAD).
         """
         if len(values_list) < 2:
-            # Avoid issues at the beginning of training
+            # Evitar problemas no início do treinamento
             return 0.0, 1e-8
 
-        arr = torch.tensor(values_list, dtype=torch.float32)
+        if not BATCH_MODE:
+            # Modo scalar original
+            arr = torch.tensor(values_list, dtype=torch.float32)
+        else:
+            # Modo batch: "desempacota" Tensores em um único Tensor
+            # Cada elemento de values_list pode ser shape [] (loss já reduzido)
+            # ou [batch_size]. Aqui assumimos que cada item é [batch_size],
+            # mas se for scalar, a concat ainda funciona com .view(-1).
+            arr = torch.cat([x.view(-1) for x in values_list], dim=0)
+
         if not self.use_mad:
             mean_val = arr.mean()
             std_val = arr.std(unbiased=False)
@@ -65,7 +92,12 @@ class LossTracker:
             mad_val = abs_dev.median()
             return median_val.item(), max(mad_val.item(), 1e-8)
 
-    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> Tuple[float, float, float]:
+    def compute_z_scores(
+        self,
+        mse_loss: Tensor,
+        mae_loss: Tensor,
+        log_cosh_loss: Tensor
+    ) -> Tuple[float, float, float]:
         """
         Computes z-scores for the given loss values.
 
@@ -77,13 +109,27 @@ class LossTracker:
         Returns:
             Tuple[float, float, float]: The z-scores for MSE, MAE, and log-cosh losses.
         """
+        # Primeiro, obtém as estatísticas de cada fila
         mse_center, mse_scale = self.compute_stats(self.mse_losses)
         mae_center, mae_scale = self.compute_stats(self.mae_losses)
         log_cosh_center, log_cosh_scale = self.compute_stats(self.log_cosh_losses)
 
-        mse_z = (mse_loss.item() - mse_center) / mse_scale
-        mae_z = (mae_loss.item() - mae_center) / mae_scale
-        log_cosh_z = (log_cosh_loss.item() - log_cosh_center) / log_cosh_scale
+        # Em modo batch, podemos tirar a média antes de calcular .item()
+        # ou podemos calcular cada z-score como um vetor. Abaixo, fazemos
+        # do jeito mais simples: tiramos a média do batch para manter
+        # a coerência com o retorno float original.
+        if not BATCH_MODE:
+            mse_val = mse_loss.item()
+            mae_val = mae_loss.item()
+            log_cosh_val = log_cosh_loss.item()
+        else:
+            mse_val = mse_loss.mean().item()
+            mae_val = mae_loss.mean().item()
+            log_cosh_val = log_cosh_loss.mean().item()
+
+        mse_z = (mse_val - mse_center) / mse_scale
+        mae_z = (mae_val - mae_center) / mae_scale
+        log_cosh_z = (log_cosh_val - log_cosh_center) / log_cosh_scale
 
         return mse_z, mae_z, log_cosh_z
 
@@ -110,13 +156,6 @@ class DynamicLossStrength:
             ema_decay (float): Decay rate for EMA.
             outlier_threshold (float): Threshold to clamp z-scores.
             schedule_params (Dict[str, Dict[str, float]]): Scheduling parameters for each loss.
-                Expected format:
-                {
-                    'mae': {'start': float, 'end': float},
-                    'mse': {'start': float, 'end': float},
-                    'log_cosh': {'start': float, 'end': float}
-                }
-                If None, default values will be used.
         """
         self.use_ema: bool = use_ema
         self.ema_decay: float = ema_decay
@@ -146,7 +185,6 @@ class DynamicLossStrength:
             "log_cosh": {"start": 0.2, "end": 0.4},
         }
         if schedule_params is not None:
-            # Merge user-provided parameters with defaults
             for loss_type, params in default_params.items():
                 if loss_type in schedule_params:
                     default_params[loss_type].update(schedule_params[loss_type])
@@ -180,7 +218,7 @@ class DynamicLossStrength:
         Returns:
             Tuple[float, float, float]: The adjusted weights for MSE, MAE, and log-cosh losses.
         """
-        # 1) Clamping z-scores to the outlier threshold
+        # 1) Clamping z-scores
         z_scores = {
             "mse": min(abs(mse_z), self.outlier_threshold),
             "mae": min(abs(mae_z), self.outlier_threshold),
@@ -198,48 +236,51 @@ class DynamicLossStrength:
         if sum_inv < 1e-8:
             sum_inv = 1.0
 
-        # 3) Normalizing inverted z-scores to obtain base weights
+        # 3) Normalizing inverted z-scores
         base_weights = {loss: inv_z / sum_inv for loss, inv_z in inverted_z.items()}
 
-        # 4) Apply Exponential Moving Average (if enabled)
+        # 4) Exponential Moving Average
         if self.use_ema:
             if not self.initialized:
-                # Initialize EMA with current weights
                 for loss in self.ema_weights:
                     self.ema_weights[loss] = base_weights[loss]
                 self.initialized = True
             else:
                 alpha = 1.0 - self.ema_decay
                 for loss in self.ema_weights:
-                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
+                    self.ema_weights[loss] = \
+                        (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
 
-            # Normalize EMA weights
+            # Normaliza as weights do EMA
             sum_ema = sum(self.ema_weights.values())
             if sum_ema < 1e-8:
                 sum_ema = 1.0
-            normalized_ema_weights = {loss: weight / sum_ema for loss, weight in self.ema_weights.items()}
+            normalized_ema_weights = {loss: w / sum_ema for loss, w in self.ema_weights.items()}
             base_weights = normalized_ema_weights
 
-        # 5) Apply scheduling to prioritize different losses over epochs
+        # 5) Scheduler
         if config.epochs > 1:
             frac = progress.epoch / float(config.epochs - 1)
         else:
             frac = 0.0
-        frac = max(0.0, min(frac, 1.0))  # Clamp fraction between 0 and 1
+        frac = max(0.0, min(frac, 1.0))
 
-        # Interpolate scheduling factors for each loss
         scheduled_factors = {}
         for loss, params in self.schedule_params.items():
             scheduled_factors[loss] = params["start"] * (1 - frac) + params["end"] * frac
 
-        # Multiply base weights by scheduling factors
-        weighted_weights = {loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights}
+        # Multiplica cada base weight pelo fator do scheduler
+        weighted_weights = {
+            loss: base_weights[loss] * scheduled_factors[loss]
+            for loss in base_weights
+        }
 
-        # Normalize the scheduled weights
+        # Normaliza
         sum_weighted = sum(weighted_weights.values())
         if sum_weighted < 1e-8:
             sum_weighted = 1.0
-        final_weights = {loss: weight / sum_weighted for loss, weight in weighted_weights.items()}
 
-        # Return the final adjusted weights in the order of MSE, MAE, log-cosh
+        final_weights = {loss: w / sum_weighted for loss, w in weighted_weights.items()}
+
+        # Retorna na ordem desejada
         return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]
