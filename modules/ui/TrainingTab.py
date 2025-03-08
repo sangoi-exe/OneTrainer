@@ -3,8 +3,6 @@ from modules.ui.OptimizerParamsWindow import OptimizerParamsWindow
 from modules.ui.SchedulerParamsWindow import SchedulerParamsWindow
 from modules.ui.TimestepDistributionWindow import TimestepDistributionWindow
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.enum.AlignPropLoss import AlignPropLoss
-from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
@@ -231,12 +229,7 @@ class TrainingTab:
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
         frame.grid_columnconfigure(0, weight=1)
-
-        # attention mechanism
-        components.label(frame, 0, 0, "Attention",
-                         tooltip="The attention mechanism used during training. This has a big effect on speed and memory consumption")
-        components.options(frame, 0, 1, [str(x) for x in list(AttentionMechanism)], self.ui_state,
-                           "attention_mechanism")
+        row = 0
 
         # ema
         components.label(frame, 1, 0, "EMA",
