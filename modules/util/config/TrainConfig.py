@@ -7,8 +7,8 @@ from typing import Any
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
-from modules.util.enum.AlignPropLoss import AlignPropLoss
-from modules.util.enum.AttentionMechanism import AttentionMechanism
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -286,15 +286,7 @@ class TrainConfig(BaseConfig):
     enable_autocast_cache: bool
     only_cache: bool
     resolution: str
-    attention_mechanism: AttentionMechanism
-    align_prop: bool
-    align_prop_probability: float
-    align_prop_loss: AlignPropLoss
-    align_prop_weight: float
-    align_prop_steps: int
-    align_prop_truncate_steps: float
-    align_prop_cfg_scale: float
-    loss_mode_fn: LossMode
+    frames: str
     mse_strength: float
     mae_strength: float
     log_cosh_strength: float
@@ -742,16 +734,7 @@ class TrainConfig(BaseConfig):
         data.append(("enable_autocast_cache", True, bool, False))
         data.append(("only_cache", False, bool, False))
         data.append(("resolution", "512", str, False))
-        data.append(("attention_mechanism", AttentionMechanism.XFORMERS, AttentionMechanism, False))
-        data.append(("align_prop", False, bool, False))
-        data.append(("align_prop_probability", 0.1, float, False))
-        data.append(("align_prop_loss", AlignPropLoss.AESTHETIC, AlignPropLoss, False))
-        data.append(("align_prop_weight", 0.01, float, False))
-        data.append(("align_prop_steps", 20, int, False))
-        data.append(("align_prop_truncate_steps", 0.5, float, False))
-        data.append(("align_prop_cfg_scale", 7.0, float, False))
-        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
-        data.append(("mse_strength", 1.0, float, False))
+        data.append(("frames", "25", str, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("log_cosh_strength", 0.0, float, False))
