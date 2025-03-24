@@ -173,7 +173,7 @@ class StableDiffusionXLBaseDataLoader(
         output_names = [
             'image_path', 'latent_image',
             'tokens_1', 'tokens_2',
-            'original_resolution', 'crop_resolution', 'crop_offset', 'prompt',
+            'original_resolution', 'crop_resolution', 'crop_offset',
         ]
 
         if config.masked_training or config.model_type.has_mask_input():

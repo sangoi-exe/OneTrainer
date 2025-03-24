@@ -8,6 +8,7 @@
 /workspace*
 /models*
 /training_concepts
+/training_presets
 /training_samples
 /training_user_settings
 /external

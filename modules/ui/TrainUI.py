@@ -34,6 +34,7 @@ from modules.zluda import ZLUDA
 import torch
 
 import customtkinter as ctk
+from customtkinter import AppearanceModeTracker
 
 
 class TrainUI(ctk.CTk):
@@ -51,7 +52,8 @@ class TrainUI(ctk.CTk):
         self.title("OneTrainer")
         self.geometry("1100x740")
 
-        ctk.set_appearance_mode("System")
+        # more efficient version of ctk.set_appearance_mode("System"), which retrieves the system theme on each main loop iteration
+        ctk.set_appearance_mode("Light" if AppearanceModeTracker.detect_appearance_mode() == 0 else "Dark")
         ctk.set_default_color_theme("blue")
 
         self.train_config = TrainConfig.default_values()
@@ -102,8 +104,7 @@ class TrainUI(ctk.CTk):
 
         self.set_step_progress, self.set_epoch_progress = components.double_progress(frame, 0, 0, "step", "epoch")
 
-        self.status_label = components.label(frame, 0, 1, "",
-                                             tooltip="Current status of the training run")
+        self.status_label = components.label(frame, 0, 1, "", tooltip="Current status of the training run")
 
         # padding
         frame.grid_columnconfigure(2, weight=1)
@@ -115,9 +116,9 @@ class TrainUI(ctk.CTk):
         self.training_button = components.button(frame, 0, 4, "Start Training", self.start_training)
 
         # export button
-        self.export_button = components.button(frame, 0, 5, "Export", self.export_training,
-                                               tooltip="Export the current configuration as a script to run without a UI")
-
+        self.export_button = components.button(
+            frame, 0, 5, "Export", self.export_training, tooltip="Export the current configuration as a script to run without a UI"
+        )
 
         return frame
 
@@ -153,66 +154,74 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(3, weight=1)
 
         # workspace dir
-        components.label(frame, 0, 0, "Workspace Directory",
-                         tooltip="The directory where all files of this training run are saved")
+        components.label(frame, 0, 0, "Workspace Directory", tooltip="The directory where all files of this training run are saved")
         components.dir_entry(frame, 0, 1, self.ui_state, "workspace_dir")
 
         # cache dir
-        components.label(frame, 1, 0, "Cache Directory",
-                         tooltip="The directory where cached data is saved")
+        components.label(frame, 1, 0, "Cache Directory", tooltip="The directory where cached data is saved")
         components.dir_entry(frame, 1, 1, self.ui_state, "cache_dir")
 
         # continue from previous backup
-        components.label(frame, 2, 0, "Continue from last backup",
-                         tooltip="Automatically continues training from the last backup saved in <workspace>/backup")
+        components.label(
+            frame,
+            2,
+            0,
+            "Continue from last backup",
+            tooltip="Automatically continues training from the last backup saved in <workspace>/backup",
+        )
         components.switch(frame, 2, 1, self.ui_state, "continue_last_backup")
 
         # only cache
-        components.label(frame, 3, 0, "Only Cache",
-                         tooltip="Only populate the cache, without any training")
+        components.label(frame, 3, 0, "Only Cache", tooltip="Only populate the cache, without any training")
         components.switch(frame, 3, 1, self.ui_state, "only_cache")
 
         # debug
-        components.label(frame, 4, 0, "Debug mode",
-                         tooltip="Save debug information during the training into the debug directory")
+        components.label(frame, 4, 0, "Debug mode", tooltip="Save debug information during the training into the debug directory")
         components.switch(frame, 4, 1, self.ui_state, "debug_mode")
 
-        components.label(frame, 5, 0, "Debug Directory",
-                         tooltip="The directory where debug data is saved")
+        components.label(frame, 5, 0, "Debug Directory", tooltip="The directory where debug data is saved")
         components.dir_entry(frame, 5, 1, self.ui_state, "debug_dir")
 
         # tensorboard
-        components.label(frame, 6, 0, "Tensorboard",
-                         tooltip="Starts the Tensorboard Web UI during training")
+        components.label(frame, 6, 0, "Tensorboard", tooltip="Starts the Tensorboard Web UI during training")
         components.switch(frame, 6, 1, self.ui_state, "tensorboard")
 
-        components.label(frame, 7, 0, "Expose Tensorboard",
-                         tooltip="Exposes Tensorboard Web UI to all network interfaces (makes it accessible from the network)")
+        components.label(
+            frame,
+            7,
+            0,
+            "Expose Tensorboard",
+            tooltip="Exposes Tensorboard Web UI to all network interfaces (makes it accessible from the network)",
+        )
         components.switch(frame, 7, 1, self.ui_state, "tensorboard_expose")
-        components.label(frame, 7, 2, "Tensorboard Port",
-                         tooltip="Port to use for Tensorboard link")
+        components.label(frame, 7, 2, "Tensorboard Port", tooltip="Port to use for Tensorboard link")
         components.entry(frame, 7, 3, self.ui_state, "tensorboard_port")
 
         # validation
-        components.label(frame, 8, 0, "Validation",
-                         tooltip="Enable validation steps and add new graph in tensorboard")
+        components.label(frame, 8, 0, "Validation", tooltip="Enable validation steps and add new graph in tensorboard")
         components.switch(frame, 8, 1, self.ui_state, "validation")
 
-        components.label(frame, 9, 0, "Validate after",
-                         tooltip="The interval used when validate training")
+        components.label(frame, 9, 0, "Validate after", tooltip="The interval used when validate training")
         components.time_entry(frame, 9, 1, self.ui_state, "validate_after", "validate_after_unit")
 
         # device
-        components.label(frame, 10, 0, "Dataloader Threads",
-                         tooltip="Number of threads used for the data loader. Increase if your GPU has room during caching, decrease if it's going out of memory during caching.")
+        components.label(
+            frame,
+            10,
+            0,
+            "Dataloader Threads",
+            tooltip="Number of threads used for the data loader. Increase if your GPU has room during caching, decrease if it's going out of memory during caching.",
+        )
         components.entry(frame, 10, 1, self.ui_state, "dataloader_threads")
 
-        components.label(frame, 11, 0, "Train Device",
-                         tooltip="The device used for training. Can be \"cuda\", \"cuda:0\", \"cuda:1\" etc. Default:\"cuda\"")
+        components.label(
+            frame, 11, 0, "Train Device", tooltip='The device used for training. Can be "cuda", "cuda:0", "cuda:1" etc. Default:"cuda"'
+        )
         components.entry(frame, 11, 1, self.ui_state, "train_device")
 
-        components.label(frame, 12, 0, "Temp Device",
-                         tooltip="The device used to temporarily offload models while they are not used. Default:\"cpu\"")
+        components.label(
+            frame, 12, 0, "Temp Device", tooltip='The device used to temporarily offload models while they are not used. Default:"cpu"'
+        )
         components.entry(frame, 12, 1, self.ui_state, "temp_device")
 
         frame.pack(fill="both", expand=1)
@@ -230,18 +239,23 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(4, weight=1)
 
         # aspect ratio bucketing
-        components.label(frame, 0, 0, "Aspect Ratio Bucketing",
-                         tooltip="Aspect ratio bucketing enables training on images with different aspect ratios")
+        components.label(
+            frame, 0, 0, "Aspect Ratio Bucketing", tooltip="Aspect ratio bucketing enables training on images with different aspect ratios"
+        )
         components.switch(frame, 0, 1, self.ui_state, "aspect_ratio_bucketing")
 
         # latent caching
-        components.label(frame, 1, 0, "Latent Caching",
-                         tooltip="Caching of intermediate training data that can be re-used between epochs")
+        components.label(frame, 1, 0, "Latent Caching", tooltip="Caching of intermediate training data that can be re-used between epochs")
         components.switch(frame, 1, 1, self.ui_state, "latent_caching")
 
         # clear cache before training
-        components.label(frame, 2, 0, "Clear cache before training",
-                         tooltip="Clears the cache directory before starting to train. Only disable this if you want to continue using the same cached data. Disabling this can lead to errors, if other settings are changed during a restart")
+        components.label(
+            frame,
+            2,
+            0,
+            "Clear cache before training",
+            tooltip="Clears the cache directory before starting to train. Only disable this if you want to continue using the same cached data. Disabling this can lead to errors, if other settings are changed during a restart",
+        )
         components.switch(frame, 2, 1, self.ui_state, "clear_cache_before_training")
 
         frame.pack(fill="both", expand=1)
@@ -263,31 +277,37 @@ class TrainUI(ctk.CTk):
         top_frame.grid(row=0, column=0, sticky="nsew")
         sub_frame = ctk.CTkFrame(master=top_frame, corner_radius=0, fg_color="transparent")
         sub_frame.grid(row=1, column=0, sticky="nsew", columnspan=6)
-        components.label(top_frame, 0, 0, "Sample After",
-                         tooltip="The interval used when automatically sampling from the model during training")
+        components.label(
+            top_frame, 0, 0, "Sample After", tooltip="The interval used when automatically sampling from the model during training"
+        )
         components.time_entry(top_frame, 0, 1, self.ui_state, "sample_after", "sample_after_unit")
 
-        components.label(top_frame, 0, 2, "Format",
-                         tooltip="File Format used when saving samples")
-        components.options_kv(top_frame, 0, 3, [
-            ("PNG", ImageFormat.PNG),
-            ("JPG", ImageFormat.JPG),
-        ], self.ui_state, "sample_image_format")
+        components.label(top_frame, 0, 2, "Format", tooltip="File Format used when saving samples")
+        components.options_kv(
+            top_frame,
+            0,
+            3,
+            [
+                ("PNG", ImageFormat.PNG),
+                ("JPG", ImageFormat.JPG),
+            ],
+            self.ui_state,
+            "sample_image_format",
+        )
 
         components.button(top_frame, 0, 4, "sample now", self.sample_now)
 
         components.button(top_frame, 0, 5, "manual sample", self.open_sample_ui)
 
-        components.label(sub_frame, 0, 0, "Non-EMA Sampling",
-                         tooltip="Whether to include non-ema sampling when using ema.")
+        components.label(sub_frame, 0, 0, "Non-EMA Sampling", tooltip="Whether to include non-ema sampling when using ema.")
         components.switch(sub_frame, 0, 1, self.ui_state, "non_ema_sampling")
 
-        components.label(sub_frame, 0, 2, "Samples to Tensorboard",
-                         tooltip="Whether to include sample images in the Tensorboard output.")
+        components.label(sub_frame, 0, 2, "Samples to Tensorboard", tooltip="Whether to include sample images in the Tensorboard output.")
         components.switch(sub_frame, 0, 3, self.ui_state, "samples_to_tensorboard")
 
-        components.label(sub_frame, 0, 4, "Skip samples on train start",
-                         tooltip="Whether to skip generating sample images at the start of training.")
+        components.label(
+            sub_frame, 0, 4, "Skip samples on train start", tooltip="Whether to skip generating sample images at the start of training."
+        )
         components.switch(sub_frame, 0, 5, self.ui_state, "skip_sample_on_train_start")
 
         # table
@@ -305,44 +325,39 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(4, weight=1)
 
         # backup after
-        components.label(frame, 0, 0, "Backup After",
-                         tooltip="The interval used when automatically creating model backups during training")
+        components.label(frame, 0, 0, "Backup After", tooltip="The interval used when automatically creating model backups during training")
         components.time_entry(frame, 0, 1, self.ui_state, "backup_after", "backup_after_unit")
 
         # backup now
         components.button(frame, 0, 3, "backup now", self.backup_now)
 
         # rolling backup
-        components.label(frame, 1, 0, "Rolling Backup",
-                         tooltip="If rolling backups are enabled, older backups are deleted automatically")
+        components.label(frame, 1, 0, "Rolling Backup", tooltip="If rolling backups are enabled, older backups are deleted automatically")
         components.switch(frame, 1, 1, self.ui_state, "rolling_backup")
 
         # rolling backup count
-        components.label(frame, 1, 3, "Rolling Backup Count",
-                         tooltip="Defines the number of backups to keep if rolling backups are enabled")
+        components.label(
+            frame, 1, 3, "Rolling Backup Count", tooltip="Defines the number of backups to keep if rolling backups are enabled"
+        )
         components.entry(frame, 1, 4, self.ui_state, "rolling_backup_count")
 
         # backup before save
-        components.label(frame, 2, 0, "Backup Before Save",
-                         tooltip="Create a full backup before saving the final model")
+        components.label(frame, 2, 0, "Backup Before Save", tooltip="Create a full backup before saving the final model")
         components.switch(frame, 2, 1, self.ui_state, "backup_before_save")
 
         # save after
-        components.label(frame, 3, 0, "Save Every",
-                         tooltip="The interval used when automatically saving the model during training")
+        components.label(frame, 3, 0, "Save Every", tooltip="The interval used when automatically saving the model during training")
         components.time_entry(frame, 3, 1, self.ui_state, "save_every", "save_every_unit")
 
         # save now
         components.button(frame, 3, 3, "save now", self.save_now)
 
         # skip save
-        components.label(frame, 4, 0, "Skip First",
-                         tooltip="Start saving automatically after this interval has elapsed")
+        components.label(frame, 4, 0, "Skip First", tooltip="Start saving automatically after this interval has elapsed")
         components.entry(frame, 4, 1, self.ui_state, "save_skip_first", width=50, sticky="nw")
 
         # save filename prefix
-        components.label(frame, 5, 0, "Save Filename Prefix",
-                         tooltip="The prefix for filenames used when saving the model during training")
+        components.label(frame, 5, 0, "Save Filename Prefix", tooltip="The prefix for filenames used when saving the model during training")
         components.entry(frame, 5, 1, self.ui_state, "save_filename_prefix")
 
         frame.pack(fill="both", expand=1)
@@ -357,39 +372,57 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(4, weight=1)
 
         # lora model name
-        components.label(frame, 0, 0, "LoRA base model",
-                         tooltip="The base LoRA to train on. Leave empty to create a new LoRA")
+        components.label(frame, 0, 0, "LoRA base model", tooltip="The base LoRA to train on. Leave empty to create a new LoRA")
         components.file_entry(
-            frame, 0, 1, self.ui_state, "lora_model_name",
-            path_modifier=lambda x: Path(x).parent.absolute() if x.endswith(".json") else x
+            frame, 0, 1, self.ui_state, "lora_model_name", path_modifier=lambda x: Path(x).parent.absolute() if x.endswith(".json") else x
         )
 
         # lora rank
-        components.label(frame, 1, 0, "LoRA rank",
-                         tooltip="The rank parameter used when creating a new LoRA")
+        components.label(frame, 1, 0, "LoRA rank", tooltip="The rank parameter used when creating a new LoRA")
         components.entry(frame, 1, 1, self.ui_state, "lora_rank")
 
         # lora rank
-        components.label(frame, 2, 0, "LoRA alpha",
-                         tooltip="The alpha parameter used when creating a new LoRA")
+        components.label(frame, 2, 0, "LoRA alpha", tooltip="The alpha parameter used when creating a new LoRA")
         components.entry(frame, 2, 1, self.ui_state, "lora_alpha")
 
         # Dropout Percentage
-        components.label(frame, 3, 0, "Dropout Probability",
-                         tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.")
+        components.label(
+            frame,
+            3,
+            0,
+            "Dropout Probability",
+            tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.",
+        )
         components.entry(frame, 3, 1, self.ui_state, "dropout_probability")
 
         # lora weight dtype
-        components.label(frame, 4, 0, "LoRA Weight Data Type",
-                         tooltip="The LoRA weight data type used for training. This can reduce memory consumption, but reduces precision")
-        components.options_kv(frame, 4, 1, [
-            ("float32", DataType.FLOAT_32),
-            ("bfloat16", DataType.BFLOAT_16),
-        ], self.ui_state, "lora_weight_dtype")
+        components.label(
+            frame,
+            4,
+            0,
+            "LoRA Weight Data Type",
+            tooltip="The LoRA weight data type used for training. This can reduce memory consumption, but reduces precision",
+        )
+        components.options_kv(
+            frame,
+            4,
+            1,
+            [
+                ("float32", DataType.FLOAT_32),
+                ("bfloat16", DataType.BFLOAT_16),
+            ],
+            self.ui_state,
+            "lora_weight_dtype",
+        )
 
         # For use with additional embeddings.
-        components.label(frame, 5, 0, "Bundle Embeddings",
-                         tooltip="Bundles any additional embeddings into the LoRA output file, rather than as separate files")
+        components.label(
+            frame,
+            5,
+            0,
+            "Bundle Embeddings",
+            tooltip="Bundles any additional embeddings into the LoRA output file, rather than as separate files",
+        )
         components.switch(frame, 5, 1, self.ui_state, "bundle_additional_embeddings")
 
         frame.pack(fill="both", expand=1)
@@ -404,34 +437,46 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(4, weight=1)
 
         # embedding model name
-        components.label(frame, 0, 0, "Base embedding",
-                         tooltip="The base embedding to train on. Leave empty to create a new embedding")
+        components.label(frame, 0, 0, "Base embedding", tooltip="The base embedding to train on. Leave empty to create a new embedding")
         components.file_entry(
-            frame, 0, 1, self.ui_state, "embedding.model_name",
-            path_modifier=lambda x: Path(x).parent.absolute() if x.endswith(".json") else x
+            frame,
+            0,
+            1,
+            self.ui_state,
+            "embedding.model_name",
+            path_modifier=lambda x: Path(x).parent.absolute() if x.endswith(".json") else x,
         )
 
         # token count
-        components.label(frame, 1, 0, "Token count",
-                         tooltip="The token count used when creating a new embedding")
+        components.label(frame, 1, 0, "Token count", tooltip="The token count used when creating a new embedding")
         components.entry(frame, 1, 1, self.ui_state, "embedding.token_count")
 
         # initial embedding text
-        components.label(frame, 2, 0, "Initial embedding text",
-                         tooltip="The initial embedding text used when creating a new embedding")
+        components.label(frame, 2, 0, "Initial embedding text", tooltip="The initial embedding text used when creating a new embedding")
         components.entry(frame, 2, 1, self.ui_state, "embedding.initial_embedding_text")
 
         # embedding weight dtype
-        components.label(frame, 3, 0, "Embedding Weight Data Type",
-                         tooltip="The Embedding weight data type used for training. This can reduce memory consumption, but reduces precision")
-        components.options_kv(frame, 3, 1, [
-            ("float32", DataType.FLOAT_32),
-            ("bfloat16", DataType.BFLOAT_16),
-        ], self.ui_state, "embedding_weight_dtype")
+        components.label(
+            frame,
+            3,
+            0,
+            "Embedding Weight Data Type",
+            tooltip="The Embedding weight data type used for training. This can reduce memory consumption, but reduces precision",
+        )
+        components.options_kv(
+            frame,
+            3,
+            1,
+            [
+                ("float32", DataType.FLOAT_32),
+                ("bfloat16", DataType.BFLOAT_16),
+            ],
+            self.ui_state,
+            "embedding_weight_dtype",
+        )
 
         # placeholder
-        components.label(frame, 4, 0, "Placeholder",
-                         tooltip="The placeholder used when using the embedding in a prompt")
+        components.label(frame, 4, 0, "Placeholder", tooltip="The placeholder used when using the embedding in a prompt")
         components.entry(frame, 4, 1, self.ui_state, "embedding.placeholder")
 
         frame.pack(fill="both", expand=1)
@@ -449,22 +494,18 @@ class TrainUI(ctk.CTk):
         frame.grid_columnconfigure(4, weight=1)
 
         # dataset
-        components.label(frame, 0, 0, "Dataset Tools",
-                         tooltip="Open the captioning tool")
+        components.label(frame, 0, 0, "Dataset Tools", tooltip="Open the captioning tool")
         components.button(frame, 0, 1, "Open", self.open_dataset_tool)
 
         # convert model
-        components.label(frame, 1, 0, "Convert Model Tools",
-                         tooltip="Open the model conversion tool")
+        components.label(frame, 1, 0, "Convert Model Tools", tooltip="Open the model conversion tool")
         components.button(frame, 1, 1, "Open", self.open_convert_model_tool)
 
         # sample
-        components.label(frame, 2, 0, "Sampling Tool",
-                         tooltip="Open the model sampling tool")
+        components.label(frame, 2, 0, "Sampling Tool", tooltip="Open the model sampling tool")
         components.button(frame, 2, 1, "Open", self.open_sampling_tool)
 
-        components.label(frame, 3, 0, "Profiling Tool",
-                         tooltip="Open the profiling tools.")
+        components.label(frame, 3, 0, "Profiling Tool", tooltip="Open the profiling tools.")
         components.button(frame, 3, 1, "Open", self.open_profiling_tool)
 
         frame.pack(fill="both", expand=1)
@@ -599,10 +640,14 @@ class TrainUI(ctk.CTk):
             self.training_commands.stop()
 
     def export_training(self):
-        file_path = filedialog.asksaveasfilename(filetypes=[
-            ("All Files", "*.*"),
-            ("json", "*.json"),
-        ], initialdir=".", initialfile="config.json")
+        file_path = filedialog.asksaveasfilename(
+            filetypes=[
+                ("All Files", "*.*"),
+                ("json", "*.json"),
+            ],
+            initialdir=".",
+            initialfile="config.json",
+        )
 
         if file_path:
             with open(file_path, "w") as f:
