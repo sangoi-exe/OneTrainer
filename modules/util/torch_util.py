@@ -20,8 +20,7 @@ def state_dict_has_prefix(state_dict: dict | None, prefix: str):
         return False
     return any(k.startswith(prefix) for k in state_dict)
 
-
-def get_tensors(
+def get_tensor_data(
         data: torch.Tensor | list | tuple | dict,
         include_parameter_indices: list[int] | None = None,
 ) -> list[torch.Tensor]:
@@ -35,7 +34,7 @@ def get_tensors(
                 tensors.extend(get_tensors(elem))
     elif isinstance(data, dict) and include_parameter_indices is None:
         for elem in data.values():
-            tensors.extend(get_tensors(elem))
+            tensors.extend(get_tensor_data(elem))
 
     return tensors
 
@@ -67,6 +66,73 @@ def add_dummy_grad_fn_(
     elif isinstance(data, dict):
         for key, elem in data.items():
             if isinstance(elem, torch.Tensor):
+                grad_tensor = torch \
+                    .zeros(size=(0, *elem.shape[1:]), requires_grad=True, device=elem.device, dtype=elem.dtype)
+                data[key] = torch.cat([elem, grad_tensor], dim=0)
+                return data
+            else:
+                data[key] = add_dummy_grad_fn_(elem)
+
+    return data
+
+def has_grad_fn(
+        data: torch.Tensor | list | tuple | dict,
+        include_parameter_indices: list[int] | None = None,
+) -> bool:
+    if isinstance(data, torch.Tensor) and include_parameter_indices is None:
+        return data.grad_fn is not None
+    elif isinstance(data, list | tuple):
+        for i, elem in enumerate(data):
+            if include_parameter_indices is None or i in include_parameter_indices:
+                if has_grad_fn(elem):
+                    return True
+    elif isinstance(data, dict) and include_parameter_indices is None:
+        for elem in data.values():
+            if has_grad_fn(elem):
+                return True
+
+    return False
+
+def add_dummy_grad_fn_(
+        data: torch.Tensor | list | tuple | dict,
+) -> Any:
+    if isinstance(data, torch.Tensor):
+        if data.grad_fn is not None:
+            return data
+        grad_tensor = torch\
+            .zeros(size=(0, *data.shape[1:]), requires_grad=True, device=data.device, dtype=data.dtype)
+        return torch.cat([data, grad_tensor], dim=0)
+    if isinstance(data, list):
+        for i, elem in enumerate(data):
+            if isinstance(elem, torch.Tensor):
+                if elem.grad_fn is not None:
+                    return data
+                grad_tensor = torch\
+                    .zeros(size=(0, *elem.shape[1:]), requires_grad=True, device=elem.device, dtype=elem.dtype)
+                data[i] = torch.cat([elem, grad_tensor], dim=0)
+                return data
+            else:
+                data[i] = add_dummy_grad_fn_(elem)
+    if isinstance(data, tuple):
+        for i, elem in enumerate(data):
+            if isinstance(elem, torch.Tensor):
+                if elem.grad_fn is not None:
+                    return data
+                grad_tensor = torch\
+                    .zeros(size=(0, *elem.shape[1:]), requires_grad=True, device=elem.device, dtype=elem.dtype)
+                data = list(data)
+                data[i] = torch.cat([elem, grad_tensor], dim=0)
+                data = tuple(data)
+                return data
+            else:
+                data = list(data)
+                data[i] = add_dummy_grad_fn_(elem)
+                data = tuple(data)
+    elif isinstance(data, dict):
+        for key, elem in data.items():
+            if isinstance(elem, torch.Tensor):
+                if elem.grad_fn is not None:
+                    return data
                 grad_tensor = torch \
                     .zeros(size=(0, *elem.shape[1:]), requires_grad=True, device=elem.device, dtype=elem.dtype)
                 data[key] = torch.cat([elem, grad_tensor], dim=0)

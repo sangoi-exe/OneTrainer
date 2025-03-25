@@ -4,16 +4,24 @@ from typing import Any
 
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.LayerOffloadConductor import LayerOffloadConductor
-from modules.util.torch_util import add_dummy_grad_fn_, get_tensors
+from modules.util.torch_util import add_dummy_grad_fn_, has_grad_fn
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from diffusers.models.attention import BasicTransformerBlock, JointTransformerBlock
+from diffusers.models.transformers.sana_transformer import SanaTransformerBlock
 from diffusers.models.transformers.transformer_flux import FluxSingleTransformerBlock, FluxTransformerBlock
+from diffusers.models.transformers.transformer_hunyuan_video import (
+    HunyuanVideoIndividualTokenRefinerBlock,
+    HunyuanVideoSingleTransformerBlock,
+    HunyuanVideoTransformerBlock,
+)
 from diffusers.models.unets.unet_stable_cascade import SDCascadeAttnBlock, SDCascadeResBlock, SDCascadeTimestepBlock
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.t5.modeling_t5 import T5Block
 
 
@@ -28,8 +36,6 @@ def __kwargs_to_args(fun: Callable, args: tuple[Any, ...], kwargs: dict[str, Any
             parameters.append(kwargs[key])
         elif value.default is not value.empty:
             parameters.append(value.default)
-        else:
-            raise Exception("could not convert from kwargs to args")
 
     return tuple(parameters)
 
@@ -88,6 +94,11 @@ def create_checkpointed_forward(
             args = bound_conductor.before_layer(bound_layer_index, call_id, args)
             output = orig_forward(*args)
             bound_conductor.after_layer(bound_layer_index, call_id, args)
+
+            # make sure at least one of the output tensors has a grad_fn so the output of the checkpoint has a grad_fn
+            if torch.is_grad_enabled() and not has_grad_fn(output):
+                output = add_dummy_grad_fn_(output)
+
             return output
 
         def custom_forward(
@@ -239,7 +250,45 @@ def enable_checkpointing_for_t5_encoder_layers(
         if isinstance(child_module, T5Block):
             child_module.forward = create_checkpointed_forward(
                 child_module, torch.device(config.train_device),
-                [],
+                [],  # No activation offloading, because the output might be taken from the middle of the network
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    return conductor
+
+
+def enable_checkpointing_for_gemma_layers(
+        orig_module: nn.Module,
+        config: TrainConfig,
+) -> LayerOffloadConductor:
+    conductor = LayerOffloadConductor(orig_module, config)
+
+    layer_index = 0
+    for child_module in orig_module.modules():
+        if isinstance(child_module, Gemma2DecoderLayer):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                [],  # No activation offloading, because the output might be taken from the middle of the network
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    return conductor
+
+
+def enable_checkpointing_for_llama_encoder_layers(
+        orig_module: nn.Module,
+        config: TrainConfig,
+) -> LayerOffloadConductor:
+    conductor = LayerOffloadConductor(orig_module, config)
+
+    layer_index = 0
+    for child_module in orig_module.modules():
+        if isinstance(child_module, LlamaDecoderLayer):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                [],  # No activation offloading, because the output might be taken from the middle of the network
                 conductor, layer_index,
             )
             layer_index += 1
@@ -258,7 +307,7 @@ def enable_checkpointing_for_stable_diffusion_3_transformer(
         if isinstance(child_module, JointTransformerBlock):
             child_module.forward = create_checkpointed_forward(
                 child_module, torch.device(config.train_device),
-                [],
+                ["hidden_states", "encoder_hidden_states"],
                 conductor, layer_index,
             )
             layer_index += 1
@@ -284,6 +333,60 @@ def enable_checkpointing_for_flux_transformer(
 
     for child_module in orig_module.modules():
         if isinstance(child_module, FluxSingleTransformerBlock):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                ["hidden_states"],
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    return conductor
+
+def enable_checkpointing_for_sana_transformer(
+        orig_module: nn.Module,
+        config: TrainConfig,
+) -> LayerOffloadConductor:
+    conductor = LayerOffloadConductor(orig_module, config)
+
+    layer_index = 0
+    for child_module in orig_module.modules():
+        if isinstance(child_module, SanaTransformerBlock):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                ["hidden_states"],
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    return conductor
+
+def enable_checkpointing_for_hunyuan_video_transformer(
+        orig_module: nn.Module,
+        config: TrainConfig,
+) -> LayerOffloadConductor:
+    conductor = LayerOffloadConductor(orig_module, config)
+
+    layer_index = 0
+    for child_module in orig_module.modules():
+        if isinstance(child_module, HunyuanVideoIndividualTokenRefinerBlock):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                ["hidden_states"],
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    for child_module in orig_module.modules():
+        if isinstance(child_module, HunyuanVideoTransformerBlock):
+            child_module.forward = create_checkpointed_forward(
+                child_module, torch.device(config.train_device),
+                ["hidden_states", "encoder_hidden_states"],
+                conductor, layer_index,
+            )
+            layer_index += 1
+
+    for child_module in orig_module.modules():
+        if isinstance(child_module, HunyuanVideoSingleTransformerBlock):
             child_module.forward = create_checkpointed_forward(
                 child_module, torch.device(config.train_device),
                 ["hidden_states"],

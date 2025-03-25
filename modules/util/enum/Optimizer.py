@@ -21,6 +21,8 @@ class Optimizer(Enum):
     AdEMAMix = 'AdEMAMix'
     AdEMAMix_8BIT = "AdEMAMix_8BIT"
 
+    ADOPT = 'ADOPT'
+
     LAMB = 'LAMB'
     LAMB_8BIT = 'LAMB_8BIT'
 
@@ -61,6 +63,7 @@ class Optimizer(Enum):
     ADABELIEF = 'ADABELIEF'
     TIGER = 'TIGER'
     AIDA = 'AIDA'
+    YOGI = 'YOGI'
 
     @property
     def is_adaptive(self):

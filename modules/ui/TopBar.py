@@ -1,6 +1,7 @@
 import json
 import os
 import traceback
+import webbrowser
 from collections.abc import Callable
 from contextlib import suppress
 
@@ -61,18 +62,21 @@ class TopBar:
         # TODO
         # components.icon_button(self.frame, 0, 2, "-", self.__remove_config)
 
+        # Wiki button
+        components.button(self.frame, 0, 4, "Wiki", self.open_wiki)
+
         # save button
         components.button(self.frame, 0, 3, "save current config", self.__save_config,
                           tooltip="Save the current configuration in a custom preset")
 
         # padding
-        self.frame.grid_columnconfigure(4, weight=1)
+        self.frame.grid_columnconfigure(5, weight=1)
 
         # model type
         components.options_kv(
             master=self.frame,
             row=0,
-            column=5,
+            column=6,
             values=[
                 ("Stable Diffusion 1.5", ModelType.STABLE_DIFFUSION_15),
                 ("Stable Diffusion 1.5 Inpainting", ModelType.STABLE_DIFFUSION_15_INPAINTING),
@@ -89,6 +93,8 @@ class TopBar:
                 ("PixArt Sigma", ModelType.PIXART_SIGMA),
                 ("Flux Dev", ModelType.FLUX_DEV_1),
                 ("Flux Fill Dev", ModelType.FLUX_FILL_DEV_1),
+                ("Sana", ModelType.SANA),
+                ("Hunyuan Video", ModelType.HUNYUAN_VIDEO),
             ],
             ui_state=self.ui_state,
             var_name="model_type",
@@ -112,7 +118,9 @@ class TopBar:
                 or self.train_config.model_type.is_stable_diffusion_xl() \
                 or self.train_config.model_type.is_wuerstchen() \
                 or self.train_config.model_type.is_pixart() \
-                or self.train_config.model_type.is_flux():
+                or self.train_config.model_type.is_flux() \
+                or self.train_config.model_type.is_sana() \
+                or self.train_config.model_type.is_hunyuan_video():
             values = [
                 ("Fine Tune", TrainingMethod.FINE_TUNE),
                 ("LoRA", TrainingMethod.LORA),
@@ -123,7 +131,7 @@ class TopBar:
         self.training_method = components.options_kv(
             master=self.frame,
             row=0,
-            column=6,
+            column=7,
             values=values,
             ui_state=self.ui_state,
             var_name="training_method",
@@ -162,7 +170,7 @@ class TopBar:
             config_dict.pop('secrets')
 
         with open(path, "w") as f:
-            json.dump(config_dict, f, indent=4)
+            json.dump(self.train_config.to_settings_dict(secrets=False), f, indent=4)
 
         return path
 

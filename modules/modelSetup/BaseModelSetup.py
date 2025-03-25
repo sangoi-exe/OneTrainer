@@ -189,7 +189,7 @@ class BaseModelSetup(
         train_progress: TrainProgress,
     ):
         return self.single_action_elapsed(
-            "stop_embedding_training",
+            "stop_embedding_training_" + str(config.uuid),
             config.stop_training_after,
             config.stop_training_after_unit,
             train_progress,
