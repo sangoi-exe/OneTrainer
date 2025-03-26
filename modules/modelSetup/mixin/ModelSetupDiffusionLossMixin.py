@@ -6,7 +6,6 @@ from modules.module.HPSv2ScoreModel import HPSv2ScoreModel
 from modules.util.TrainProgress import TrainProgress
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
-from modules.util.enum.AlignPropLoss import AlignPropLoss
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses

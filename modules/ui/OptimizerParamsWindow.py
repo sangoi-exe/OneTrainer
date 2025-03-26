@@ -10,6 +10,7 @@ from modules.util.optimizer_util import (
     update_optimizer_config,
 )
 from modules.util.ui import components
+from modules.util.ui.ui_utils import set_window_icon
 
 import customtkinter as ctk
 
@@ -32,8 +33,9 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
         self.title("Optimizer Settings")
-        self.geometry("800x400")
+        self.geometry("800x500")
         self.resizable(True, True)
+        set_window_icon(self)
         self.wait_visibility()
         self.grab_set()
         self.focus_set()
@@ -53,6 +55,7 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
 
         components.button(self, 1, 0, "ok", command=self.on_window_close)
         self.main_frame(self.frame)
+        self.after(150, lambda: set_window_icon(self))
 
     def main_frame(self, master):
         # Optimizer
@@ -111,6 +114,7 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'fused_back_pass': {'title': 'Fused Back Pass', 'tooltip': 'Whether to fuse the back propagation pass with the optimizer step. This reduces VRAM usage, but is not compatible with gradient accumulation.', 'type': 'bool'},
             'growth_rate': {'title': 'Growth Rate', 'tooltip': 'Limit for D estimate growth rate.', 'type': 'float'},
             'initial_accumulator_value': {'title': 'Initial Accumulator Value', 'tooltip': 'Initial value for Adagrad optimizer.', 'type': 'float'},
+            'initial_accumulator': {'title': 'Initial Accumulator', 'tooltip': 'Sets the starting value for both moment estimates to ensure numerical stability and balanced adaptive updates early in training.', 'type': 'float'},
             'is_paged': {'title': 'Is Paged', 'tooltip': 'Whether the optimizer\'s internal state should be paged to CPU.', 'type': 'bool'},
             'log_every': {'title': 'Log Every', 'tooltip': 'Intervals at which logging should occur.', 'type': 'int'},
             'lr_decay': {'title': 'LR Decay', 'tooltip': 'Rate at which learning rate decreases.', 'type': 'float'},
@@ -142,7 +146,8 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'r': {'title': 'R', 'tooltip': 'EMA factor.', 'type': 'float'},
             'adanorm': {'title': 'AdaNorm', 'tooltip': 'Whether to use the AdaNorm variant', 'type': 'bool'},
             'adam_debias': {'title': 'Adam Debias', 'tooltip': 'Only correct the denominator to avoid inflating step sizes early in training.', 'type': 'bool'},
-
+            'slice_p': {'title': 'Slice parameters', 'tooltip': 'Reduce memory usage by calculating LR adaptation statistics on only every pth entry of each tensor. For values greater than 1 this is an approximation to standard Prodigy. Values ~11 are reasonable.', 'type': 'int'},
+            'cautious': {'title': 'Cautious', 'tooltip': 'Whether to use the Cautious variant.', 'type': 'bool'},
         }
         # @formatter:on
 
