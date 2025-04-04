@@ -166,7 +166,6 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("xi", None, float, True))
         data.append(("n_sma_threshold", None, int, True))
         data.append(("ams_bound", False, bool, False))
-        data.append(("r", None, float, True))
         data.append(("adanorm", False, bool, False))
         data.append(("adam_debias", False, bool, False))
         data.append(("slice_p", None, int, True))

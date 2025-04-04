@@ -23,7 +23,7 @@ debug*.py
 /update.var
 config.json
 secrets.json
-snapshotIt.py
+snapshotLegacy.py
 
 # environments
 /.venv*

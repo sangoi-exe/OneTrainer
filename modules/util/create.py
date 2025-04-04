@@ -123,6 +123,9 @@ from modules.util.optimizer.adamw_extensions import patch_adamw
 from modules.util.optimizer.prodigy_extensions import patch_prodigy
 from modules.util.TrainProgress import TrainProgress
 
+from prodigyopt import Prodigy as ProdigyOptimizer
+from modules.util.prodigy_extensions import patch_prodigy
+
 import torch
 from torch.nn import Parameter
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler, SequentialLR
@@ -828,26 +831,30 @@ def create_optimizer(
 
         # PRODIGY Optimizer
         case Optimizer.PRODIGY:
-            import prodigyopt
-            optimizer = prodigyopt.Prodigy(
+            # Usar ProdigyOptimizer para evitar conflito com Enum
+            optimizer = ProdigyOptimizer(
                 params=parameters,
-                lr=config.learning_rate,
+                lr=config.learning_rate, # Prodigy recomenda LR=1.0, mas usamos o config LR como multiplicador
                 betas=(optimizer_config.beta1 if optimizer_config.beta1 is not None else 0.9,
                        optimizer_config.beta2 if optimizer_config.beta2 is not None else 0.999),
-                beta3=optimizer_config.beta3 if optimizer_config.beta3 is not None else None,
+                beta3=optimizer_config.beta3, # Pode ser None
                 eps=optimizer_config.eps if optimizer_config.eps is not None else 1e-8,
-                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0,
+                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0.0,
                 decouple=optimizer_config.decouple if optimizer_config.decouple is not None else True,
                 use_bias_correction=optimizer_config.use_bias_correction if optimizer_config.use_bias_correction is not None else False,
                 safeguard_warmup=optimizer_config.safeguard_warmup if optimizer_config.safeguard_warmup is not None else False,
                 d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-6,
                 d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 1.0,
                 growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else float('inf'),
-                fsdp_in_use=optimizer_config.fsdp_in_use if optimizer_config.fsdp_in_use is not None else False,
+                fsdp_in_use=optimizer_config.fsdp_in_use if optimizer_config.fsdp_in_use is not None else False, # Pode precisar de auto-detecção melhorada
                 slice_p=optimizer_config.slice_p if optimizer_config.slice_p is not None else 1,
             )
-            if optimizer_config.stochastic_rounding:
-                patch_prodigy(optimizer, optimizer_config.stochastic_rounding)
+            # Aplicar patch para adicionar métodos e rounding estocástico
+            # Determinar se rounding deve ser ativo (ex: se dtype for bf16)
+            use_stochastic_rounding = config.optimizer.stochastic_rounding and config.train_dtype == config.train_dtype.BFLOAT_16
+            patch_prodigy(optimizer, use_stochastic_rounding)
+            # Marcar como schedule-free para compatibilidade com OneTrainer
+            optimizer.is_schedule_free = True
 
         # ADAFactor Optimizer
         case Optimizer.ADAFACTOR:

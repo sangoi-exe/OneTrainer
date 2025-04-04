@@ -706,6 +706,45 @@ class GenericTrainer(BaseTrainer):
                         )
 
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+                        
+												# ALTERAÇÃO INSERIDA: Modificar a lógica de step/update para fused backward pass
+                        # Step the optimizer and update scaler if NOT using fused back pass
+                        if not (self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass()):
+                            if scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                                # scaler.update() will be called below, outside this condition
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
+
+                            # Zero gradients only if not using fused back pass (where it's done in the hook)
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False # Gradients are gone now
+
+                        # Always update the scaler if it exists (even in fused mode, to adjust scale)
+                        if scaler:
+                             scaler.update()
+
+                        # Always step the LR scheduler (schedule-free optimizers ignore this)
+                        lr_scheduler.step()
+
+                        # Zero grad again just in case, though should be redundant in fused mode
+                        if self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass():
+                             self.model.optimizer.zero_grad(set_to_none=True)
+                             has_gradient = False # Ensure flag is correct
+
+                        # Report learning rate after potential scheduler step
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler, self.tensorboard
+                        )
+
+                        # Log loss values
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+												
                         ema_loss = ema_loss or accumulated_loss
                         ema_loss_steps += 1
                         ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))

@@ -64,6 +64,7 @@ class Optimizer(Enum):
     TIGER = 'TIGER'
     AIDA = 'AIDA'
     YOGI = 'YOGI'
+    PRODIGY = 'PRODIGY'
 
     @property
     def is_adaptive(self):
@@ -89,6 +90,7 @@ class Optimizer(Enum):
             Optimizer.CAME,
             Optimizer.ADAM,
             Optimizer.ADAMW,
+            Optimizer.PRODIGY,
         ]
 
     # Small helper for adjusting learning rates to adaptive optimizers.
