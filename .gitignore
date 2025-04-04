@@ -23,6 +23,7 @@ debug*.py
 /update.var
 config.json
 secrets.json
+snapshotLegacy.py
 
 # environments
 /.venv*
@@ -40,3 +41,4 @@ pixi.toml
 /src
 train.bat
 debug_report.log
+secrets.json

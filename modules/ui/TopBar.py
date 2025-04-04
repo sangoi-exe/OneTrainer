@@ -165,6 +165,10 @@ class TopBar:
         name = path_util.safe_filename(name)
         path = path_util.canonical_join("training_presets", f"{name}.json")
 
+        config_dict = self.train_config.to_dict()
+        if 'secrets' in config_dict:
+            config_dict.pop('secrets')
+
         with open(path, "w") as f:
             json.dump(self.train_config.to_settings_dict(secrets=False), f, indent=4)
 

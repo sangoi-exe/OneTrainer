@@ -680,6 +680,10 @@ class TrainUI(ctk.CTk):
         )
 
         if file_path:
+            config_dict=self.train_config.to_pack_dict()
+            if 'secrets' in config_dict:
+                config_dict.pop('secrets')
+
             with open(file_path, "w") as f:
                 json.dump(self.train_config.to_pack_dict(secrets=False), f, indent=4)
 

@@ -259,18 +259,19 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     Optimizer.PRODIGY: {
         "beta1": 0.9,
         "beta2": 0.999,
-        "beta3": None,
+        "beta3": None, # Defaults to sqrt(beta2)
         "eps": 1e-8,
-        "weight_decay": 0,
-        "decouple": True,
-        "use_bias_correction": False,
-        "safeguard_warmup": False,
+        "weight_decay": 0.0,
+        "decouple": True, # Recommended default
+        "use_bias_correction": True, # Recommended default
+        "safeguard_warmup": True, # Recommended default
         "d0": 1e-6,
-        "d_coef": 1.0,
+        "d_coef": 1.0, # Changed from original Prodigy default of 2.0 based on some recommendations, keep 1.0 from user example
         "growth_rate": float('inf'),
-        "stochastic_rounding": False,
-        "fsdp_in_use": False,
-        "slice_p": 11,
+        "fsdp_in_use": False, # Auto-detected in Prodigy, but kept for consistency
+        "slice_p": 1, # Default value, user can override
+        "stochastic_rounding": True, # Default to True, useful for BF16
+        "fused_back_pass": True, # User explicitly enables this via config
     },
     Optimizer.DADAPT_ADA_GRAD: {
         "momentum": 0,

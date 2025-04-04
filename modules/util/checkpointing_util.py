@@ -87,6 +87,10 @@ def create_checkpointed_forward(
             if bound_layer_index == 0 and not torch.is_grad_enabled():
                 bound_conductor.start_forward(True)
 
+            # make sure at least one of the input tensors has a grad_fn so the output has a grad_fn
+            if not any(t.requires_grad for t in get_tensors(args)):
+                args = add_dummy_grad_fn_(args)
+
             args = bound_conductor.before_layer(bound_layer_index, call_id, args)
             output = orig_forward(*args)
             bound_conductor.after_layer(bound_layer_index, call_id, args)

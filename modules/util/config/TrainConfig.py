@@ -6,10 +6,14 @@ from typing import Any
 
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.config.CloudConfig import CloudConfig
+from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AlignPropLoss import AlignPropLoss
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -70,6 +74,7 @@ class TrainOptimizerConfig(BaseConfig):
     nesterov: bool
     no_prox: bool
     optim_bits: int
+    percentile_clipping: int
     percentile_clipping: int
     r: float
     relative_step: bool
@@ -142,6 +147,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("no_prox", False, bool, False))
         data.append(("optim_bits", None, int, True))
         data.append(("percentile_clipping", None, int, True))
+        data.append(("percentile_clipping", None, int, True))
         data.append(("r", None, float, True))
         data.append(("relative_step", False, bool, False))
         data.append(("safeguard_warmup", False, bool, False))
@@ -160,7 +166,6 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("xi", None, float, True))
         data.append(("n_sma_threshold", None, int, True))
         data.append(("ams_bound", False, bool, False))
-        data.append(("r", None, float, True))
         data.append(("adanorm", False, bool, False))
         data.append(("adam_debias", False, bool, False))
         data.append(("slice_p", None, int, True))
@@ -281,6 +286,7 @@ class TrainConfig(BaseConfig):
     learning_rate: float
     learning_rate_warmup_steps: float
     learning_rate_cycles: float
+    learning_rate_min_factor: float
     learning_rate_min_factor: float
     epochs: int
     batch_size: int

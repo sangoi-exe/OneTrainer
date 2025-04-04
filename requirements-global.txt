@@ -9,11 +9,18 @@ huggingface-hub==0.28.1
 scipy==1.15.1; sys_platform != 'win32'
 matplotlib==3.10.0
 av==14.1.0 # using an older version. only update once torchvision has been updated as well.
+huggingface-hub==0.28.1
+scipy==1.15.1; sys_platform != 'win32'
+matplotlib==3.10.0
+av==14.1.0 # using an older version. only update once torchvision has been updated as well.
 
 # pytorch
 accelerate==1.3.0
 safetensors==0.5.2
+accelerate==1.3.0
+safetensors==0.5.2
 tensorboard==2.18.0
+pytorch-lightning==2.5.0.post0
 pytorch-lightning==2.5.0.post0
 
 # stable diffusion
@@ -25,6 +32,7 @@ invisible-watermark==0.2.0 # needed for the SDXL pipeline
 
 # other models
 pooch==1.8.2
+open-clip-torch==2.30.0
 open-clip-torch==2.30.0
 
 # data loader

@@ -22,6 +22,7 @@ from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 
 class BasePixArtAlphaSetup(
