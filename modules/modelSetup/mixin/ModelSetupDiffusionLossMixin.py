@@ -36,41 +36,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		self.loss_tracker = LossTracker(window_size=100, use_mad=False)
 		self.dynamic_loss_strengthing = DynamicLossStrength()
 
-	def __align_prop_losses(
-		self,
-		batch: dict,
-		data: dict,
-		config: TrainConfig,
-		train_device: torch.device,
-	):
-		if self.__align_prop_loss_fn is None:
-			dtype = data["predicted"].dtype
-
-			match config.align_prop_loss:
-				case AlignPropLoss.HPS:
-					self.__align_prop_loss_fn = HPSv2ScoreModel(dtype)
-				case AlignPropLoss.AESTHETIC:
-					self.__align_prop_loss_fn = AestheticScoreModel()
-
-			self.__align_prop_loss_fn.to(device=train_device, dtype=dtype)
-			self.__align_prop_loss_fn.requires_grad_(False)
-			self.__align_prop_loss_fn.eval()
-
-		losses = 0
-
-		match config.align_prop_loss:
-			case AlignPropLoss.HPS:
-				with torch.autocast(
-					device_type=train_device.type, dtype=data["predicted"].dtype
-				):
-					losses = self.__align_prop_loss_fn(
-						data["predicted"], batch["prompt"], train_device
-					)
-			case AlignPropLoss.AESTHETIC:
-				losses = self.__align_prop_loss_fn(data["predicted"])
-
-		return losses * config.align_prop_weight
-
 	def __log_cosh_loss(
 			self,
 			pred: torch.Tensor,
@@ -375,8 +340,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		epsilon = 1e-8
 
 		# 2) Cálculo do MAPE (já presente)
-		mape = torch.abs((target - predicted) / (target + epsilon))
-		mape = torch.clamp(mape, min=0, max=1).mean(dim=[1, 2, 3])
+		# 2) Blend MAPE + MSPE (peso 50/50)
+		abs_percent_error = torch.abs((target - predicted) / (target + epsilon)).clamp(min=0, max=1)
+		sq_percent_error = abs_percent_error ** 2
+		blended_error = 0.5 * abs_percent_error + 0.5 * sq_percent_error
+		mape = blended_error.mean(dim=[1, 2, 3])
 
 		# -----------------------------------------------------------------------
 		# CÁLCULO DO FATOR DE PROGRESSO

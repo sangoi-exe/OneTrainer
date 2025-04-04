@@ -297,6 +297,7 @@ class TrainConfig(BaseConfig):
     only_cache: bool
     resolution: str
     frames: str
+    loss_mode_fn: LossMode
     mse_strength: float
     mae_strength: float
     log_cosh_strength: float
@@ -776,6 +777,7 @@ class TrainConfig(BaseConfig):
         data.append(("only_cache", False, bool, False))
         data.append(("resolution", "512", str, False))
         data.append(("frames", "25", str, False))
+        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("log_cosh_strength", 0.0, float, False))
