@@ -1,5 +1,3 @@
-# --- START OF FILE loraModuleOneTrainer.txt (com geração automática no __init__) ---
-
 import copy
 import math
 from abc import abstractmethod

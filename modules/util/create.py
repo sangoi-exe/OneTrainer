@@ -124,7 +124,7 @@ from modules.util.optimizer.prodigy_extensions import patch_prodigy
 from modules.util.TrainProgress import TrainProgress
 
 from prodigyopt import Prodigy as ProdigyOptimizer
-from modules.util.prodigy_extensions import patch_prodigy
+from modules.util.optimizer.prodigy_extensions import patch_prodigy
 
 import torch
 from torch.nn import Parameter

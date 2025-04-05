@@ -1,0 +1,3405 @@
+# Snapshot do Projeto
+Timestamp: 20250405_131232
+
+## Estrutura do Projeto:
++-- docs/
++-- embedding_templates/
++-- modules/
+    +-- modules\cloud/
+    +-- modules\dataLoader/
+        +-- modules\dataLoader\flux/
+        +-- modules\dataLoader\mixin/
+        +-- modules\dataLoader\wuerstchen/
+    +-- modules\model/
+        +-- modules\model\util/
+    +-- modules\modelLoader/
+        +-- modules\modelLoader\flux/
+        +-- modules\modelLoader\hunyuanVideo/
+        +-- modules\modelLoader\mixin/
+        +-- modules\modelLoader\pixartAlpha/
+        +-- modules\modelLoader\sana/
+        +-- modules\modelLoader\stableDiffusion/
+        +-- modules\modelLoader\stableDiffusion3/
+        +-- modules\modelLoader\stableDiffusionXL/
+        +-- modules\modelLoader\wuerstchen/
+    +-- modules\modelSampler/
+    +-- modules\modelSaver/
+        +-- modules\modelSaver\flux/
+        +-- modules\modelSaver\hunyuanVideo/
+        +-- modules\modelSaver\mixin/
+        +-- modules\modelSaver\pixartAlpha/
+        +-- modules\modelSaver\sana/
+        +-- modules\modelSaver\stableDiffusion/
+        +-- modules\modelSaver\stableDiffusion3/
+        +-- modules\modelSaver\stableDiffusionXL/
+        +-- modules\modelSaver\wuerstchen/
+    +-- modules\modelSetup/
+        +-- modules\modelSetup\BaseStableDiffusionXLSetup.py
+        +-- modules\modelSetup\flux/
+        +-- modules\modelSetup\mixin/
+        +-- modules\modelSetup\stableDiffusion3/
+    +-- modules\module/
+        +-- modules\module\LoRAModule.py
+        +-- modules\module\quantized/
+            +-- modules\module\quantized\mixin/
+    +-- modules\trainer/
+        +-- modules\trainer\GenericTrainer.py
+    +-- modules\ui/
+    +-- modules\util/
+        +-- modules\util\checkpointing_util.py
+        +-- modules\util\args/
+        +-- modules\util\callbacks/
+        +-- modules\util\commands/
+        +-- modules\util\config/
+            +-- modules\util\config\TrainConfig.py
+        +-- modules\util\convert/
+        +-- modules\util\enum/
+        +-- modules\util\loss/
+        +-- modules\util\modelSpec/
+        +-- modules\util\optimizer/
+        +-- modules\util\ui/
+    +-- modules\zluda/
++-- resources/
+    +-- resources\icons/
+    +-- resources\images/
+    +-- resources\model_config/
+        +-- resources\model_config\stable_cascade/
+        +-- resources\model_config\stable_diffusion/
+        +-- resources\model_config\stable_diffusion_xl/
+    +-- resources\sd_model_spec/
++-- scripts/
+    +-- scripts\util/
++-- training_concepts/
++-- training_presets/
++-- training_samples/
+
+
+## Conteúdo do Projeto:
++-- docs/
++-- embedding_templates/
++-- modules/
+    +-- modules\cloud/
+    +-- modules\dataLoader/
+        +-- modules\dataLoader\flux/
+        +-- modules\dataLoader\mixin/
+        +-- modules\dataLoader\wuerstchen/
+    +-- modules\model/
+        +-- modules\model\util/
+    +-- modules\modelLoader/
+        +-- modules\modelLoader\flux/
+        +-- modules\modelLoader\hunyuanVideo/
+        +-- modules\modelLoader\mixin/
+        +-- modules\modelLoader\pixartAlpha/
+        +-- modules\modelLoader\sana/
+        +-- modules\modelLoader\stableDiffusion/
+        +-- modules\modelLoader\stableDiffusion3/
+        +-- modules\modelLoader\stableDiffusionXL/
+        +-- modules\modelLoader\wuerstchen/
+    +-- modules\modelSampler/
+    +-- modules\modelSaver/
+        +-- modules\modelSaver\flux/
+        +-- modules\modelSaver\hunyuanVideo/
+        +-- modules\modelSaver\mixin/
+        +-- modules\modelSaver\pixartAlpha/
+        +-- modules\modelSaver\sana/
+        +-- modules\modelSaver\stableDiffusion/
+        +-- modules\modelSaver\stableDiffusion3/
+        +-- modules\modelSaver\stableDiffusionXL/
+        +-- modules\modelSaver\wuerstchen/
+    +-- modules\modelSetup/
+        +-- modules\modelSetup\BaseStableDiffusionXLSetup.py
+            ```BaseStableDiffusionXLSetup.py
+from abc import ABCMeta
+from random import Random
+
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
+from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiffusionLossMixin
+from modules.modelSetup.mixin.ModelSetupDiffusionMixin import ModelSetupDiffusionMixin
+from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
+from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
+from modules.util.checkpointing_util import (
+	enable_checkpointing_for_basic_transformer_blocks,
+	enable_checkpointing_for_clip_encoder_layers,
+)
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.conv_util import apply_circular_padding_to_conv2d
+from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.quantization_util import quantize_layers
+from modules.util.TrainProgress import TrainProgress
+from torch.utils.tensorboard import SummaryWriter
+
+import torch
+from torch import Tensor
+
+from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+
+class BaseStableDiffusionXLSetup(
+	BaseModelSetup,
+	ModelSetupDiffusionLossMixin,
+	ModelSetupDebugMixin,
+	ModelSetupNoiseMixin,
+	ModelSetupDiffusionMixin,
+	ModelSetupEmbeddingMixin,
+	metaclass=ABCMeta
+):
+
+	def setup_optimizations(
+			self,
+			model: StableDiffusionXLModel,
+			config: TrainConfig,
+	):
+		model.unet_offload_conductor = None # Inicializa como None
+
+		if config.gradient_checkpointing.enabled():
+			model.unet_offload_conductor = None
+			model.text_encoder_1_offload_conductor = None # Não usado para CLIP, mas seguro zerar
+			model.text_encoder_2_offload_conductor = None # Não usado para CLIP, mas seguro zerar
+
+		if config.gradient_checkpointing != GradientCheckpointingMethod.OFF:
+			unet_conductor_or_none = enable_checkpointing_for_basic_transformer_blocks(model.unet, config, offload_enabled=True)
+			enable_checkpointing_for_clip_encoder_layers(model.text_encoder_1, config)
+			enable_checkpointing_for_clip_encoder_layers(model.text_encoder_2, config)
+
+			if config.gradient_checkpointing == GradientCheckpointingMethod.CPU_OFFLOADED:
+				model.unet_offload_conductor = unet_conductor_or_none
+
+		if config.force_circular_padding:
+			apply_circular_padding_to_conv2d(model.vae)
+			apply_circular_padding_to_conv2d(model.unet)
+			if model.unet_lora is not None:
+				apply_circular_padding_to_conv2d(model.unet_lora)
+
+		model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
+			config.weight_dtypes().unet,
+			config.weight_dtypes().text_encoder,
+			config.weight_dtypes().text_encoder_2,
+			config.weight_dtypes().vae,
+			config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
+			config.weight_dtypes().embedding if config.train_any_embedding() else None,
+		], config.enable_autocast_cache)
+
+		model.vae_autocast_context, model.vae_train_dtype = disable_fp16_autocast_context(
+			self.train_device,
+			config.train_dtype,
+			config.fallback_train_dtype,
+			[
+				config.weight_dtypes().vae,
+			],
+			config.enable_autocast_cache,
+		)
+
+		quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype)
+		quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype)
+		quantize_layers(model.vae, self.train_device, model.vae_train_dtype)
+		quantize_layers(model.unet, self.train_device, model.train_dtype)
+
+	def _setup_embeddings(
+			self,
+			model: StableDiffusionXLModel,
+			config: TrainConfig,
+	):
+		additional_embeddings = []
+		for embedding_config in config.all_embedding_configs():
+			embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
+			if embedding_state is None:
+				embedding_state_1 = self._create_new_embedding(
+					embedding_config,
+					model.tokenizer_1,
+					model.text_encoder_1,
+					lambda text: model.encode_text(
+						text=text,
+						train_device=self.temp_device,
+					)[0][0][1:],
+				)
+
+				embedding_state_2 = self._create_new_embedding(
+					embedding_config,
+					model.tokenizer_2,
+					model.text_encoder_2,
+					lambda text: model.encode_text(
+						text=text,
+						train_device=self.temp_device,
+					)[1][0][1:],
+				)
+			else:
+				embedding_state_1 = embedding_state.get("clip_l_out", embedding_state.get("clip_l", None))
+				embedding_state_2 = embedding_state.get("clip_g_out", embedding_state.get("clip_g", None))
+
+			embedding_state_1 = embedding_state_1.to(
+				dtype=model.text_encoder_1.get_input_embeddings().weight.dtype,
+				device=self.train_device,
+			).detach()
+
+			embedding_state_2 = embedding_state_2.to(
+				dtype=model.text_encoder_2.get_input_embeddings().weight.dtype,
+				device=self.train_device,
+			).detach()
+
+			embedding = StableDiffusionXLModelEmbedding(
+				embedding_config.uuid,
+				embedding_state_1,
+				embedding_state_2,
+				embedding_config.placeholder,
+				embedding_config.is_output_embedding,
+			)
+			if embedding_config.uuid == config.embedding.uuid:
+				model.embedding = embedding
+			else:
+				additional_embeddings.append(embedding)
+
+		model.additional_embeddings = additional_embeddings
+
+		self._add_embeddings_to_tokenizer(model.tokenizer_1, model.all_text_encoder_1_embeddings())
+		self._add_embeddings_to_tokenizer(model.tokenizer_2, model.all_text_encoder_2_embeddings())
+
+	def _setup_embedding_wrapper(
+			self,
+			model: StableDiffusionXLModel,
+			config: TrainConfig,
+	):
+		model.embedding_wrapper_1 = AdditionalEmbeddingWrapper(
+			tokenizer=model.tokenizer_1,
+			orig_module=model.text_encoder_1.text_model.embeddings.token_embedding,
+			embeddings=model.all_text_encoder_1_embeddings(),
+		)
+		model.embedding_wrapper_2 = AdditionalEmbeddingWrapper(
+			tokenizer=model.tokenizer_2,
+			orig_module=model.text_encoder_2.text_model.embeddings.token_embedding,
+			embeddings=model.all_text_encoder_2_embeddings(),
+		)
+
+		model.embedding_wrapper_1.hook_to_module()
+		model.embedding_wrapper_2.hook_to_module()
+
+	def _setup_embeddings_requires_grad(
+			self,
+			model: StableDiffusionXLModel,
+			config: TrainConfig,
+	):
+		for embedding, embedding_config in zip(model.all_text_encoder_1_embeddings(),
+											   config.all_embedding_configs(), strict=True):
+			train_embedding_1 = \
+				embedding_config.train \
+				and config.text_encoder.train_embedding \
+				and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+			embedding.requires_grad_(train_embedding_1)
+
+		for embedding, embedding_config in zip(model.all_text_encoder_2_embeddings(),
+											   config.all_embedding_configs(), strict=True):
+			train_embedding_2 = \
+				embedding_config.train \
+				and config.text_encoder_2.train_embedding \
+				and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+			embedding.requires_grad_(train_embedding_2)
+
+	def predict(
+			self,
+			model: StableDiffusionXLModel,
+			batch: dict,
+			config: TrainConfig,
+			train_progress: TrainProgress,
+			*,
+			deterministic: bool = False,
+	) -> dict:
+		with model.autocast_context:
+			batch_seed = 0 if deterministic else train_progress.global_step
+			generator = torch.Generator(device=config.train_device)
+			generator.manual_seed(batch_seed)
+			rand = Random(batch_seed)
+
+			vae_scaling_factor = model.vae.config['scaling_factor']
+
+			text_encoder_output, pooled_text_encoder_2_output = model.combine_text_encoder_output(*model.encode_text(
+				train_device=self.train_device,
+				batch_size=batch['latent_image'].shape[0],
+				rand=rand,
+				tokens_1=batch['tokens_1'],
+				tokens_2=batch['tokens_2'],
+				text_encoder_1_layer_skip=config.text_encoder_layer_skip,
+				text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
+				text_encoder_1_output=batch[
+					'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+				text_encoder_2_output=batch[
+					'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+				pooled_text_encoder_2_output=batch[
+					'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+				text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
+				text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
+			))
+
+			latent_image = batch['latent_image']
+			scaled_latent_image = latent_image * vae_scaling_factor
+
+			scaled_latent_conditioning_image = None
+			if config.model_type.has_conditioning_image_input():
+				scaled_latent_conditioning_image = batch['latent_conditioning_image'] * vae_scaling_factor
+
+			latent_noise = self._create_noise(scaled_latent_image, config, generator)
+
+			timestep = self._get_timestep_discrete(
+				model.noise_scheduler.config['num_train_timesteps'],
+				deterministic,
+				generator,
+				scaled_latent_image.shape[0],
+				config,
+			)
+
+			scaled_noisy_latent_image = self._add_noise_discrete(
+				scaled_latent_image,
+				latent_noise,
+				timestep,
+				model.noise_scheduler.betas,
+			)
+
+			original_height = batch['original_resolution'][0]
+			original_width = batch['original_resolution'][1]
+			crops_coords_top = batch['crop_offset'][0]
+			crops_coords_left = batch['crop_offset'][1]
+			target_height = batch['crop_resolution'][0]
+			target_width = batch['crop_resolution'][1]
+
+			add_time_ids = torch.stack([
+				original_height,
+				original_width,
+				crops_coords_top,
+				crops_coords_left,
+				target_height,
+				target_width
+			], dim=1)
+
+			add_time_ids = add_time_ids.to(
+				dtype=scaled_noisy_latent_image.dtype,
+				device=scaled_noisy_latent_image.device,
+			)
+
+			if config.model_type.has_mask_input() and config.model_type.has_conditioning_image_input():
+				latent_input = torch.concat(
+					[scaled_noisy_latent_image, batch['latent_mask'], scaled_latent_conditioning_image], 1
+				)
+			else:
+				latent_input = scaled_noisy_latent_image
+
+			added_cond_kwargs = {"text_embeds": pooled_text_encoder_2_output, "time_ids": add_time_ids}
+			predicted_latent_noise = model.unet(
+				sample=latent_input.to(dtype=model.train_dtype.torch_dtype()),
+				timestep=timestep,
+				encoder_hidden_states=text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
+				added_cond_kwargs=added_cond_kwargs,
+			).sample
+
+			model_output_data = {}
+
+			if model.noise_scheduler.config.prediction_type == 'epsilon':
+				model_output_data = {
+					'loss_type': 'target',
+					'timestep': timestep,
+					'predicted': predicted_latent_noise,
+					'target': latent_noise,
+				}
+			elif model.noise_scheduler.config.prediction_type == 'v_prediction':
+				target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
+				model_output_data = {
+					'loss_type': 'target',
+					'timestep': timestep,
+					'predicted': predicted_latent_noise,
+					'target': target_velocity,
+				}
+
+			if config.debug_mode:
+				with torch.no_grad():
+					self._save_text(
+						self._decode_tokens(batch['tokens_1'], model.tokenizer_1),
+						config.debug_dir + "/training_batches",
+						"7-prompt",
+						train_progress.global_step,
+					)
+
+					self._save_image(
+						self._project_latent_to_image_sdxl(latent_noise),
+						config.debug_dir + "/training_batches",
+						"1-noise",
+						train_progress.global_step,
+						True
+					)
+
+					self._save_image(
+						self._project_latent_to_image_sdxl(predicted_latent_noise),
+						config.debug_dir + "/training_batches",
+						"2-predicted_noise",
+						train_progress.global_step,
+						True
+					)
+
+					self._save_image(
+						self._project_latent_to_image_sdxl(scaled_noisy_latent_image),
+						config.debug_dir + "/training_batches",
+						"3-noisy_image",
+						train_progress.global_step,
+						True
+					)
+
+					alphas_cumprod = model.noise_scheduler.alphas_cumprod.to(config.train_device)
+					sqrt_alpha_prod = alphas_cumprod[timestep] ** 0.5
+					sqrt_alpha_prod = sqrt_alpha_prod.flatten().reshape(-1, 1, 1, 1)
+
+					sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timestep]) ** 0.5
+					sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().reshape(-1, 1, 1, 1)
+
+					scaled_predicted_latent_image = \
+						(scaled_noisy_latent_image - predicted_latent_noise * sqrt_one_minus_alpha_prod) \
+						/ sqrt_alpha_prod
+					self._save_image(
+						self._project_latent_to_image_sdxl(scaled_predicted_latent_image),
+						config.debug_dir + "/training_batches",
+						"4-predicted_image",
+						model.train_progress.global_step,
+						True
+					)
+
+					self._save_image(
+						self._project_latent_to_image_sdxl(scaled_latent_image),
+						config.debug_dir + "/training_batches",
+						"5-image",
+						model.train_progress.global_step,
+						True
+					)
+
+		model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
+		return model_output_data
+
+	def calculate_loss(
+			self,
+			model: StableDiffusionXLModel,
+			batch: dict,
+			data: dict,
+			config: TrainConfig,
+			progress: TrainProgress,
+			tensorboard: SummaryWriter
+	) -> Tensor:
+		return self._diffusion_losses(
+			batch=batch,
+			data=data,
+			config=config,
+			progress=progress,
+			tensorboard=tensorboard,
+			train_device=self.train_device,
+			betas=model.noise_scheduler.betas.to(device=self.train_device),
+		).mean()
+            ```
+
+        +-- modules\modelSetup\flux/
+        +-- modules\modelSetup\mixin/
+        +-- modules\modelSetup\stableDiffusion3/
+    +-- modules\module/
+        +-- modules\module\LoRAModule.py
+            ```LoRAModule.py
+import copy
+import math
+from abc import abstractmethod
+from collections.abc import Mapping
+from typing import Any
+import re # Adicionado
+import os # Adicionado
+
+try:
+    from modules.util.config.TrainConfig import TrainConfig
+except ImportError:
+    print("Aviso: Não foi possível importar TrainConfig. Usando um placeholder.")
+    class TrainConfig:
+        def __init__(self):
+            self.peft_type = PeftType.LORA # Exemplo
+            self.lora_rank = 4
+            self.lora_alpha = 1.0
+            self.lora_decompose = False
+            self.lora_decompose_norm_epsilon = False
+            self.train_device = "cpu"
+
+try:
+    from modules.util.enum.ModelType import PeftType
+except ImportError:
+    print("Aviso: Não foi possível importar PeftType. Usando um placeholder.")
+    from enum import Enum
+    class PeftType(Enum):
+        LORA = 0
+        LOHA = 1
+
+try:
+    from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
+except ImportError:
+    print("Aviso: Não foi possível importar funções de quantization_util. Usando placeholders.")
+    def get_unquantized_weight(module, dtype, device): return module.weight # Simplificação
+    def get_weight_shape(module): return module.weight.shape # Simplificação
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn import Conv2d, Dropout, Linear, Parameter
+
+BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
+KEY_TO_BLOCK_MAPPING = {
+    "lora_unet_conv_in": "IN00",
+    "lora_unet_time_embedding": "IN09", # Agrupando embeddings aqui por convenção
+    "lora_unet_add_embedding": "IN09",  # Agrupando embeddings aqui por convenção
+    "lora_unet_down_blocks_0_resnets_0": "IN01",
+    "lora_unet_down_blocks_0_resnets_1": "IN02",
+    "lora_unet_down_blocks_0_downsamplers_0": "IN03",
+    "lora_unet_down_blocks_1_resnets_0": "IN04",
+    "lora_unet_down_blocks_1_attentions_0": "IN04",
+    "lora_unet_down_blocks_1_resnets_1": "IN05",
+    "lora_unet_down_blocks_1_attentions_1": "IN05",
+    "lora_unet_down_blocks_1_downsamplers_0": "IN06",
+    "lora_unet_down_blocks_2_resnets_0": "IN07",
+    "lora_unet_down_blocks_2_attentions_0": "IN07",
+    "lora_unet_down_blocks_2_resnets_1": "IN08",
+    "lora_unet_down_blocks_2_attentions_1": "IN08",
+    "lora_unet_mid_block": "M00", # Cobre resnets e attentions do mid block
+    "lora_unet_up_blocks_0_resnets_0": "OUT00",
+    "lora_unet_up_blocks_0_attentions_0": "OUT00",
+    "lora_unet_up_blocks_0_resnets_1": "OUT01",
+    "lora_unet_up_blocks_0_attentions_1": "OUT01",
+    "lora_unet_up_blocks_0_resnets_2": "OUT02",
+    "lora_unet_up_blocks_0_attentions_2": "OUT02",
+    "lora_unet_up_blocks_0_upsamplers_0": "OUT02",
+    "lora_unet_up_blocks_1_resnets_0": "OUT03",
+    "lora_unet_up_blocks_1_attentions_0": "OUT03",
+    "lora_unet_up_blocks_1_resnets_1": "OUT04",
+    "lora_unet_up_blocks_1_attentions_1": "OUT04",
+    "lora_unet_up_blocks_1_resnets_2": "OUT05",
+    "lora_unet_up_blocks_1_attentions_2": "OUT05",
+    "lora_unet_up_blocks_1_upsamplers_0": "OUT05",
+    "lora_unet_up_blocks_2_resnets_0": "OUT06",
+    "lora_unet_up_blocks_2_resnets_1": "OUT07",
+    "lora_unet_up_blocks_2_resnets_2": "OUT08",
+    "lora_unet_conv_out": "OUT11",
+}
+
+class PeftBase(nn.Module):
+    is_applied: bool
+    orig_forward: Any | None
+    orig_eval: Any | None
+    orig_train: Any | None
+    _orig_module: list[nn.Module] | None  # list prevents it from registering
+    prefix: str
+    layer_kwargs: dict  # Applied during the forward op() call.
+    _initialized: bool  # Tracks whether we've created the layers or not.
+
+    def __init__(self, prefix: str, orig_module: nn.Module | None):
+        super().__init__()
+        self.prefix = prefix.replace('.', '_') + '.'
+        self._orig_module = [orig_module] if orig_module else None
+        self.is_applied = False
+        self.layer_kwargs = {}
+        self._initialized = False
+
+        if orig_module is not None:
+            match orig_module:
+                case nn.Linear():
+                    self.op = F.linear
+                    self.shape = get_weight_shape(orig_module)
+                case nn.Conv2d():
+                    self.op = F.conv2d
+                    self.shape = get_weight_shape(orig_module)
+                    self.layer_kwargs.setdefault("stride", orig_module.stride)
+                    self.layer_kwargs.setdefault("padding", orig_module.padding)
+                    self.layer_kwargs.setdefault("dilation", orig_module.dilation)
+                    self.layer_kwargs.setdefault("groups", orig_module.groups)
+                case _:
+                    print(f"Aviso: Tipo de módulo não suportado encontrado em PeftBase: {type(orig_module)}. Continuando, mas pode falhar.")
+                    self.op = None
+                    self.shape = None
+
+    def hook_to_module(self):
+        if self.orig_module is None: return # Não pode fazer hook sem módulo original
+        if not self.is_applied:
+            self.orig_forward = self.orig_module.forward
+            self.orig_train = self.orig_module.train
+            self.orig_eval = self.orig_module.eval
+            self.orig_module.forward = self.forward
+            self.orig_module.train = self._wrap_train
+            self.orig_module.eval = self._wrap_eval
+            self.is_applied = True
+
+    def remove_hook_from_module(self):
+        if self.orig_module is None or self.orig_forward is None: return
+        if self.is_applied:
+            self.orig_module.forward = self.orig_forward
+            self.orig_module.train = self.orig_train
+            self.orig_module.eval = self.orig_eval
+            self.is_applied = False
+
+    def _wrap_train(self, mode=True):
+        if self.orig_module is None or self.orig_train is None: return
+        self.orig_train(mode)
+        self.train(mode)
+
+    def _wrap_eval(self):
+        if self.orig_module is None or self.orig_eval is None: return
+        self.orig_eval()
+        self.eval()
+
+    def make_weight(self, A: Tensor, B: Tensor):
+        """Layer-type-independent way of creating a weight matrix from LoRA A/B."""
+        if self.shape is None:
+             raise RuntimeError(f"Cannot make weight for {self.prefix}: shape not determined (likely unsupported layer type).")
+        W = B.view(B.size(0), -1) @ A.view(A.size(0), -1)
+        return W.view(self.shape)
+
+    def check_initialized(self):
+        """Checks, and raises an exception, if the module is not initialized."""
+        if not self._initialized:
+            raise RuntimeError(f"Module {self.prefix} is not initialized.")
+
+        assert self.orig_module is not None, f"orig_module is None for {self.prefix}"
+        assert self.orig_forward is not None, f"orig_forward is None for {self.prefix}"
+
+    @property
+    def orig_module(self) -> nn.Module:
+        if self._orig_module is None:
+             raise AttributeError(f"Original module not set for PEFT layer with prefix {self.prefix}")
+        return self._orig_module[0]
+
+    def load_state_dict(self, state_dict: Mapping[str, Any],
+                        strict: bool = True, assign: bool = False):
+        module_prefix_with_dot = self.prefix # self.prefix já termina com '.'
+        relevant_keys = {k: v for k, v in state_dict.items() if k.startswith(module_prefix_with_dot)}
+        if not relevant_keys:
+             return nn.modules.module._IncompatibleKeys([], list(state_dict.keys()))
+
+        state_dict_local = {k.removeprefix(module_prefix_with_dot): v for k, v in relevant_keys.items()}
+
+        if not self._initialized and state_dict_local and self._orig_module is not None:
+             try:
+                 self.initialize_weights()
+                 self._initialized = True # Marca como inicializado após a tentativa
+             except NotImplementedError as e:
+                 print(f"Erro ao inicializar pesos para {self.prefix}: {e}. O módulo pode não ser carregado corretamente.")
+
+        if self._initialized:
+            load_result = super().load_state_dict(state_dict_local, strict=strict, assign=assign)
+        else:
+            missing_keys = list(state_dict_local.keys())
+            load_result = nn.modules.module._IncompatibleKeys(missing_keys, [])
+
+        keys_processed_or_skipped = list(relevant_keys.keys())
+        for key in keys_processed_or_skipped:
+            if key in state_dict: # Verifica se a chave ainda existe (pode ter sido pop'ada)
+                 state_dict.pop(key) # Remove as chaves que foram processadas (ou deveriam ter sido)
+
+        return load_result
+
+    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        local_state_dict = super().state_dict(*args, destination=None, prefix='', keep_vars=keep_vars)
+
+        state_dict_with_prefix = {self.prefix + k: v for k, v in local_state_dict.items()}
+
+        if prefix:
+            state_dict_with_prefix = {prefix + k: v for k, v in state_dict_with_prefix.items()}
+
+        if destination is None:
+            destination = state_dict_with_prefix
+        else:
+            destination.update(state_dict_with_prefix)
+
+        return destination
+
+    @abstractmethod
+    def initialize_weights(self):
+        pass
+
+    @abstractmethod
+    def apply_to_module(self):
+        pass
+
+    @abstractmethod
+    def extract_from_module(self, base_module: nn.Module):
+        pass
+
+    def create_layer(self) -> tuple[nn.Module, nn.Module]:
+        """Generic helper function for creating a PEFT layer, like LoRA.
+
+        Creates down/up layer modules for the given layer type in the
+        orig_module, for the given rank.
+
+        Does not perform initialization, as that usually depends on the PEFT
+        method.
+        """
+        if self.orig_module is None:
+            raise RuntimeError(f"Cannot create layer for {self.prefix}: Original module is None.")
+
+        device = self.orig_module.weight.device
+        match self.orig_module:
+            case nn.Linear():
+                in_features = self.orig_module.in_features
+                out_features = self.orig_module.out_features
+                if not hasattr(self, 'rank'): raise AttributeError(f"Rank not set for {self.prefix}")
+                lora_down = nn.Linear(in_features, self.rank, bias=False, device=device)
+                lora_up = nn.Linear(self.rank, out_features, bias=False, device=device)
+
+            case nn.Conv2d():
+                in_channels = self.orig_module.in_channels
+                out_channels = self.orig_module.out_channels
+                kernel_size = self.orig_module.kernel_size
+                stride = self.orig_module.stride
+                padding = self.orig_module.padding
+                dilation = self.orig_module.dilation
+                groups = self.orig_module.groups
+                if not hasattr(self, 'rank'): raise AttributeError(f"Rank not set for {self.prefix}")
+                lora_down = Conv2d(in_channels, self.rank, kernel_size, stride, padding, dilation=dilation, bias=False, device=device)
+                lora_up = Conv2d(self.rank, out_channels // groups, (1, 1), stride=1, padding=0, bias=False, device=device) # Stride e padding explícitos
+
+            case _:
+                raise NotImplementedError(f"Layer creation not implemented for type: {type(self.orig_module)}")
+
+        return lora_down, lora_up
+
+    @classmethod
+    def make_dummy(cls):
+        """Create a dummy version of a PEFT class."""
+        class Dummy(cls):
+            def __init__(self, *args, **kwargs):
+                prefix = args[0] if args else kwargs.get('prefix', 'dummy_prefix')
+                PeftBase.__init__(self, prefix, None) # Chama __init__ da base sem módulo real
+                self._state_dict = {}
+                self._initialized = False # Dummies não são 'inicializados' no sentido de ter pesos
+
+            def forward(self, *args, **kwargs):
+                 raise NotImplementedError("Dummy module should not perform forward pass.")
+
+            def load_state_dict(self, state_dict: Mapping[str, Any],
+                                strict: bool = True, assign: bool = False):
+                module_prefix_with_dot = self.prefix
+                relevant_keys = {k: v for k, v in state_dict.items() if k.startswith(module_prefix_with_dot)}
+                state_dict_local = {k.removeprefix(module_prefix_with_dot): v for k, v in relevant_keys.items()}
+
+                if not state_dict_local:
+                    return nn.modules.module._IncompatibleKeys([], [])
+
+                self._initialized = True # Marca como 'inicializado' para ter um state_dict
+                self._state_dict = copy.deepcopy(state_dict_local)
+
+                keys_to_remove = list(relevant_keys.keys())
+                for key in keys_to_remove:
+                     if key in state_dict:
+                         state_dict.pop(key)
+
+                return nn.modules.module._IncompatibleKeys([], [])
+
+            def state_dict(self, *args, destination=None, prefix='', keep_vars=False): # Assinatura completa
+                if not self._initialized:
+                    if destination is None:
+                         destination = {}
+                    return destination
+
+                state_dict_with_module_prefix = {self.prefix + k: v for k, v in self._state_dict.items()}
+
+                if prefix:
+                    state_dict_with_full_prefix = {prefix + k: v for k, v in state_dict_with_module_prefix.items()}
+                else:
+                    state_dict_with_full_prefix = state_dict_with_module_prefix
+
+                if destination is None:
+                    destination = state_dict_with_full_prefix
+                else:
+                    destination.update(state_dict_with_full_prefix)
+
+                return destination
+
+            def initialize_weights(self): pass # Não faz nada
+            def hook_to_module(self): raise NotImplementedError("Should never be called on a dummy module.")
+            def remove_hook_from_module(self): raise NotImplementedError("Should never be called on a dummy module.")
+            def apply_to_module(self): raise NotImplementedError("Should never be called on a dummy module.")
+            def extract_from_module(self, base_module: nn.Module): raise NotImplementedError("Should never be called on a dummy module.")
+
+        return Dummy
+
+class LoHaModule(PeftBase):
+    """Implementation of LoHa from Lycoris."""
+    rank: int
+    dropout: Dropout
+    hada_w1_a: Parameter | None
+    hada_w1_b: Parameter | None
+    hada_w2_a: Parameter | None
+    hada_w2_b: Parameter | None
+
+    def __init__(self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float):
+        super().__init__(prefix, orig_module)
+        self.rank = rank
+        self.dropout = Dropout(0)
+        self.register_buffer("alpha", torch.tensor(alpha))
+        self.hada_w1_a = None
+        self.hada_w1_b = None
+        self.hada_w2_a = None
+        self.hada_w2_b = None
+
+        if orig_module is not None:
+             try: # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
+                self.initialize_weights()
+                self.alpha = self.alpha.to(orig_module.weight.device)
+             except NotImplementedError:
+                 print(f"Aviso: Não foi possível inicializar LoHa para {prefix} devido ao tipo de camada.")
+
+    def initialize_weights(self):
+        if self._initialized: return
+        self._initialized = True
+        hada_w1_b_layer, hada_w1_a_layer = self.create_layer()
+        hada_w2_b_layer, hada_w2_a_layer = self.create_layer()
+
+        self.hada_w1_a = hada_w1_a_layer.weight
+        self.hada_w1_b = hada_w1_b_layer.weight
+        self.hada_w2_a = hada_w2_a_layer.weight
+        self.hada_w2_b = hada_w2_b_layer.weight
+
+        nn.init.normal_(self.hada_w1_a, std=0.1)
+        nn.init.normal_(self.hada_w1_b, std=1)
+        nn.init.constant_(self.hada_w2_a, 0)
+        nn.init.normal_(self.hada_w2_b, std=1)
+
+    def check_initialized(self):
+        super().check_initialized()
+        assert self.hada_w1_a is not None
+        assert self.hada_w1_b is not None
+        assert self.hada_w2_a is not None
+        assert self.hada_w2_b is not None
+
+    def forward(self, x, *args, **kwargs):
+        self.check_initialized()
+        if self.op is None: # Se a camada original não era suportada
+             print(f"Aviso: Pulando forward de LoHa para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
+             return self.orig_forward(x)
+
+        W1 = self.make_weight(self.dropout(self.hada_w1_b),
+                              self.dropout(self.hada_w1_a))
+        W2 = self.make_weight(self.dropout(self.hada_w2_b),
+                              self.dropout(self.hada_w2_a))
+        W = (W1 * W2) * (self.alpha.item() / self.rank) # Usa .item()
+        return self.orig_forward(x) + self.op(x, W, bias=None, **self.layer_kwargs)
+
+    def apply_to_module(self): pass # TODO
+    def extract_from_module(self, base_module: nn.Module): pass # TODO
+
+class LoRAModule(PeftBase):
+    lora_down: nn.Module | None
+    lora_up: nn.Module | None
+    rank: int
+    alpha: torch.Tensor
+    dropout: Dropout
+
+    def __init__(self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float):
+        super().__init__(prefix, orig_module)
+        self.rank = rank
+        self.dropout = Dropout(0)
+        self.register_buffer("alpha", torch.tensor(alpha))
+        self.lora_down = None
+        self.lora_up = None
+
+        if orig_module is not None:
+            try: # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
+                self.initialize_weights()
+                self.alpha = self.alpha.to(orig_module.weight.device)
+            except NotImplementedError:
+                 print(f"Aviso: Não foi possível inicializar LoRA para {prefix} devido ao tipo de camada.")
+
+    def initialize_weights(self):
+        if self._initialized: return
+        self._initialized = True
+        self.lora_down, self.lora_up = self.create_layer()
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
+
+    def check_initialized(self):
+        super().check_initialized()
+        assert self.lora_down is not None, f"LoRA down not initialized for {self.prefix}"
+        assert self.lora_up is not None, f"LoRA up not initialized for {self.prefix}"
+
+    def forward(self, x, *args, **kwargs):
+        self.check_initialized()
+        if self.op is None: # Se a camada original não era suportada
+             print(f"Aviso: Pulando forward de LoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
+             return self.orig_forward(x)
+
+        lora_output = self.lora_up(self.lora_down(self.dropout(x)))
+        original_output = self.orig_forward(x)
+        scale = self.alpha.item() / self.rank
+        return original_output + lora_output * scale
+
+    def apply_to_module(self): pass # TODO
+    def extract_from_module(self, base_module: nn.Module): pass # TODO
+
+class DoRAModule(LoRAModule):
+    """Weight-decomposed low rank adaptation."""
+    dora_num_dims: int
+    dora_scale: Parameter | None
+    norm_epsilon: bool
+
+    def __init__(self, *args, **kwargs):
+        self.dora_scale = None
+        self.norm_epsilon = kwargs.pop('norm_epsilon', False)
+        self.train_device = kwargs.pop('train_device')
+        super().__init__(*args, **kwargs) # Chama __init__ de LoRAModule
+
+    def initialize_weights(self):
+        if self._initialized: return
+        try:
+            super().initialize_weights()
+        except NotImplementedError:
+             self._initialized = False # Garante que não seja marcado como inicializado
+             raise # Re-levanta a exceção original
+
+        if self.orig_module is not None and self.dora_scale is None:
+             orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
+             self.dora_num_dims = orig_weight.dim() - 1
+             initial_norm = torch.norm(
+                 orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
+                 dim=1, keepdim=True
+             ).reshape(orig_weight.shape[1], *[1] * self.dora_num_dims).transpose(1, 0)
+             self.dora_scale = nn.Parameter(initial_norm.to(device=self.orig_module.weight.device))
+             del orig_weight
+
+    def check_initialized(self):
+        super().check_initialized()
+        assert self.dora_scale is not None, f"DoRA scale not initialized for {self.prefix}"
+
+    def forward(self, x, *args, **kwargs):
+        self.check_initialized()
+        if self.op is None: # Se a camada original não era suportada
+             print(f"Aviso: Pulando forward de DoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
+             return self.orig_forward(x)
+
+        A = self.lora_down.weight
+        B = self.lora_up.weight
+        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
+        lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
+        WP = orig_weight + lora_delta_w
+        del orig_weight, lora_delta_w
+
+        eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
+        norm = WP.detach() \
+                 .transpose(0, 1) \
+                 .reshape(WP.shape[1], -1) \
+                 .norm(dim=1, keepdim=True) \
+                 .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
+                 .transpose(0, 1) + eps
+        WP_normalized = WP / norm
+        WP_scaled = self.dora_scale * WP_normalized
+        x_dropout = self.dropout(x)
+        return self.op(x_dropout,
+                       WP_scaled,
+                       self.orig_module.bias,
+                       **self.layer_kwargs)
+
+DummyLoRAModule = LoRAModule.make_dummy()
+DummyDoRAModule = DoRAModule.make_dummy()
+DummyLoHaModule = LoHaModule.make_dummy()
+
+class LoRAModuleWrapper:
+    orig_module: nn.Module
+    rank: int
+    alpha: float
+    lora_modules: dict[str, PeftBase] # Dicionário para armazenar módulos LoRA/DoRA/Dummy
+
+    def __init__(
+            self,
+            orig_module: nn.Module | None,
+            prefix: str,
+            config: TrainConfig,
+            module_filter: list[str] = None,
+    ):
+        self.orig_module = orig_module
+        self.prefix = prefix # Prefixo base, ex: "lora_unet"
+        self.peft_type = config.peft_type
+        self.rank = config.lora_rank
+        self.alpha = config.lora_alpha
+        self.module_filter = [x.strip() for x in module_filter] if module_filter is not None else []
+        weight_decompose = config.lora_decompose
+
+        self.additional_args = [self.rank, self.alpha]
+        self.additional_kwargs = {}
+
+        if self.peft_type == PeftType.LORA:
+            if weight_decompose:
+                self.klass = DoRAModule
+                self.dummy_klass = DummyDoRAModule
+                self.additional_kwargs = {
+                    'norm_epsilon': config.lora_decompose_norm_epsilon,
+                    'train_device': torch.device(config.train_device),
+                }
+            else:
+                self.klass = LoRAModule
+                self.dummy_klass = DummyLoRAModule
+        elif self.peft_type == PeftType.LOHA:
+            self.klass = LoHaModule
+            self.dummy_klass = DummyLoHaModule
+        else:
+             raise ValueError(f"Unsupported PeftType: {self.peft_type}")
+
+        self.lora_modules = self.__create_modules(orig_module)
+
+        self.generate_keys_by_block_file(f"{self.prefix}_keys_by_block.txt")
+
+    def __create_modules(self, root_module: nn.Module | None) -> dict[str, PeftBase]:
+        lora_modules = {}
+        if root_module is not None:
+            for name, child_module in root_module.named_modules():
+                clean_name = name.removeprefix(self.prefix + "_") if name.startswith(self.prefix + "_") else name
+                full_peft_prefix = f"{self.prefix}_{clean_name}" if clean_name else self.prefix
+
+                passes_filter = not self.module_filter or any(f in name for f in self.module_filter)
+
+                if passes_filter and isinstance(child_module, (Linear, Conv2d)):
+                    try:
+                        lora_modules[name] = self.klass(full_peft_prefix, child_module, *self.additional_args, **self.additional_kwargs)
+                    except Exception as e:
+                         print(f"Erro ao criar módulo PEFT para {name} (prefixo {full_peft_prefix}): {e}")
+
+        return lora_modules
+
+    def requires_grad_(self, requires_grad: bool):
+        for module in self.lora_modules.values():
+            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                 module.requires_grad_(requires_grad)
+
+    def parameters(self) -> list[Parameter]:
+        parameters = []
+        for module in self.lora_modules.values():
+            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                parameters.extend(list(module.parameters())) # Garante que seja uma lista
+        return parameters
+
+    def to(self, device: torch.device = None, dtype: torch.dtype = None) -> 'LoRAModuleWrapper':
+        for module in self.lora_modules.values():
+            module.to(device, dtype)
+        return self
+
+    def load_state_dict(self, state_dict: dict[str, Tensor]):
+        """Loads the state dict into LoRA/DoRA modules and handles remaining keys with dummies."""
+        remaining_state_dict = copy.deepcopy(state_dict)
+        loaded_prefixes = set()
+
+        for name, module in self.lora_modules.items():
+             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                 module.load_state_dict(remaining_state_dict)
+                 loaded_prefixes.add(module.prefix)
+
+        potential_dummy_keys = {k: v for k, v in remaining_state_dict.items() if k.startswith(self.prefix)}
+
+        while potential_dummy_keys:
+            key_example = next(iter(potential_dummy_keys))
+            parts = key_example.split('.')
+            dummy_prefix_parts = []
+            known_suffix = False
+
+            common_suffixes = [
+                '.lora_down.weight', '.lora_up.weight', '.alpha', '.dora_scale',
+                '.hada_w1_a', '.hada_w1_b', '.hada_w2_a', '.hada_w2_b'
+            ]
+            for suffix in common_suffixes:
+                if key_example.endswith(suffix):
+                     num_parts_to_remove = suffix.count('.') + 1
+                     dummy_prefix_parts = parts[:-num_parts_to_remove]
+                     known_suffix = True
+                     break
+
+            if not known_suffix:
+                 print(f"Aviso: Não foi possível determinar o prefixo do módulo para a chave remanescente: {key_example}. Pulando.")
+                 potential_dummy_keys.pop(key_example)
+                 continue
+
+            dummy_module_prefix_with_dot = '.'.join(dummy_prefix_parts) + '.'
+
+            if dummy_module_prefix_with_dot in loaded_prefixes:
+                 keys_to_remove = [k for k in potential_dummy_keys if k.startswith(dummy_module_prefix_with_dot)]
+                 for k in keys_to_remove:
+                     if k in potential_dummy_keys: potential_dummy_keys.pop(k)
+                 continue
+
+            dummy_module_name = dummy_module_prefix_with_dot.removeprefix(self.prefix + "_").removesuffix('.') if dummy_module_prefix_with_dot != self.prefix + "." else ""
+            dummy_module = self.dummy_klass(dummy_module_prefix_with_dot, None, *self.additional_args, **self.additional_kwargs)
+            dummy_module.load_state_dict(copy.deepcopy(potential_dummy_keys))
+
+            dummy_keys_loaded = list(dummy_module.state_dict().keys())
+            for k in dummy_keys_loaded:
+                 if k in potential_dummy_keys:
+                     potential_dummy_keys.pop(k)
+
+            self.lora_modules[dummy_module_name] = dummy_module
+            loaded_prefixes.add(dummy_module_prefix_with_dot)
+
+        final_remaining_keys = list(potential_dummy_keys.keys())
+        if final_remaining_keys:
+            pass
+
+    def state_dict(self) -> dict:
+        """Returns the state dict containing keys from all managed modules (real and dummy)."""
+        state_dict = {}
+        for module in self.lora_modules.values():
+            module_sd = module.state_dict()
+            state_dict.update(module_sd)
+        return state_dict
+
+    def modules(self) -> list[nn.Module]:
+        """Returns a list of all managed modules (real and dummy)."""
+        return list(self.lora_modules.values())
+
+    def hook_to_module(self):
+        """Hooks the real LoRA modules into their corresponding original modules."""
+        for module in self.lora_modules.values():
+            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                module.hook_to_module()
+
+    def remove_hook_from_module(self):
+        """Removes the LoRA hook from the real modules."""
+        for module in self.lora_modules.values():
+             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                module.remove_hook_from_module()
+
+    def apply_to_module(self):
+        """Applies the LoRA weights directly to the original modules (real modules only)."""
+        for module in self.lora_modules.values():
+            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                module.apply_to_module()
+
+    def extract_from_module(self, base_module: nn.Module):
+        """Extracts LoRA weights by comparing the current module state to a base module (real modules only)."""
+        for name, module in self.lora_modules.items():
+             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                try:
+                    corresponding_base_submodule = base_module.get_submodule(name)
+                    module.extract_from_module(corresponding_base_submodule)
+                except AttributeError:
+                     print(f"Warning: Could not find corresponding submodule '{name}' in base_module during extraction.")
+
+    def prune(self):
+        """Removes all dummy modules from the managed modules."""
+        dummy_to_remove = self.dummy_klass
+        self.lora_modules = {k: v for (k, v) in self.lora_modules.items() if not isinstance(v, dummy_to_remove)}
+        print(f"Pruned dummy modules. Remaining modules: {len(self.lora_modules)}")
+
+    def set_dropout(self, dropout_probability: float):
+        """Sets the dropout probability for all real managed modules."""
+        if not 0 <= dropout_probability <= 1:
+            raise ValueError("Dropout probability must be in [0, 1]")
+        for module in self.lora_modules.values():
+             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
+                 if hasattr(module, 'dropout') and isinstance(module.dropout, nn.Dropout):
+                     module.dropout.p = dropout_probability
+
+    @staticmethod
+    def get_block_id_from_key_prefix(lora_module_prefix_with_dot: str) -> str:
+        """Determina o Block ID (IN00-OUT11) a partir do prefixo completo do módulo LoRA/DoRA."""
+        lora_module_prefix = lora_module_prefix_with_dot.removesuffix('.')
+
+        if lora_module_prefix.startswith("lora_unet_mid_block"):
+            return "M00"
+
+        sorted_map_prefixes = sorted(KEY_TO_BLOCK_MAPPING.keys(), key=len, reverse=True)
+
+        for map_prefix in sorted_map_prefixes:
+            if lora_module_prefix.startswith(map_prefix):
+                return KEY_TO_BLOCK_MAPPING[map_prefix]
+
+        print(f"Aviso: Prefixo do módulo não mapeado encontrado: {lora_module_prefix}. Assumindo BASE.")
+        return "BASE"
+
+    def generate_keys_by_block_file(self, output_filename="unetKeysByBlock_generated.txt"):
+        """Gera um arquivo de texto com todas as chaves LoRA/DoRA organizadas por bloco."""
+        if not self.lora_modules:
+            print("Aviso: Nenhum módulo LoRA/DoRA encontrado no wrapper. Arquivo de chaves não gerado.")
+            return
+
+        print(f"Gerando arquivo de chaves por bloco: {output_filename}")
+        blocks_data: dict[str, list[str]] = {block_id: [] for block_id in BLOCKID26}
+
+        for module_name, module_instance in self.lora_modules.items():
+            module_prefix_with_dot = module_instance.prefix
+            block_id = self.get_block_id_from_key_prefix(module_prefix_with_dot)
+
+            try:
+                 module_state_dict = module_instance.state_dict()
+                 for key in module_state_dict.keys():
+                     blocks_data[block_id].append(key)
+            except Exception as e:
+                 print(f"Erro ao obter state_dict para o módulo {module_name} (prefixo {module_prefix_with_dot}): {e}")
+
+        for block_id in blocks_data:
+            blocks_data[block_id].sort()
+
+        output_lines = []
+        for block_id in BLOCKID26:
+            output_lines.append(f"=== {block_id} ===")
+            keys_in_block = blocks_data[block_id]
+            if keys_in_block:
+                output_lines.extend(keys_in_block)
+            else:
+                if block_id == "BASE":
+                    output_lines.append("(Nenhuma chave UNet corresponde a BASE)")
+                elif block_id in ["IN10", "IN11", "OUT09", "OUT10"]:
+                     output_lines.append("(Vazio)")
+                else:
+                    output_lines.append("(Vazio)")
+
+            output_lines.append("") # Linha em branco entre blocos
+
+        try:
+            output_dir = os.path.dirname(output_filename)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            with open(output_filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(output_lines).strip())
+            print(f"Arquivo '{output_filename}' gerado com sucesso.")
+        except Exception as e:
+            print(f"Erro ao escrever o arquivo '{output_filename}': {e}")
+
+            ```
+
+        +-- modules\module\quantized/
+            +-- modules\module\quantized\mixin/
+    +-- modules\trainer/
+        +-- modules\trainer\GenericTrainer.py
+            ```GenericTrainer.py
+import contextlib
+import copy
+import json
+import os
+import shutil
+import traceback
+from collections.abc import Callable
+from pathlib import Path
+
+from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.model.BaseModel import BaseModel
+from modules.modelLoader.BaseModelLoader import BaseModelLoader
+from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
+from modules.modelSaver.BaseModelSaver import BaseModelSaver
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.trainer.BaseTrainer import BaseTrainer
+from modules.util import create, path_util
+from modules.util.callbacks.TrainCallbacks import TrainCallbacks
+from modules.util.commands.TrainCommands import TrainCommands
+from modules.util.config.SampleConfig import SampleConfig
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
+from modules.util.enum.FileType import FileType
+from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.memory_util import TorchMemoryRecorder
+from modules.util.time_util import get_string_timestamp
+from modules.util.torch_util import torch_gc
+from modules.util.TrainProgress import TrainProgress
+
+import torch
+from torch import Tensor, nn
+from torch.nn import Parameter
+from torch.utils.hooks import RemovableHandle
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.transforms.functional import pil_to_tensor
+
+import huggingface_hub
+from requests.exceptions import ConnectionError
+from tqdm import tqdm
+
+class GenericTrainer(BaseTrainer):
+    model_loader: BaseModelLoader
+    model_setup: BaseModelSetup
+    data_loader: BaseDataLoader
+    model_saver: BaseModelSaver
+    model_sampler: BaseModelSampler
+    model: BaseModel | None
+    validation_data_loader: BaseDataLoader
+
+    previous_sample_time: float
+    sample_queue: list[Callable]
+
+    parameters: list[Parameter]
+
+    tensorboard: SummaryWriter
+
+    grad_hook_handles: list[RemovableHandle]
+
+    def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
+        super().__init__(config, callbacks, commands)
+
+        tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
+        os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
+        self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}"))
+        if config.tensorboard:
+            super()._start_tensorboard()
+
+        self.model = None
+        self.one_step_trained = False
+
+        self.grad_hook_handles = []
+
+    def start(self):
+        self.__save_config_to_workspace()
+
+        if self.config.clear_cache_before_training and self.config.latent_caching:
+            self.__clear_cache()
+
+        if self.config.train_dtype.enable_tf():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        self.model_loader = self.create_model_loader()
+        self.model_setup = self.create_model_setup()
+
+        self.callbacks.on_update_status("loading the model")
+
+        model_names = self.config.model_names()
+
+        if self.config.continue_last_backup:
+            self.callbacks.on_update_status("searching for previous backups")
+            last_backup_path = self.config.get_last_backup_path()
+
+            if last_backup_path:
+                if self.config.training_method == TrainingMethod.LORA:
+                    model_names.lora = last_backup_path
+                elif self.config.training_method == TrainingMethod.EMBEDDING:
+                    model_names.embedding.model_name = last_backup_path
+                else:  # fine-tunes
+                    model_names.base_model = last_backup_path
+
+                print(f"Continuing training from backup '{last_backup_path}'...")
+            else:
+                print("No backup found, continuing without backup...")
+
+        if self.config.secrets.huggingface_token != "":
+            self.callbacks.on_update_status("logging into Hugging Face")
+            with contextlib.suppress(ConnectionError):
+                huggingface_hub.login(
+                    token = self.config.secrets.huggingface_token,
+                    new_session = False,
+                )
+
+        self.callbacks.on_update_status("loading the model")
+        self.model = self.model_loader.load(
+            model_type=self.config.model_type,
+            model_names=model_names,
+            weight_dtypes=self.config.weight_dtypes(),
+        )
+        self.model.train_config = self.config
+
+        self.callbacks.on_update_status("running model setup")
+
+        self.model_setup.setup_optimizations(self.model, self.config)
+        self.model_setup.setup_train_device(self.model, self.config)
+        self.model_setup.setup_model(self.model, self.config)
+        self.model.to(self.temp_device)
+        self.model.eval()
+        torch_gc()
+
+        self.callbacks.on_update_status("creating the data loader/caching")
+
+        self.data_loader = self.create_data_loader(
+            self.model, self.model.train_progress
+        )
+        self.model_saver = self.create_model_saver()
+
+        self.model_sampler = self.create_model_sampler(self.model)
+        self.previous_sample_time = -1
+        self.sample_queue = []
+
+        self.parameters = self.model.parameters.parameters()
+        if self.config.validation:
+            self.validation_data_loader = self.create_data_loader(
+                self.model, self.model.train_progress, is_validation=True
+            )
+
+    def __save_config_to_workspace(self):
+        path = path_util.canonical_join(self.config.workspace_dir, "config")
+        os.makedirs(Path(path).absolute(), exist_ok=True)
+        path = path_util.canonical_join(path, f"{get_string_timestamp()}.json")
+        with open(path, "w") as f:
+            json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
+
+    def __clear_cache(self):
+        print(
+            f'Clearing cache directory {self.config.cache_dir}! '
+            f'You can disable this if you want to continue using the same cache.'
+        )
+        if os.path.isdir(self.config.cache_dir):
+            for filename in os.listdir(self.config.cache_dir):
+                path = os.path.join(self.config.cache_dir, filename)
+                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                    shutil.rmtree(path)
+
+    def __prune_backups(self, backups_to_keep: int):
+        backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
+        if os.path.exists(backup_dirpath):
+            backup_directories = sorted(
+                [dirpath for dirpath in os.listdir(backup_dirpath) if
+                 os.path.isdir(os.path.join(backup_dirpath, dirpath))],
+                reverse=True,
+            )
+
+            for dirpath in backup_directories[backups_to_keep:]:
+                dirpath = os.path.join(backup_dirpath, dirpath)
+                try:
+                    shutil.rmtree(dirpath)
+                except Exception:
+                    print(f"Could not delete old rolling backup {dirpath}")
+
+        return
+
+    def __enqueue_sample_during_training(self, fun: Callable):
+        self.sample_queue.append(fun)
+
+    def __execute_sample_during_training(self):
+        for fun in self.sample_queue:
+            fun()
+        self.sample_queue = []
+
+    def __sample_loop(
+            self,
+            train_progress: TrainProgress,
+            train_device: torch.device,
+            sample_config_list: list[SampleConfig],
+            folder_postfix: str = "",
+            is_custom_sample: bool = False,
+    ):
+        for i, sample_config in enumerate(sample_config_list):
+            if sample_config.enabled:
+                try:
+                    safe_prompt = path_util.safe_filename(sample_config.prompt)
+
+                    if is_custom_sample:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            "custom",
+                        )
+                    else:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            f"{str(i)} - {safe_prompt}{folder_postfix}",
+                        )
+
+                    sample_path = os.path.join(
+                        sample_dir,
+                        f"{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
+                    )
+
+                    def on_sample_default(sampler_output: ModelSamplerOutput):
+                        if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
+                            self.tensorboard.add_image(
+                                f"sample{str(i)} - {safe_prompt}", pil_to_tensor(sampler_output.data),  # noqa: B023
+                                train_progress.global_step
+                            )
+                        self.callbacks.on_sample_default(sampler_output)
+
+                    def on_sample_custom(sampler_output: ModelSamplerOutput):
+                        self.callbacks.on_sample_custom(sampler_output)
+
+                    on_sample = on_sample_custom if is_custom_sample else on_sample_default
+                    on_update_progress = self.callbacks.on_update_sample_custom_progress if is_custom_sample else self.callbacks.on_update_sample_default_progress
+
+                    self.model.to(self.temp_device)
+                    self.model.eval()
+
+                    sample_config = copy.copy(sample_config)
+                    sample_config.from_train_config(self.config)
+
+                    self.model_sampler.sample(
+                        sample_config=sample_config,
+                        destination=sample_path,
+                        image_format=self.config.sample_image_format,
+                        video_format=self.config.sample_video_format,
+                        audio_format=self.config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_update_progress=on_update_progress,
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    print("Error during sampling, proceeding without sampling")
+
+                torch_gc()
+
+    def __sample_during_training(
+            self,
+            train_progress: TrainProgress,
+            train_device: torch.device,
+            sample_params_list: list[SampleConfig] = None,
+    ):
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+        torch_gc()
+
+        self.callbacks.on_update_status("sampling")
+
+        is_custom_sample = False
+        if not sample_params_list:
+            if self.config.samples is not None:
+                sample_params_list = self.config.samples
+            else:
+                with open(self.config.sample_definition_file_name, 'r') as f:
+                    samples = json.load(f)
+                    for i in range(len(samples)):
+                        samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                    sample_params_list = samples
+        else:
+            is_custom_sample = True
+
+        if self.model.ema:
+            self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+
+        self.__sample_loop(
+            train_progress=train_progress,
+            train_device=train_device,
+            sample_config_list=sample_params_list,
+            is_custom_sample=is_custom_sample,
+        )
+
+        if self.model.ema:
+            self.model.ema.copy_temp_to(self.parameters)
+
+        if self.model.ema and not is_custom_sample and self.config.non_ema_sampling:
+            self.__sample_loop(
+                train_progress=train_progress,
+                train_device=train_device,
+                sample_config_list=sample_params_list,
+                folder_postfix=" - no-ema",
+            )
+
+        self.model_setup.setup_train_device(self.model, self.config)
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.train()
+
+        torch_gc()
+
+    def __validate(self, train_progress: TrainProgress):
+        if self.__needs_validate(train_progress):
+            self.validation_data_loader.get_data_set().start_next_epoch()
+            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+
+            if current_epoch_length_validation == 0:
+                return
+
+            self.callbacks.on_update_status("calculating validation loss")
+            self.model_setup.setup_train_device(self.model, self.config)
+
+            torch_gc()
+
+            step_tqdm_validation = tqdm(
+                self.validation_data_loader.get_data_loader(),
+                desc="validation_step",
+                total=current_epoch_length_validation)
+
+            accumulated_loss_per_concept = {}
+            concept_counts = {}
+            mapping_seed_to_label = {}
+            mapping_label_to_seed = {}
+
+            for validation_batch in step_tqdm_validation:
+                if self.__needs_gc(train_progress):
+                    torch_gc()
+
+                with torch.no_grad():
+                    model_output_data = self.model_setup.predict(
+                        self.model, validation_batch, self.config, train_progress, deterministic=True)
+                    loss_validation = self.model_setup.calculate_loss(
+                        self.model, validation_batch, model_output_data, self.config)
+
+                concept_name = validation_batch["concept_name"][0]
+                concept_path = validation_batch["concept_path"][0]
+                concept_seed = validation_batch["concept_seed"].item()
+                loss = loss_validation.item()
+
+                label = concept_name if concept_name else os.path.basename(concept_path)
+                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
+                    suffix = 1
+                    new_label = f"{label}({suffix})"
+                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
+                        suffix += 1
+                        new_label = f"{label}({suffix})"
+                    label = new_label
+
+                if concept_seed not in mapping_seed_to_label:
+                    mapping_seed_to_label[concept_seed] = label
+                    mapping_label_to_seed[label] = concept_seed
+
+                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
+                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+
+            for concept_seed, total_loss in accumulated_loss_per_concept.items():
+                average_loss = total_loss / concept_counts[concept_seed]
+
+                self.tensorboard.add_scalar(f"loss/validation_step/{mapping_seed_to_label[concept_seed]}",
+                                            average_loss,
+                                            train_progress.global_step)
+
+            if len(concept_counts) > 1:
+                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
+                total_count = sum(concept_counts[key] for key in concept_counts)
+                total_average_loss = total_loss / total_count
+
+                self.tensorboard.add_scalar("loss/validation_step/total_average",
+                                            total_average_loss,
+                                            train_progress.global_step)
+
+    def __save_backup_config(self, backup_path):
+        config_path = os.path.join(backup_path, "onetrainer_config")
+        args_path = path_util.canonical_join(config_path, "args.json")
+        concepts_path = path_util.canonical_join(config_path, "concepts.json")
+        samples_path = path_util.canonical_join(config_path, "samples.json")
+
+        os.makedirs(Path(config_path).absolute(), exist_ok=True)
+
+        with open(args_path, "w") as f:
+            json.dump(self.config.to_settings_dict(secrets=False), f, indent=4)
+        if os.path.isfile(self.config.concept_file_name):
+            shutil.copy2(self.config.concept_file_name, concepts_path)
+        if os.path.isfile(self.config.sample_definition_file_name):
+            shutil.copy2(self.config.sample_definition_file_name, samples_path)
+
+    def backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        torch_gc()
+
+        self.callbacks.on_update_status("creating backup")
+
+        backup_name = f"{get_string_timestamp()}-backup-{train_progress.filename_string()}"
+        backup_path = os.path.join(self.config.workspace_dir, "backup", backup_name)
+
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+
+        try:
+            if print_msg:
+                print_cb("Creating Backup " + backup_path)
+
+            self.model_saver.save(
+                self.model,
+                self.config.model_type,
+                ModelFormat.INTERNAL,
+                backup_path,
+                None,
+            )
+
+            self.__save_backup_config(backup_path)
+        except Exception:
+            traceback.print_exc()
+            print("Could not save backup. Check your disk space!")
+            try:
+                if os.path.isdir(backup_path):
+                    shutil.rmtree(backup_path)
+            except Exception:
+                traceback.print_exc()
+                print("Could not delete partial backup")
+        finally:
+            if self.config.rolling_backup:
+                self.__prune_backups(self.config.rolling_backup_count)
+
+        self.model_setup.setup_train_device(self.model, self.config)
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.train()
+
+        torch_gc()
+
+    def save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        torch_gc()
+
+        self.callbacks.on_update_status("saving")
+
+        save_path = os.path.join(
+            self.config.workspace_dir,
+            "save",
+            f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{train_progress.filename_string()}{self.config.output_model_format.file_extension()}"
+        )
+        if print_msg:
+            print_cb("Saving " + save_path)
+
+        try:
+            if self.model.ema:
+                self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.eval()
+            self.model_saver.save(
+                model=self.model,
+                model_type=self.config.model_type,
+                output_model_format=self.config.output_model_format,
+                output_model_destination=save_path,
+                dtype=self.config.output_dtype.torch_dtype()
+            )
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.train()
+        except Exception:
+            traceback.print_exc()
+            print("Could not save model. Check your disk space!")
+            try:
+                if os.path.isfile(save_path):
+                    shutil.rmtree(save_path)
+            except Exception:
+                traceback.print_exc()
+                print("Could not delete partial save")
+        finally:
+            if self.model.ema:
+                self.model.ema.copy_temp_to(self.parameters)
+
+        torch_gc()
+
+    def __needs_sample(self, train_progress: TrainProgress):
+        return self.single_action_elapsed(
+            "sample_skip_first", self.config.sample_skip_first, self.config.sample_after_unit, train_progress
+        ) and self.repeating_action_needed(
+            "sample", self.config.sample_after, self.config.sample_after_unit, train_progress
+        )
+
+    def __needs_backup(self, train_progress: TrainProgress):
+        return self.repeating_action_needed(
+            "backup", self.config.backup_after, self.config.backup_after_unit, train_progress, start_at_zero=False
+        )
+
+    def __needs_save(self, train_progress: TrainProgress):
+        return self.single_action_elapsed(
+            "save_skip_first", self.config.save_skip_first, self.config.save_every_unit, train_progress
+        ) and self.repeating_action_needed(
+            "save", self.config.save_every, self.config.save_every_unit, train_progress, start_at_zero=False
+        )
+
+    def __needs_gc(self, train_progress: TrainProgress):
+        return self.repeating_action_needed("gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False)
+
+    def __needs_validate(self, train_progress: TrainProgress):
+        return self.repeating_action_needed(
+            "validate", self.config.validate_after, self.config.validate_after_unit, train_progress
+        )
+
+    def __is_update_step(self, train_progress: TrainProgress) -> bool:
+        return self.repeating_action_needed(
+            "update_step", self.config.gradient_accumulation_steps, TimeUnit.STEP, train_progress, start_at_zero=False
+        )
+
+    def __apply_fused_back_pass(self, scaler):
+        if self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+            if self.config.gradient_accumulation_steps > 1:
+                print("Warning: activating fused_back_pass with gradient_accumulation_steps > 1 does not reduce VRAM usage.")
+
+            for param_group in self.model.optimizer.param_groups:
+                for i, parameter in enumerate(param_group["params"]):
+                    if parameter.requires_grad:
+                        if scaler:
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                                if self.__is_update_step(self.model.train_progress):
+                                    scaler.unscale_parameter_(tensor, self.model.optimizer)
+                                    if self.config.clip_grad_norm is not None:
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
+                                    tensor.grad = None
+                        else:
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                                if self.__is_update_step(self.model.train_progress):
+                                    if self.config.clip_grad_norm is not None:
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    self.model.optimizer.step_parameter(tensor, param_group, i)
+                                    tensor.grad = None
+
+                        handle = parameter.register_post_accumulate_grad_hook(__grad_hook)
+                        self.grad_hook_handles.append(handle)
+
+    def __before_eval(self):
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+
+    def train(self):
+        train_device = torch.device(self.config.train_device)
+
+        train_progress = self.model.train_progress
+
+        if self.config.only_cache:
+            self.callbacks.on_update_status("caching")
+            for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+                self.data_loader.get_data_set().start_next_epoch()
+            return
+
+        scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+
+        self.__apply_fused_back_pass(scaler)
+
+        has_gradient = False
+
+        lr_scheduler = None
+        accumulated_loss = 0.0
+        ema_loss = None
+        ema_loss_steps = 0
+        for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+            self.callbacks.on_update_status("starting epoch/caching")
+
+            if self.config.latent_caching:
+                self.data_loader.get_data_set().start_next_epoch()
+                self.model_setup.setup_train_device(self.model, self.config)
+            else:
+                self.model_setup.setup_train_device(self.model, self.config)
+                self.data_loader.get_data_set().start_next_epoch()
+
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.train()
+
+            torch_gc()
+
+            if lr_scheduler is None:
+                lr_scheduler = create.create_lr_scheduler(
+                    config=self.config,
+                    optimizer=self.model.optimizer,
+                    learning_rate_scheduler=self.config.learning_rate_scheduler,
+                    warmup_steps=self.config.learning_rate_warmup_steps,
+                    num_cycles=self.config.learning_rate_cycles,
+                    min_factor=self.config.learning_rate_min_factor,
+                    num_epochs=self.config.epochs,
+                    approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
+                    batch_size=self.config.batch_size,
+                    gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                    global_step=train_progress.global_step
+                )
+
+            current_epoch_length = self.data_loader.get_data_set().approximate_length()
+            step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
+                             initial=train_progress.epoch_step)
+            for batch in step_tqdm:
+                if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                    self.__enqueue_sample_during_training(
+                        lambda: self.__sample_during_training(train_progress, train_device)
+                    )
+
+                if self.__needs_backup(train_progress):
+                    self.commands.backup()
+
+                if self.__needs_save(train_progress):
+                    self.commands.save()
+
+                sample_commands = self.commands.get_and_reset_sample_custom_commands()
+                if sample_commands:
+                    def create_sample_commands_fun(sample_commands):
+                        def sample_commands_fun():
+                            self.__sample_during_training(train_progress, train_device, sample_commands)
+
+                        return sample_commands_fun
+
+                    self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
+
+                if self.__needs_gc(train_progress):
+                    torch_gc()
+
+                if not has_gradient:
+                    self.__execute_sample_during_training()
+                    transferred_to_temp_device = False
+
+                    if self.commands.get_and_reset_backup_command():
+                        self.model.to(self.temp_device)
+                        self.backup(train_progress, True, step_tqdm.write)
+                        transferred_to_temp_device = True
+
+                    if self.commands.get_and_reset_save_command():
+                        self.model.to(self.temp_device)
+                        self.save(train_progress, True, step_tqdm.write)
+                        transferred_to_temp_device = True
+
+                    if transferred_to_temp_device:
+                        self.model_setup.setup_train_device(self.model, self.config)
+
+                self.callbacks.on_update_status("training")
+
+                with TorchMemoryRecorder(enabled=False):
+                    model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
+
+                    loss = loss / self.config.gradient_accumulation_steps
+                    if scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                    has_gradient = True
+                    accumulated_loss += loss.item()
+
+                    if self.__is_update_step(train_progress):
+                        if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                            scaler.step_after_unscale_parameter_(self.model.optimizer)
+                            scaler.update()
+                        elif scaler:
+                            scaler.unscale_(self.model.optimizer)
+                            if self.config.clip_grad_norm is not None:
+                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            scaler.step(self.model.optimizer)
+                            scaler.update()
+                        else:
+                            if self.config.clip_grad_norm is not None:
+                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            self.model.optimizer.step()
+
+                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                        self.model.optimizer.zero_grad(set_to_none=True)
+                        has_gradient = False
+
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler, self.tensorboard
+                        )
+
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+
+                        if not (self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass()):
+                            if scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
+
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False # Gradients are gone now
+
+                        if scaler:
+                             scaler.update()
+
+                        lr_scheduler.step()
+
+                        if self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass():
+                             self.model.optimizer.zero_grad(set_to_none=True)
+                             has_gradient = False # Ensure flag is correct
+
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler, self.tensorboard
+                        )
+
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+
+                        ema_loss = ema_loss or accumulated_loss
+                        ema_loss_steps += 1
+                        ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
+                        ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss * (1 - ema_loss_decay))
+                        step_tqdm.set_postfix({
+                            'loss': accumulated_loss,
+                            'smooth loss': ema_loss,
+                        })
+                        self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                        accumulated_loss = 0.0
+
+                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        if self.model.ema:
+                            update_step = train_progress.global_step // self.config.gradient_accumulation_steps
+                            self.tensorboard.add_scalar(
+                                "ema_decay",
+                                self.model.ema.get_current_decay(update_step),
+                                train_progress.global_step
+                            )
+                            self.model.ema.step(
+                                self.parameters,
+                                update_step
+                            )
+
+                        self.one_step_trained = True
+
+                if self.config.validation:
+                    self.__validate(train_progress)
+
+                train_progress.next_step(self.config.batch_size)
+                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+                if self.commands.get_stop_command():
+                    return
+
+            train_progress.next_epoch()
+            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+            if self.commands.get_stop_command():
+                return
+
+    def end(self):
+        if self.one_step_trained:
+            self.model.to(self.temp_device)
+
+            if self.config.backup_before_save:
+                self.backup(self.model.train_progress)
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.eval()
+
+            self.callbacks.on_update_status("saving the final model")
+
+            if self.model.ema:
+                self.model.ema.copy_ema_to(self.parameters, store_temp=False)
+            if os.path.isdir(self.config.output_model_destination) and self.config.output_model_format.is_single_file():
+                save_path = os.path.join(
+                    self.config.output_model_destination,
+                    f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}"
+                )
+            else:
+                save_path = self.config.output_model_destination
+            print("Saving " + save_path)
+
+            self.model_saver.save(
+                model=self.model,
+                model_type=self.config.model_type,
+                output_model_format=self.config.output_model_format,
+                output_model_destination=save_path,
+                dtype=self.config.output_dtype.torch_dtype()
+            )
+        elif self.model is not None:
+            self.model.to(self.temp_device)
+
+        self.tensorboard.close()
+
+        if self.config.tensorboard:
+            super()._stop_tensorboard()
+
+        for handle in self.grad_hook_handles:
+            handle.remove()
+            ```
+
+    +-- modules\ui/
+    +-- modules\util/
+        +-- modules\util\checkpointing_util.py
+            ```checkpointing_util.py
+import re
+from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+
+import inspect
+from collections.abc import Callable
+from typing import Any
+
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.LayerOffloadConductor import LayerOffloadConductor
+from modules.util.torch_util import add_dummy_grad_fn_, has_grad_fn
+
+import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+from diffusers.models.attention import BasicTransformerBlock, JointTransformerBlock
+from diffusers.models.transformers.sana_transformer import SanaTransformerBlock
+from diffusers.models.transformers.transformer_flux import FluxSingleTransformerBlock, FluxTransformerBlock
+from diffusers.models.transformers.transformer_hunyuan_video import (
+	HunyuanVideoIndividualTokenRefinerBlock,
+	HunyuanVideoSingleTransformerBlock,
+	HunyuanVideoTransformerBlock,
+)
+from diffusers.models.unets.unet_stable_cascade import SDCascadeAttnBlock, SDCascadeResBlock, SDCascadeTimestepBlock
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.t5.modeling_t5 import T5Block
+
+def __kwargs_to_args(fun: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+	signature = dict(inspect.signature(fun).parameters)
+	parameters = []
+
+	for i, (key, value) in enumerate(signature.items()):
+		if i < len(args):
+			parameters.append(args[i])
+		elif key in kwargs:
+			parameters.append(kwargs[key])
+		elif value.default is not value.empty:
+			parameters.append(value.default)
+
+	return tuple(parameters)
+
+def __get_args_indices(fun: Callable, arg_names: list[str]) -> list[int]:
+	signature = dict(inspect.signature(fun).parameters)
+	indices = []
+
+	for i, key in enumerate(signature.keys()):
+		if key in arg_names:
+			indices.append(i)
+
+	return indices
+
+__current_call_index = 0
+
+def __generate_call_index() -> int:
+	global __current_call_index
+	__current_call_index += 1
+	return __current_call_index
+
+def create_checkpointed_forward(
+		orig_module: nn.Module,
+		train_device: torch.device,
+		include_from_offload_param_names: list[str] = None,
+		conductor: LayerOffloadConductor | None = None,
+		layer_index: int = 0,
+) -> Callable:
+	orig_forward = orig_module.forward
+	if include_from_offload_param_names is None:
+		include_from_offload_param_names = []
+	included_offload_param_indices = __get_args_indices(orig_forward, include_from_offload_param_names)
+
+	bound_conductor = conductor
+	bound_layer_index = layer_index
+	if conductor is not None:
+		conductor.add_layer(orig_module, included_offload_param_indices)
+
+	if conductor is not None and conductor.offload_activated():
+		def offloaded_custom_forward(
+				dummy: torch.Tensor,
+				call_id: int,
+				*args,
+		):
+			if bound_layer_index == 0 and not torch.is_grad_enabled():
+				bound_conductor.start_forward(True)
+
+			if not any(t.requires_grad for t in get_tensors(args)):
+				args = add_dummy_grad_fn_(args)
+
+			args = bound_conductor.before_layer(bound_layer_index, call_id, args)
+			output = orig_forward(*args)
+			bound_conductor.after_layer(bound_layer_index, call_id, args)
+
+			if torch.is_grad_enabled() and not has_grad_fn(output):
+				output = add_dummy_grad_fn_(output)
+
+			return output
+
+		def custom_forward(
+				call_index: int,
+				*args,
+		):
+			if bound_layer_index == 0:
+				bound_conductor.start_forward(False)
+
+			args = bound_conductor.before_layer(bound_layer_index, call_index, args)
+			output = orig_forward(*args)
+			bound_conductor.after_layer(bound_layer_index, call_index, args)
+			return output
+
+		def forward(
+				*args,
+				**kwargs
+		):
+			call_id = __generate_call_index()
+
+			if torch.is_grad_enabled():
+				dummy = torch.zeros((1,), device=train_device)
+				dummy.requires_grad_(True)
+
+				args = __kwargs_to_args(orig_forward, args, kwargs)
+
+				return checkpoint(
+					offloaded_custom_forward,
+					dummy,
+					call_id,
+					*args,
+					use_reentrant=True
+				)
+			else:
+				args = __kwargs_to_args(orig_forward, args, kwargs)
+				return custom_forward(call_id, *args)
+	else:
+		def custom_forward(
+				dummy: torch.Tensor = None,
+				*args,
+				**kwargs,
+		):
+			return orig_forward(
+				*args,
+				**kwargs,
+			)
+
+		def forward(
+				*args,
+				**kwargs
+		):
+			if torch.is_grad_enabled():
+				dummy = torch.zeros((1,), device=train_device)
+				dummy.requires_grad_(True)
+
+				return checkpoint(
+					custom_forward,
+					dummy,
+					*args,
+					**kwargs,
+					use_reentrant=False
+				)
+			else:
+				return custom_forward(None, *args, **kwargs)
+
+	return forward
+
+def enable_checkpointing_for_basic_transformer_blocks(
+		orig_module: nn.Module,
+		config: TrainConfig,
+		offload_enabled: bool,
+) -> LayerOffloadConductor | None:
+
+	if config.gradient_checkpointing == GradientCheckpointingMethod.OFF:
+		return None
+
+	if config.gradient_checkpointing == GradientCheckpointingMethod.CPU_OFFLOADED:
+		conductor = LayerOffloadConductor(orig_module, config)
+		layer_index = 0
+		for child_module in orig_module.modules():
+			if isinstance(child_module, BasicTransformerBlock):
+				if offload_enabled:
+					child_module.forward = create_checkpointed_forward(
+						child_module, torch.device(config.train_device),
+						[],
+						conductor, layer_index,
+					)
+				else:
+					child_module.forward = create_checkpointed_forward(
+						child_module, torch.device(config.train_device),
+						[],
+					)
+				layer_index += 1
+
+			return conductor
+
+	elif config.gradient_checkpointing == GradientCheckpointingMethod.ON:
+		layers_to_checkpoint_selectively = config.gradient_checkpointing_layers
+		print(f"INFO: Checkpointing seletivo ON. Padrões: {layers_to_checkpoint_selectively if layers_to_checkpoint_selectively else 'Todos (lista vazia)'}")
+
+		for name, child_module in orig_module.named_modules(): # Iterar com nomes
+			if isinstance(child_module, BasicTransformerBlock):
+				if should_checkpoint_layer(name, layers_to_checkpoint_selectively):
+					child_module.forward = create_checkpointed_forward(
+						child_module, torch.device(config.train_device),
+						[], # include_from_offload_param_names (provavelmente vazio para ON)
+						conductor=None, # *** IMPORTANTE: Passa None ***
+						layer_index=0,  # Irrelevante sem conductor
+					)
+				else: # Opcional para depuração
+					print(f"DEBUG: NÃO checkpointando camada: {name}")
+
+		return None # Não retorna conductor no modo ON seletivo
+
+	return None
+
+def enable_checkpointing_for_clip_encoder_layers(
+		orig_module: nn.Module,
+		config: TrainConfig,
+):
+	for child_module in orig_module.modules():
+		if isinstance(child_module, CLIPEncoderLayer):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],
+			)
+
+def enable_checkpointing_for_stable_cascade_blocks(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, SDCascadeResBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],
+				conductor, layer_index,
+			)
+			layer_index += 1
+		if isinstance(child_module, SDCascadeAttnBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],
+				conductor, layer_index,
+			)
+			layer_index += 1
+		if isinstance(child_module, SDCascadeTimestepBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_t5_encoder_layers(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, T5Block):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],  # No activation offloading, because the output might be taken from the middle of the network
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_gemma_layers(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, Gemma2DecoderLayer):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],  # No activation offloading, because the output might be taken from the middle of the network
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_llama_encoder_layers(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, LlamaDecoderLayer):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				[],  # No activation offloading, because the output might be taken from the middle of the network
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_stable_diffusion_3_transformer(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, JointTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states", "encoder_hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_flux_transformer(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, FluxTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states", "encoder_hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	for child_module in orig_module.modules():
+		if isinstance(child_module, FluxSingleTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_sana_transformer(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, SanaTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def enable_checkpointing_for_hunyuan_video_transformer(
+		orig_module: nn.Module,
+		config: TrainConfig,
+) -> LayerOffloadConductor:
+	conductor = LayerOffloadConductor(orig_module, config)
+
+	layer_index = 0
+	for child_module in orig_module.modules():
+		if isinstance(child_module, HunyuanVideoIndividualTokenRefinerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	for child_module in orig_module.modules():
+		if isinstance(child_module, HunyuanVideoTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states", "encoder_hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	for child_module in orig_module.modules():
+		if isinstance(child_module, HunyuanVideoSingleTransformerBlock):
+			child_module.forward = create_checkpointed_forward(
+				child_module, torch.device(config.train_device),
+				["hidden_states"],
+				conductor, layer_index,
+			)
+			layer_index += 1
+
+	return conductor
+
+def should_checkpoint_layer(layer_name: str, patterns: list[str]) -> bool:
+	"""Verifica se o nome da camada corresponde a algum dos padrões fornecidos."""
+	if not patterns:
+		return True
+	for pattern in patterns:
+		if pattern.strip() in layer_name:
+			return True
+	return False
+            ```
+
+        +-- modules\util\args/
+        +-- modules\util\callbacks/
+        +-- modules\util\commands/
+        +-- modules\util\config/
+            +-- modules\util\config\TrainConfig.py
+                ```TrainConfig.py
+import json
+import os
+import uuid
+from copy import deepcopy
+from typing import Any
+
+from modules.util.config.BaseConfig import BaseConfig
+from modules.util.config.CloudConfig import CloudConfig
+from modules.util.config.CloudConfig import CloudConfig
+from modules.util.config.ConceptConfig import ConceptConfig
+from modules.util.config.SampleConfig import SampleConfig
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.ConfigPart import ConfigPart
+from modules.util.enum.DataType import DataType
+from modules.util.enum.EMAMode import EMAMode
+from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+from modules.util.enum.ImageFormat import ImageFormat
+from modules.util.enum.LearningRateScaler import LearningRateScaler
+from modules.util.enum.LearningRateScheduler import LearningRateScheduler
+from modules.util.enum.LossScaler import LossScaler
+from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.LossMode import LossMode
+from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import ModelType, PeftType
+from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.TimestepDistribution import TimestepDistribution
+from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.ModelNames import EmbeddingName, ModelNames
+from modules.util.ModelWeightDtypes import ModelWeightDtypes
+from modules.util.torch_util import default_device
+
+class TrainOptimizerConfig(BaseConfig):
+    optimizer: Optimizer
+    adam_w_mode: bool
+    alpha: float
+    amsgrad: bool
+    beta1: float
+    beta2: float
+    beta3: float
+    bias_correction: bool
+    block_wise: bool
+    capturable: bool
+    centered: bool
+    clip_threshold: float
+    d0: float
+    d_coef: float
+    dampening: float
+    decay_rate: float
+    decouple: bool
+    differentiable: bool
+    eps: float
+    eps2: float
+    foreach: bool
+    fsdp_in_use: bool
+    fused: bool
+    fused_back_pass: bool
+    growth_rate: float
+    initial_accumulator_value: int
+    initial_accumulator: float
+    is_paged: bool
+    log_every: int
+    lr_decay: float
+    max_unorm: float
+    maximize: bool
+    min_8bit_size: int
+    momentum: float
+    nesterov: bool
+    no_prox: bool
+    optim_bits: int
+    percentile_clipping: int
+    percentile_clipping: int
+    r: float
+    relative_step: bool
+    safeguard_warmup: bool
+    scale_parameter: bool
+    stochastic_rounding: bool
+    use_bias_correction: bool
+    use_triton: bool
+    warmup_init: bool
+    weight_decay: float
+    weight_lr_power: float
+    decoupled_decay: bool
+    fixed_decay: bool
+    weight_decouple: bool
+    rectify: bool
+    degenerated_to_sgd: bool
+    k: int
+    xi: float
+    n_sma_threshold: int
+    ams_bound: bool
+    r: float
+    adanorm: bool
+    adam_debias: bool
+    slice_p: int
+    cautious: bool
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("optimizer", Optimizer.ADAMW, Optimizer, False))
+        data.append(("adam_w_mode", False, bool, False))
+        data.append(("alpha", None, float, True))
+        data.append(("amsgrad", False, bool, False))
+        data.append(("beta1", None, float, True))
+        data.append(("beta2", None, float, True))
+        data.append(("beta3", None, float, True))
+        data.append(("bias_correction", False, bool, False))
+        data.append(("block_wise", False, bool, False))
+        data.append(("capturable", False, bool, False))
+        data.append(("centered", False, bool, False))
+        data.append(("clip_threshold", None, float, True))
+        data.append(("d0", None, float, True))
+        data.append(("d_coef", None, float, True))
+        data.append(("dampening", None, float, True))
+        data.append(("decay_rate", None, float, True))
+        data.append(("decouple", False, bool, False))
+        data.append(("differentiable", False, bool, False))
+        data.append(("eps", None, float, True))
+        data.append(("eps2", None, float, True))
+        data.append(("foreach", False, bool, True))  # Disabled, because it uses too much VRAM
+        data.append(("fsdp_in_use", False, bool, False))
+        data.append(("fused", False, bool, False))
+        data.append(("fused_back_pass", False, bool, False))
+        data.append(("growth_rate", None, float, True))
+        data.append(("initial_accumulator_value", None, int, True))
+        data.append(("initial_accumulator", None, float, True))
+        data.append(("is_paged", False, bool, False))
+        data.append(("log_every", None, int, True))
+        data.append(("lr_decay", None, float, True))
+        data.append(("max_unorm", None, float, True))
+        data.append(("maximize", False, bool, False))
+        data.append(("min_8bit_size", None, int, True))
+        data.append(("momentum", None, float, True))
+        data.append(("nesterov", False, bool, False))
+        data.append(("no_prox", False, bool, False))
+        data.append(("optim_bits", None, int, True))
+        data.append(("percentile_clipping", None, int, True))
+        data.append(("percentile_clipping", None, int, True))
+        data.append(("r", None, float, True))
+        data.append(("relative_step", False, bool, False))
+        data.append(("safeguard_warmup", False, bool, False))
+        data.append(("scale_parameter", False, bool, False))
+        data.append(("stochastic_rounding", True, bool, False))
+        data.append(("use_bias_correction", False, bool, False))
+        data.append(("use_triton", False, bool, False))
+        data.append(("warmup_init", False, bool, False))
+        data.append(("weight_decay", None, float, True))
+        data.append(("weight_lr_power", None, float, True))
+        data.append(("decoupled_decay", False, bool, False))
+        data.append(("fixed_decay", False, bool, False))
+        data.append(("rectify", False, bool, False))
+        data.append(("degenerated_to_sgd", False, bool, False))
+        data.append(("k", None, int, True))
+        data.append(("xi", None, float, True))
+        data.append(("n_sma_threshold", None, int, True))
+        data.append(("ams_bound", False, bool, False))
+        data.append(("adanorm", False, bool, False))
+        data.append(("adam_debias", False, bool, False))
+        data.append(("slice_p", None, int, True))
+        data.append(("cautious", False, bool, False))
+
+        return TrainOptimizerConfig(data)
+
+class TrainModelPartConfig(BaseConfig):
+    model_name: str
+    include: bool
+    train: bool
+    stop_training_after: int
+    stop_training_after_unit: TimeUnit
+    learning_rate: float
+    weight_dtype: DataType
+    dropout_probability: float
+    train_embedding: bool
+    attention_mask: bool
+    guidance_scale: float
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("model_name", "", str, False))
+        data.append(("include", True, bool, False))
+        data.append(("train", True, bool, False))
+        data.append(("stop_training_after", None, int, True))
+        data.append(("stop_training_after_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("learning_rate", None, float, True))
+        data.append(("weight_dtype", DataType.NONE, DataType, False))
+        data.append(("dropout_probability", 0.0, float, False))
+        data.append(("train_embedding", True, bool, False))
+        data.append(("attention_mask", False, bool, False))
+        data.append(("guidance_scale", 1.0, float, False))
+
+        return TrainModelPartConfig(data)
+
+class TrainEmbeddingConfig(BaseConfig):
+    uuid: str
+    model_name: str
+    placeholder: str
+    train: bool
+    stop_training_after: int
+    stop_training_after_unit: TimeUnit
+    token_count: int | None
+    initial_embedding_text: str
+    is_output_embedding: bool
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("uuid", str(uuid.uuid4()), str, False))
+        data.append(("model_name", "", str, False))
+        data.append(("placeholder", "<embedding>", str, False))
+        data.append(("train", True, bool, False))
+        data.append(("stop_training_after", None, int, True))
+        data.append(("stop_training_after_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("token_count", 1, int, True))
+        data.append(("initial_embedding_text", "*", str, False))
+        data.append(("is_output_embedding", False, bool, False))
+
+        return TrainEmbeddingConfig(data)
+
+class TrainConfig(BaseConfig):
+    training_method: TrainingMethod
+    model_type: ModelType
+    debug_mode: bool
+    debug_dir: str
+    workspace_dir: str
+    cache_dir: str
+    tensorboard: bool
+    tensorboard_expose: bool
+    tensorboard_port: str
+    validation: bool
+    validate_after: float
+    validate_after_unit: TimeUnit
+    continue_last_backup: bool
+    include_train_config: ConfigPart
+
+    base_model_name: str
+    weight_dtype: DataType
+    output_dtype: DataType
+    output_model_format: ModelFormat
+    output_model_destination: str
+    gradient_checkpointing: GradientCheckpointingMethod
+    gradient_checkpointing_layers: list[str]
+    enable_async_offloading: bool
+    enable_activation_offloading: bool
+    layer_offload_fraction: float
+    force_circular_padding: bool
+
+    concept_file_name: str
+    concepts: list[ConceptConfig]
+    aspect_ratio_bucketing: bool
+    latent_caching: bool
+    clear_cache_before_training: bool
+
+    learning_rate_scheduler: LearningRateScheduler
+    custom_learning_rate_scheduler: str | None
+    scheduler_params: list[dict[str, str]]
+    learning_rate: float
+    learning_rate_warmup_steps: float
+    learning_rate_cycles: float
+    learning_rate_min_factor: float
+    learning_rate_min_factor: float
+    epochs: int
+    batch_size: int
+    gradient_accumulation_steps: int
+    ema: EMAMode
+    ema_decay: float
+    ema_update_step_interval: int
+    dataloader_threads: int
+    train_device: str
+    temp_device: str
+    train_dtype: DataType
+    fallback_train_dtype: DataType
+    enable_autocast_cache: bool
+    only_cache: bool
+    resolution: str
+    frames: str
+    loss_mode_fn: LossMode
+    mse_strength: float
+    mae_strength: float
+    log_cosh_strength: float
+    vb_loss_strength: float
+    loss_weight_fn: LossWeight
+    loss_weight_strength: float
+    dropout_probability: float
+    loss_scaler: LossScaler
+    learning_rate_scaler: LearningRateScaler
+    clip_grad_norm: float
+
+    offset_noise_weight: float
+    perturbation_noise_weight: float
+    rescale_noise_scheduler_to_zero_terminal_snr: bool
+    force_v_prediction: bool
+    force_epsilon_prediction: bool
+    timestep_distribution: TimestepDistribution
+    min_noising_strength: float
+    max_noising_strength: float
+
+    noising_weight: float
+    noising_bias: float
+
+    timestep_shift: float
+    dynamic_timestep_shifting: bool
+
+    unet: TrainModelPartConfig
+
+    prior: TrainModelPartConfig
+
+    text_encoder: TrainModelPartConfig
+    text_encoder_layer_skip: int
+
+    text_encoder_2: TrainModelPartConfig
+    text_encoder_2_layer_skip: int
+
+    text_encoder_3: TrainModelPartConfig
+    text_encoder_3_layer_skip: int
+
+    vae: TrainModelPartConfig
+
+    effnet_encoder: TrainModelPartConfig
+
+    decoder: TrainModelPartConfig
+
+    decoder_text_encoder: TrainModelPartConfig
+
+    decoder_vqgan: TrainModelPartConfig
+
+    masked_training: bool
+    unmasked_probability: float
+    unmasked_weight: float
+    normalize_masked_area_loss: bool
+
+    embedding_learning_rate: float
+    preserve_embedding_norm: bool
+    embedding: TrainEmbeddingConfig
+    additional_embeddings: list[TrainEmbeddingConfig]
+    embedding_weight_dtype: DataType
+
+    peft_type: PeftType
+    lora_model_name: str
+    lora_rank: int
+    lora_alpha: float
+    lora_decompose: bool
+    lora_decompose_norm_epsilon: bool
+    lora_weight_dtype: DataType
+    lora_layers: str  # comma-separated
+    lora_layer_preset: str
+    bundle_additional_embeddings: bool
+
+    optimizer: TrainOptimizerConfig
+    optimizer_defaults: dict[str, TrainOptimizerConfig]
+
+    sample_definition_file_name: str
+    samples: list[SampleConfig]
+    sample_after: float
+    sample_after_unit: TimeUnit
+    sample_skip_first: int
+    sample_image_format: ImageFormat
+    sample_video_format: VideoFormat
+    sample_audio_format: AudioFormat
+    samples_to_tensorboard: bool
+    non_ema_sampling: bool
+
+    cloud: CloudConfig
+
+    backup_after: float
+    backup_after_unit: TimeUnit
+    rolling_backup: bool
+    rolling_backup_count: int
+    backup_before_save: bool
+    save_every: int
+    save_every_unit: TimeUnit
+    save_skip_first: int
+    save_filename_prefix: str
+
+    secrets: SecretsConfig
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(
+            data,
+            config_version=6,
+            config_migrations={
+                0: self.__migration_0,
+                1: self.__migration_1,
+                2: self.__migration_2,
+                3: self.__migration_3,
+                4: self.__migration_4,
+                5: self.__migration_5,
+            }
+        )
+
+    def __migration_0(self, data: dict) -> dict:
+        optimizer_settings = {}
+        migrated_data = {}
+        for key, value in data.items():
+            if key == 'optimizer':
+                optimizer_settings['optimizer'] = value
+            elif key.startswith('optimizer'):
+                optimizer_settings[key.removeprefix('optimizer_')] = value
+            else:
+                migrated_data[key] = value
+
+        if 'optimizer' in optimizer_settings:
+            migrated_data['optimizer'] = optimizer_settings
+            migrated_data['optimizer_defaults'] = {
+                optimizer_settings['optimizer']: deepcopy(optimizer_settings)
+            }
+
+        return migrated_data
+
+    def __migration_1(self, data: dict) -> dict:
+        migrated_data = {
+            "unet": {},
+            "prior": {},
+            "text_encoder": {},
+            "text_encoder_2": {},
+            "vae": {},
+            "effnet_encoder": {},
+            "decoder": {},
+            "decoder_text_encoder": {},
+            "decoder_vqgan": {},
+            "embeddings": [{}],
+        }
+
+        for key, value in data.items():
+            if key == "train_unet":
+                migrated_data["unet"]["train"] = value
+            elif key == "train_unet_epochs":
+                migrated_data["unet"]["stop_training_after"] = value
+                migrated_data["unet"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "unet_learning_rate":
+                migrated_data["unet"]["learning_rate"] = value
+            elif key == "unet_weight_dtype":
+                migrated_data["unet"]["weight_dtype"] = value
+
+            elif key == "train_prior":
+                migrated_data["prior"]["train"] = value
+            elif key == "prior_model_name":
+                migrated_data["prior"]["model_name"] = value
+            elif key == "train_prior_epochs":
+                migrated_data["prior"]["stop_training_after"] = value
+                migrated_data["prior"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "prior_learning_rate":
+                migrated_data["prior"]["learning_rate"] = value
+            elif key == "prior_weight_dtype":
+                migrated_data["prior"]["weight_dtype"] = value
+
+            elif key == "train_text_encoder":
+                migrated_data["text_encoder"]["train"] = value
+            elif key == "train_text_encoder_epochs":
+                migrated_data["text_encoder"]["stop_training_after"] = value
+                migrated_data["text_encoder"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "text_encoder_learning_rate":
+                migrated_data["text_encoder"]["learning_rate"] = value
+            elif key == "text_encoder_weight_dtype":
+                migrated_data["text_encoder"]["weight_dtype"] = value
+
+            elif key == "train_text_encoder_2":
+                migrated_data["text_encoder_2"]["train"] = value
+            elif key == "train_text_encoder_2_epochs":
+                migrated_data["text_encoder_2"]["stop_training_after"] = value
+                migrated_data["text_encoder_2"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "text_encoder_2_learning_rate":
+                migrated_data["text_encoder_2"]["learning_rate"] = value
+            elif key == "text_encoder_2_weight_dtype":
+                migrated_data["text_encoder_2"]["weight_dtype"] = value
+
+            elif key == "vae_model_name":
+                migrated_data["vae"]["model_name"] = value
+            elif key == "vae_weight_dtype":
+                migrated_data["vae"]["weight_dtype"] = value
+
+            elif key == "effnet_encoder_model_name":
+                migrated_data["effnet_encoder"]["model_name"] = value
+            elif key == "effnet_encoder_weight_dtype":
+                migrated_data["effnet_encoder"]["weight_dtype"] = value
+
+            elif key == "decoder_model_name":
+                migrated_data["decoder"]["model_name"] = value
+            elif key == "decoder_weight_dtype":
+                migrated_data["decoder"]["weight_dtype"] = value
+
+            elif key == "decoder_text_encoder_weight_dtype":
+                migrated_data["decoder_text_encoder"]["weight_dtype"] = value
+
+            elif key == "decoder_vqgan_weight_dtype":
+                migrated_data["decoder_vqgan"]["weight_dtype"] = value
+
+            elif key == "embedding_model_names" and len(value) > 0:
+                migrated_data["embeddings"][0]["model_name"] = value[0]
+            elif key == "token_count":
+                migrated_data["embeddings"][0]["token_count"] = value
+            elif key == "initial_embedding_text":
+                migrated_data["embeddings"][0]["initial_embedding_text"] = value
+
+            else:
+                migrated_data[key] = value
+
+        return migrated_data
+
+    def __migration_2(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        min_snr_gamma = migrated_data.pop("min_snr_gamma", 0.0)
+        model_type = ModelType(migrated_data.get("model_type", ModelType.STABLE_DIFFUSION_15))
+        if min_snr_gamma:
+            migrated_data["loss_weight_fn"] = LossWeight.MIN_SNR_GAMMA
+            migrated_data["loss_weight_strength"] = min_snr_gamma
+        elif model_type.is_wuerstchen():
+            migrated_data["loss_weight_fn"] = LossWeight.P2
+            migrated_data["loss_weight_strength"] = 1.0
+
+        return migrated_data
+
+    def __migration_3(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        noising_weight = migrated_data.pop("noising_weight", 0.0)
+        noising_bias = migrated_data.pop("noising_bias", 0.5)
+
+        if noising_weight != 0:
+            migrated_data["timestep_distribution"] = TimestepDistribution.SIGMOID
+            migrated_data["noising_weight"] = noising_weight
+            migrated_data["noising_bias"] = noising_bias - 0.5
+        else:
+            migrated_data["timestep_distribution"] = TimestepDistribution.UNIFORM
+            migrated_data["noising_weight"] = 0.0
+            migrated_data["noising_bias"] = 0.0
+
+        return migrated_data
+
+    def __migration_4(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        gradient_checkpointing = migrated_data.pop("gradient_checkpointing", True)
+
+        if gradient_checkpointing:
+            migrated_data["gradient_checkpointing"] = GradientCheckpointingMethod.ON
+        else:
+            migrated_data["gradient_checkpointing"] = GradientCheckpointingMethod.OFF
+
+        return migrated_data
+
+    def __migration_5(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        if "save_after" in migrated_data:
+            migrated_data["save_every"] = migrated_data.pop("save_after")
+        if "save_after_unit" in migrated_data:
+            migrated_data["save_every_unit"] = migrated_data.pop("save_after_unit")
+
+        return migrated_data
+
+    def weight_dtypes(self) -> ModelWeightDtypes:
+        return ModelWeightDtypes(
+            self.train_dtype,
+            self.fallback_train_dtype,
+            self.weight_dtype if self.unet.weight_dtype == DataType.NONE else self.unet.weight_dtype,
+            self.weight_dtype if self.prior.weight_dtype == DataType.NONE else self.prior.weight_dtype,
+            self.weight_dtype if self.text_encoder.weight_dtype == DataType.NONE else self.text_encoder.weight_dtype,
+            self.weight_dtype if self.text_encoder_2.weight_dtype == DataType.NONE else self.text_encoder_2.weight_dtype,
+            self.weight_dtype if self.text_encoder_3.weight_dtype == DataType.NONE else self.text_encoder_3.weight_dtype,
+            self.weight_dtype if self.vae.weight_dtype == DataType.NONE else self.vae.weight_dtype,
+            self.weight_dtype if self.effnet_encoder.weight_dtype == DataType.NONE else self.effnet_encoder.weight_dtype,
+            self.weight_dtype if self.decoder.weight_dtype == DataType.NONE else self.decoder.weight_dtype,
+            self.weight_dtype if self.decoder_text_encoder.weight_dtype == DataType.NONE else self.decoder_text_encoder.weight_dtype,
+            self.weight_dtype if self.decoder_vqgan.weight_dtype == DataType.NONE else self.decoder_vqgan.weight_dtype,
+            self.weight_dtype if self.lora_weight_dtype == DataType.NONE else self.lora_weight_dtype,
+            self.weight_dtype if self.embedding_weight_dtype == DataType.NONE else self.embedding_weight_dtype,
+        )
+
+    def model_names(self) -> ModelNames:
+        return ModelNames(
+            base_model=self.base_model_name,
+            prior_model=self.prior.model_name,
+            effnet_encoder_model=self.effnet_encoder.model_name,
+            decoder_model=self.decoder.model_name,
+            vae_model=self.vae.model_name,
+            lora=self.lora_model_name,
+            embedding=EmbeddingName(self.embedding.uuid, self.embedding.model_name) \
+                if self.training_method == TrainingMethod.EMBEDDING else None,
+            additional_embeddings=[EmbeddingName(embedding.uuid, embedding.model_name) for embedding in
+                                   self.additional_embeddings],
+            include_text_encoder=self.text_encoder.include,
+            include_text_encoder_2=self.text_encoder_2.include,
+            include_text_encoder_3=self.text_encoder_3.include,
+        )
+
+    def train_any_embedding(self) -> bool:
+        return ((self.training_method == TrainingMethod.EMBEDDING) and not self.embedding.is_output_embedding) \
+            or any((embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings)
+
+    def train_any_output_embedding(self) -> bool:
+        return ((self.training_method == TrainingMethod.EMBEDDING) and self.embedding.is_output_embedding) \
+            or any((embedding.train and embedding.is_output_embedding) for embedding in self.additional_embeddings)
+
+    def train_text_encoder_or_embedding(self) -> bool:
+        return (self.text_encoder.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def train_text_encoder_2_or_embedding(self) -> bool:
+        return (self.text_encoder_2.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder_2.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def train_text_encoder_3_or_embedding(self) -> bool:
+        return (self.text_encoder_3.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder_3.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def all_embedding_configs(self):
+        if self.training_method == TrainingMethod.EMBEDDING:
+            return self.additional_embeddings + [self.embedding]
+        else:
+            return self.additional_embeddings
+
+    def get_last_backup_path(self) -> str | None:
+        backups_path = os.path.join(self.workspace_dir, "backup")
+        if os.path.exists(backups_path):
+            backup_paths = sorted(
+                [path for path in os.listdir(backups_path) if
+                 os.path.isdir(os.path.join(backups_path, path))],
+                reverse=True,
+            )
+
+            if backup_paths:
+                last_backup_path = backup_paths[0]
+                return os.path.join(backups_path, last_backup_path)
+
+        return None
+
+    def to_settings_dict(self, secrets: bool) -> dict:
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+
+        config.concepts = None
+        config.samples = None
+
+        config_dict = config.to_dict()
+        if not secrets:
+            config_dict.pop('secrets',None)
+        return config_dict
+
+    def to_pack_dict(self, secrets: bool) -> dict:
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+
+        if config.concepts is None:
+            with open(config.concept_file_name, 'r') as f:
+                concepts = json.load(f)
+                for i in range(len(concepts)):
+                    concepts[i] = ConceptConfig.default_values().from_dict(concepts[i])
+                config.concepts = concepts
+
+        if config.samples is None:
+            with open(config.sample_definition_file_name, 'r') as f:
+                samples = json.load(f)
+                for i in range(len(samples)):
+                    samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                config.samples = samples
+
+        config_dict = config.to_dict()
+        if not secrets:
+            config_dict.pop('secrets',None)
+        return config_dict
+
+    def to_unpacked_config(self) -> 'TrainConfig':
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+        config.concepts = None
+        config.samples = None
+        return config
+
+    @staticmethod
+    def default_values() -> 'TrainConfig':
+        data = []
+
+        data.append(("training_method", TrainingMethod.FINE_TUNE, TrainingMethod, False))
+        data.append(("model_type", ModelType.STABLE_DIFFUSION_15, ModelType, False))
+        data.append(("debug_mode", False, bool, False))
+        data.append(("debug_dir", "debug", str, False))
+        data.append(("workspace_dir", "workspace/run", str, False))
+        data.append(("cache_dir", "workspace-cache/run", str, False))
+        data.append(("tensorboard", True, bool, False))
+        data.append(("tensorboard_expose", False, bool, False))
+        data.append(("tensorboard_port", 6006, int, False))
+        data.append(("validation", False, bool, False))
+        data.append(("validate_after", 1, int, False))
+        data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
+        data.append(("continue_last_backup", False, bool, False))
+        data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
+
+        data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))
+        data.append(("weight_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("output_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("output_model_format", ModelFormat.SAFETENSORS, ModelFormat, False))
+        data.append(("output_model_destination", "models/model.safetensors", str, False))
+        data.append(("gradient_checkpointing", GradientCheckpointingMethod.ON, GradientCheckpointingMethod, False))
+        data.append(("gradient_checkpointing_layers", "attn1", list[str], False))
+        data.append(("enable_async_offloading", True, bool, False))
+        data.append(("enable_activation_offloading", True, bool, False))
+        data.append(("layer_offload_fraction", 0.0, float, False))
+        data.append(("force_circular_padding", False, bool, False))
+
+        data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
+        data.append(("concepts", None, list[ConceptConfig], True))
+        data.append(("aspect_ratio_bucketing", True, bool, False))
+        data.append(("latent_caching", True, bool, False))
+        data.append(("clear_cache_before_training", True, bool, False))
+
+        data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))
+        data.append(("custom_learning_rate_scheduler", None, str, True))
+        data.append(("scheduler_params", [], list[dict[str, str]], True))
+        data.append(("learning_rate", 3e-6, float, False))
+        data.append(("learning_rate_warmup_steps", 200.0, float, False))
+        data.append(("learning_rate_cycles", 1.0, float, False))
+        data.append(("learning_rate_min_factor", 0.0, float, False))
+        data.append(("epochs", 100, int, False))
+        data.append(("batch_size", 1, int, False))
+        data.append(("gradient_accumulation_steps", 1, int, False))
+        data.append(("ema", EMAMode.OFF, EMAMode, False))
+        data.append(("ema_decay", 0.999, float, False))
+        data.append(("ema_update_step_interval", 5, int, False))
+        data.append(("dataloader_threads", 2, int, False))
+        data.append(("train_device", default_device.type, str, False))
+        data.append(("temp_device", "cpu", str, False))
+        data.append(("train_dtype", DataType.FLOAT_16, DataType, False))
+        data.append(("fallback_train_dtype", DataType.BFLOAT_16, DataType, False))
+        data.append(("enable_autocast_cache", True, bool, False))
+        data.append(("only_cache", False, bool, False))
+        data.append(("resolution", "512", str, False))
+        data.append(("frames", "25", str, False))
+        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
+        data.append(("mse_strength", 1.0, float, False))
+        data.append(("mae_strength", 0.0, float, False))
+        data.append(("log_cosh_strength", 0.0, float, False))
+        data.append(("vb_loss_strength", 1.0, float, False))
+        data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))
+        data.append(("loss_weight_strength", 5.0, float, False))
+        data.append(("dropout_probability", 0.0, float, False))
+        data.append(("loss_scaler", LossScaler.NONE, LossScaler, False))
+        data.append(("learning_rate_scaler", LearningRateScaler.NONE, LearningRateScaler, False))
+        data.append(("clip_grad_norm", 1.0, float, True))
+
+        data.append(("offset_noise_weight", 0.0, float, False))
+        data.append(("perturbation_noise_weight", 0.0, float, False))
+        data.append(("rescale_noise_scheduler_to_zero_terminal_snr", False, bool, False))
+        data.append(("force_v_prediction", False, bool, False))
+        data.append(("force_epsilon_prediction", False, bool, False))
+        data.append(("min_noising_strength", 0.0, float, False))
+        data.append(("max_noising_strength", 1.0, float, False))
+        data.append(("timestep_distribution", TimestepDistribution.UNIFORM, TimestepDistribution, False))
+        data.append(("noising_weight", 0.0, float, False))
+        data.append(("noising_bias", 0.0, float, False))
+        data.append(("timestep_shift", 1.0, float, False))
+        data.append(("dynamic_timestep_shifting", False, bool, False))
+
+        unet = TrainModelPartConfig.default_values()
+        unet.train = True
+        unet.stop_training_after = 0
+        unet.learning_rate = None
+        unet.weight_dtype = DataType.NONE
+        data.append(("unet", unet, TrainModelPartConfig, False))
+
+        prior = TrainModelPartConfig.default_values()
+        prior.model_name = ""
+        prior.train = True
+        prior.stop_training_after = 0
+        prior.learning_rate = None
+        prior.weight_dtype = DataType.NONE
+        data.append(("prior", prior, TrainModelPartConfig, False))
+
+        text_encoder = TrainModelPartConfig.default_values()
+        text_encoder.train = True
+        text_encoder.stop_training_after = 30
+        text_encoder.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder.learning_rate = None
+        text_encoder.weight_dtype = DataType.NONE
+        data.append(("text_encoder", text_encoder, TrainModelPartConfig, False))
+        data.append(("text_encoder_layer_skip", 0, int, False))
+
+        text_encoder_2 = TrainModelPartConfig.default_values()
+        text_encoder_2.train = True
+        text_encoder_2.stop_training_after = 30
+        text_encoder_2.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder_2.learning_rate = None
+        text_encoder_2.weight_dtype = DataType.NONE
+        data.append(("text_encoder_2", text_encoder_2, TrainModelPartConfig, False))
+        data.append(("text_encoder_2_layer_skip", 0, int, False))
+
+        text_encoder_3 = TrainModelPartConfig.default_values()
+        text_encoder_3.train = True
+        text_encoder_3.stop_training_after = 30
+        text_encoder_3.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder_3.learning_rate = None
+        text_encoder_3.weight_dtype = DataType.NONE
+        data.append(("text_encoder_3", text_encoder_3, TrainModelPartConfig, False))
+        data.append(("text_encoder_3_layer_skip", 0, int, False))
+
+        vae = TrainModelPartConfig.default_values()
+        vae.model_name = ""
+        vae.weight_dtype = DataType.FLOAT_32
+        data.append(("vae", vae, TrainModelPartConfig, False))
+
+        effnet_encoder = TrainModelPartConfig.default_values()
+        effnet_encoder.model_name = ""
+        effnet_encoder.weight_dtype = DataType.NONE
+        data.append(("effnet_encoder", effnet_encoder, TrainModelPartConfig, False))
+
+        decoder = TrainModelPartConfig.default_values()
+        decoder.model_name = ""
+        decoder.weight_dtype = DataType.NONE
+        data.append(("decoder", decoder, TrainModelPartConfig, False))
+
+        decoder_text_encoder = TrainModelPartConfig.default_values()
+        decoder_text_encoder.weight_dtype = DataType.NONE
+        data.append(("decoder_text_encoder", decoder_text_encoder, TrainModelPartConfig, False))
+
+        decoder_vqgan = TrainModelPartConfig.default_values()
+        decoder_vqgan.weight_dtype = DataType.NONE
+        data.append(("decoder_vqgan", decoder_vqgan, TrainModelPartConfig, False))
+
+        data.append(("masked_training", False, bool, False))
+        data.append(("unmasked_probability", 0.1, float, False))
+        data.append(("unmasked_weight", 0.1, float, False))
+        data.append(("normalize_masked_area_loss", False, bool, False))
+
+        data.append(("embedding_learning_rate", None, float, True))
+        data.append(("preserve_embedding_norm", False, bool, False))
+        data.append(("embedding", TrainEmbeddingConfig.default_values(), TrainEmbeddingConfig, False))
+        data.append(("additional_embeddings", [], list[TrainEmbeddingConfig], False))
+        data.append(("embedding_weight_dtype", DataType.FLOAT_32, DataType, False))
+
+        data.append(("cloud", CloudConfig.default_values(), CloudConfig, False))
+
+        data.append(("peft_type", PeftType.LORA, PeftType, False))
+        data.append(("lora_model_name", "", str, False))
+        data.append(("lora_rank", 16, int, False))
+        data.append(("lora_alpha", 1.0, float, False))
+        data.append(("lora_decompose", False, bool, False))
+        data.append(("lora_decompose_norm_epsilon", True, bool, False))
+        data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("lora_layers", "", str, False))
+        data.append(("lora_layer_preset", None, str, True))
+        data.append(("bundle_additional_embeddings", True, bool, False))
+
+        data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
+        data.append(("optimizer_defaults", {}, dict[str, TrainOptimizerConfig], False))
+
+        data.append(("sample_definition_file_name", "training_samples/samples.json", str, False))
+        data.append(("samples", None, list[SampleConfig], True))
+        data.append(("sample_after", 10, int, False))
+        data.append(("sample_after_unit", TimeUnit.MINUTE, TimeUnit, False))
+        data.append(("sample_skip_first", 0, int, False))
+        data.append(("sample_image_format", ImageFormat.JPG, ImageFormat, False))
+        data.append(("sample_video_format", VideoFormat.MP4, VideoFormat, False))
+        data.append(("sample_audio_format", AudioFormat.MP3, AudioFormat, False))
+        data.append(("samples_to_tensorboard", True, bool, False))
+        data.append(("non_ema_sampling", True, bool, False))
+        data.append(("skip_sample_on_train_start", False, bool, False))
+
+        data.append(("backup_after", 30, int, False))
+        data.append(("backup_after_unit", TimeUnit.MINUTE, TimeUnit, False))
+        data.append(("rolling_backup", False, bool, False))
+        data.append(("rolling_backup_count", 3, int, False))
+        data.append(("backup_before_save", True, bool, False))
+        data.append(("save_every", 0, int, False))
+        data.append(("save_every_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("save_skip_first", 0, int, False))
+        data.append(("save_filename_prefix", "", str, False))
+
+        secrets = SecretsConfig.default_values()
+        data.append(("secrets", secrets, SecretsConfig, False))
+
+        return TrainConfig(data)
+                ```
+
+        +-- modules\util\convert/
+        +-- modules\util\enum/
+        +-- modules\util\loss/
+        +-- modules\util\modelSpec/
+        +-- modules\util\optimizer/
+        +-- modules\util\ui/
+    +-- modules\zluda/
++-- resources/
+    +-- resources\icons/
+    +-- resources\images/
+    +-- resources\model_config/
+        +-- resources\model_config\stable_cascade/
+        +-- resources\model_config\stable_diffusion/
+        +-- resources\model_config\stable_diffusion_xl/
+    +-- resources\sd_model_spec/
++-- scripts/
+    +-- scripts\util/
++-- training_concepts/
++-- training_presets/
++-- training_samples/

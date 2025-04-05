@@ -1,3 +1,4 @@
+# --- INÍCIO DO ARQUIVO modules/util/prodigy_extensions.py ---
 import math
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -14,216 +15,207 @@ if TYPE_CHECKING:
     from prodigyopt import Prodigy
 else:
     _params_t = Any
-    Prodigy = None # ALTERAÇÃO INSERIDA
+    # ALTERAÇÃO INSERIDA
+    Prodigy = None
 
-# ALTERAÇÃO INSERIDA: Lógica do step_prodigy baseada no código original de prodigyopt.prodigy.step
-#                    com adição de suporte a stochastic rounding para BF16.
+@torch.no_grad()
 def step_prodigy(self: Prodigy, closure=None):
-    """Performs a single optimization step.
+    loss = closure() if closure is not None else None
 
-    Arguments:
-        closure (callable, optional): A closure that reevaluates the model
-            and returns the loss.
-    """
-    loss = None
-    if closure is not None:
-        loss = closure()
-
-    # iterate over each parameter group independently
-    for group_idx, group in enumerate(self.param_groups):
-
+    for group in self.param_groups:
         if group['lr'] == 0.0:
             continue
 
         beta1, beta2 = group['betas']
-        beta3 = group['beta3']
-        if beta3 is None:
-            beta3 = math.sqrt(beta2)
-
-        d = group['d']
-        d_max = group['d_max']
-        d_coef = group['d_coef']
-        lr = group['lr'] # now each group has its own LR
+        beta3 = group['beta3'] or math.sqrt(beta2)
+        d, d_max, lr = group['d'], group['d_max'], group['lr']
         use_bias_correction = group['use_bias_correction']
         safeguard_warmup = group['safeguard_warmup']
         fsdp_in_use = group['fsdp_in_use']
         slice_p = group['slice_p']
-        growth_rate = group['growth_rate']
         decouple = group['decouple']
-
-        # group's iteration counter (k)
         k = group['k']
 
-        if use_bias_correction:
-            bias_correction = ((1 - beta2 ** (k+1)) ** 0.5) / (1 - beta1 ** (k+1))
-        else:
-            bias_correction = 1.0
-
+        bias_correction = ((1 - beta2 ** (k+1)) ** 0.5) / (1 - beta1 ** (k+1)) if use_bias_correction else 1.0
         dlr = d * lr * bias_correction
 
-        # we use the group's local d_numerator and locally reset the denominator
+        group['d_numerator'] *= beta3
         d_numerator = group['d_numerator']
-        d_numerator *= beta3
+        d_denom = 0.0
 
-        d_denom = 0.0  # group's denominator (will accumulate terms)
+        # Vetorização: separa tensores válidos
+        grads, params, exp_avgs, exp_avg_sqs, s_list, p0_list = [], [], [], [], [], []
+        shapes_mismatch = False
 
         for p in group['params']:
             if p.grad is None:
                 continue
 
             grad = p.grad.data
-
-            # Apply weight decay (coupled variant)
-            if group['weight_decay'] != 0 and not decouple:
-                grad.add_(p.data, alpha=group['weight_decay'])
-
-            # State initialization
-            state = self.state[p]
+            state = self.state.setdefault(p, {})
             if 'step' not in state:
                 state['step'] = 0
-                state['s'] = torch.zeros_like(p.data.flatten()[::slice_p]).detach()
-
-                if p.any():
-                    state['p0'] = p.flatten()[::slice_p].detach().clone()
-                else:
-                    # All values are zero, so save VRAM with a zero-tensor
-                    state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
-
-                # Exponential moving average of gradient values
+                state['s'] = torch.zeros_like(p.data.flatten()[::slice_p])
+                state['p0'] = p.flatten()[::slice_p].clone() if p.any() else torch.tensor(0, device=p.device, dtype=p.dtype)
                 if beta1 > 0:
-                    state['exp_avg'] = torch.zeros_like(p.data).detach()
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
 
-                # Exponential moving average of squared gradient values
-                state['exp_avg_sq'] = torch.zeros_like(p.data).detach()
-
-            exp_avg_sq = state['exp_avg_sq']
-            s = state['s']
-            p0 = state['p0']
-
-            # only if the group's LR is > 0 do we accumulate statistics
+            # state refs
+            s, p0 = state['s'], state['p0']
             if lr > 0.0:
-                d0 = group['d0']
-                # we use d / d0 instead of just d to avoid getting values that are too small
                 sliced_grad = grad.flatten()[::slice_p]
-                d_numerator += (d / d0) * dlr * torch.dot(sliced_grad, p0 - p.data.flatten()[::slice_p]).item()
-
-                # Adam EMA updates
-                if beta1 > 0:
-                    exp_avg = state['exp_avg']
-                    exp_avg.mul_(beta1).add_(grad, alpha=d * (1 - beta1))
-
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=d * d * (1 - beta2))
-
+                d_numerator += (d / group['d0']) * dlr * torch.dot(sliced_grad, p0 - p.data.flatten()[::slice_p]).item()
                 if safeguard_warmup:
-                    s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * d))
+                    s.mul_(beta3).add_(sliced_grad, alpha=((d / group['d0']) * d))
                 else:
-                    s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * dlr))
-
-                # accumulate the total denominator for this group
+                    s.mul_(beta3).add_(sliced_grad, alpha=((d / group['d0']) * dlr))
                 d_denom += s.abs().sum().item()
 
-        # if we didn't accumulate any grad (e.g., grad = 0), skip this group
-        # if we have any gradients available, will have d_denom > 0 (unless \|g\|=0)
+            # A partir daqui, preparamos vetorização se possível
+            if p.dtype != torch.bfloat16 or not getattr(self, 'stochastic_rounding', False):
+                grads.append(grad)
+                params.append(p.data)
+                exp_avg_sqs.append(self.state[p]['exp_avg_sq'])
+                if beta1 > 0:
+                    exp_avgs.append(self.state[p]['exp_avg'])
+            else:
+                shapes_mismatch = True  # fallback para laço manual
+
         if d_denom == 0.0:
             group['k'] = k + 1
             continue
 
-        if lr > 0.0:
-            if fsdp_in_use:
-                dist_tensor = torch.zeros(2).to(next(p for p in group['params'] if p.grad is not None).device)
-                dist_tensor[0] = d_numerator
-                dist_tensor[1] = d_denom
-                dist.all_reduce(dist_tensor, op=dist.ReduceOp.SUM)
-                global_d_numerator = dist_tensor[0]
-                global_d_denom = dist_tensor[1]
-            else:
-                global_d_numerator = d_numerator
-                global_d_denom = d_denom
+        # Sincronização distribuída se necessário
+        if fsdp_in_use:
+            dist_tensor = torch.tensor([d_numerator, d_denom], device=params[0].device)
+            dist.all_reduce(dist_tensor)
+            d_numerator, d_denom = dist_tensor.tolist()
 
-            # compute d_hat and d_max for the current group
-            d_hat = d_coef * global_d_numerator / global_d_denom
+        d_hat = group['d_coef'] * d_numerator / d_denom
+        if d == group['d0']:
+            d = max(d, d_hat)
+        d_max = max(d_max, d_hat)
+        d = min(d_max, d * group['growth_rate'])
 
-            # if it's the group's first update (d == d0), enforce d >= d_hat
-            if d == group['d0']:
-                d = max(d, d_hat)
+        # Salva novos valores
+        group['d'] = d
+        group['d_max'] = d_max
+        group['d_hat'] = d_hat
+        group['d_numerator'] = d_numerator
+        group['d_denom'] = d_denom
 
-            # also don't let d "fall" below d, but limit with growth_rate
-            d_max = max(d_max, d_hat)
-            d = min(d_max, d * growth_rate)
+        dlr = d * lr * bias_correction  # Recalcula após novo d
 
-            # store everything back in the group
-            group['d'] = d
-            group['d_max'] = d_max
-            group['d_hat'] = d_hat
-            group['d_numerator'] = global_d_numerator
-            group['d_denom'] = global_d_denom
-
-        # recompute dlr with the updated d (for this group)
-        dlr = d * lr * bias_correction
-
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad.data
-            state = self.state[p]
-            exp_avg_sq = state['exp_avg_sq']
-
-            state['step'] += 1
-
-            denom = exp_avg_sq.sqrt().add_(d * group['eps'])
-
-            # Apply weight decay (decoupled variant)
+        # Atualizações vetorizadas se possível
+        if grads and not shapes_mismatch:
+            # Decoupled weight decay
             if group['weight_decay'] != 0 and decouple:
-                # Use add_stochastic_ for BF16 if enabled
-                if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                     # Cannot use add_stochastic_ directly for weight decay as it modifies input
-                     temp_decay = p.data.to(torch.float32) * (-group['weight_decay'] * dlr)
-                     add_stochastic_(p.data, temp_decay)
-                     del temp_decay
+                torch._foreach_add_(params, params, alpha=-group['weight_decay'] * dlr)
+
+            # EMA
+            if beta1 > 0:
+                torch._foreach_mul_(exp_avgs, beta1)
+                torch._foreach_add_(exp_avgs, grads, alpha=d * (1 - beta1))
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=d * d * (1 - beta2))
+
+            # denom = sqrt(v) + eps*d
+            denom = [v.sqrt().add_(d * group['eps']) for v in exp_avg_sqs]
+            if beta1 > 0:
+                torch._foreach_addcdiv_(params, exp_avgs, denom, value=-dlr)
+            else:
+                torch._foreach_addcdiv_(params, grads, denom, value=-dlr * d)
+
+            # Avança step
+            for p in group['params']:
+                if p.grad is not None:
+                    p.grad = None
+                    self.state[p]['step'] += 1
+        else:
+            # Fallback (BF16 com stochastic_rounding)
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                state = self.state[p]
+                exp_avg_sq = state['exp_avg_sq']
+                denom = exp_avg_sq.sqrt().add_(d * group['eps'])
+
+                if group['weight_decay'] != 0 and decouple:
+                    if p.dtype == torch.bfloat16 and getattr(self, 'stochastic_rounding', False):
+                        temp = p.data.to(torch.float32) * (-group['weight_decay'] * dlr)
+                        add_stochastic_(p.data, temp)
+                        del temp
+                    else:
+                        p.data.add_(p.data, alpha=-group['weight_decay'] * dlr)
+
+                if p.dtype == torch.bfloat16 and getattr(self, 'stochastic_rounding', False):
+                    if beta1 > 0:
+                        addcdiv_stochastic_(p.data, state['exp_avg'], denom, value=-dlr)
+                    else:
+                        addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
                 else:
-                    p.data.add_(p.data, alpha=-group['weight_decay'] * dlr)
+                    if beta1 > 0:
+                        p.data.addcdiv_(state['exp_avg'], denom, value=-dlr)
+                    else:
+                        p.data.addcdiv_(grad, denom, value=-dlr * d)
+                state['step'] += 1                
+                p.grad = None
 
-
-            ### Take step
-            # Use addcdiv_stochastic_ for BF16 if enabled
-            if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-                if beta1 > 0:
-                    exp_avg = state['exp_avg']
-                    addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
-                else:
-                    addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
-            else: # Original logic for FP32 or other types
-                if beta1 > 0:
-                    exp_avg = state['exp_avg']
-                    p.data.addcdiv_(exp_avg, denom, value=-dlr)
-                else:
-                    p.data.addcdiv_(grad, denom, value=-dlr * d)
-
-
-        # Increment the group's k
         group['k'] = k + 1
-
     return loss
-# FIM DA ALTERAÇÃO INSERIDA
 
-# ALTERAÇÃO INSERIDA: Implementação de step_parameter para fused backward pass
 def step_parameter(self: Prodigy, p: torch.Tensor, param_group: dict, param_index_in_group: int):
     """Performs the Prodigy update step for a single parameter."""
-    if p.grad is None:
-        return
-
-    grad = p.grad.data
+    grad = p.grad.data if p.grad is not None else None # Store grad if it exists
     state = self.state[p]
     group = param_group
 
-    # Early exit if LR is 0
+    # --- Group Accumulator Initialization ---
+    # Ensure initialization happens ONCE per group per optimizer step 'k'.
+    # Use a marker tied to the group's step counter 'k'.
+    current_k = group['k']
+    init_marker = f'_initialized_for_step_{current_k}'
+
+    if init_marker not in group:
+        group[init_marker] = True # Mark as initialized for this k
+        # Clean up markers from the previous step (optional, saves minor memory)
+        old_marker = f'_initialized_for_step_{current_k-1}'
+        if old_marker in group:
+            del group[old_marker]
+
+        # Initialize the temporary accumulators for this step
+        group['_current_d_denom'] = 0.0
+        beta3 = group['beta3'] if group['beta3'] is not None else math.sqrt(group['betas'][1])
+        # Start numerator accumulation using the persistent d_numerator from the *previous* step (k-1)
+        group['_current_d_numerator'] = group['d_numerator'] * beta3
+
+    # If grad is None, we skip the update logic but still need to handle the group state logic if it's the last param
+    if grad is None:
+        # Check if this is the last parameter of the group
+        if param_index_in_group == len(group['params']) - 1:
+            # Finalize the step for the group even if this param had no grad
+            # Increment the main group step counter 'k'
+            group['k'] = current_k + 1
+            # Clean up the initialization marker and temporary accumulators
+            if init_marker in group:
+                del group[init_marker]
+            if '_current_d_denom' in group: del group['_current_d_denom']
+            if '_current_d_numerator' in group: del group['_current_d_numerator']
+        # Ensure gradient is None (it already is, but for consistency)
+        p.grad = None
+        return # Skip update for this parameter
+
+    # --- Proceed only if grad is not None ---
+
+    # Early exit if Learning Rate is 0
     if group['lr'] == 0.0:
-        p.grad = None # Release gradient even if no step is taken
+        p.grad = None # Release gradient memory
         return
 
-    # Ensure state is initialized
+    # --- Parameter State Initialization (if needed) ---
     if 'step' not in state:
-        # Initialize state lazily if not done before
         state['step'] = 0
         state['s'] = torch.zeros_like(p.data.flatten()[::group['slice_p']]).detach()
         if p.any():
@@ -231,50 +223,47 @@ def step_parameter(self: Prodigy, p: torch.Tensor, param_group: dict, param_inde
         else:
             state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
         if group['betas'][0] > 0:
-            state['exp_avg'] = torch.zeros_like(p.data).detach()
-        state['exp_avg_sq'] = torch.zeros_like(p.data).detach()
-        # Initialize group denominator accumulator if this is the first param of the group being processed in this step
-        if param_index_in_group == 0:
-             group['_current_d_denom'] = 0.0
-             group['_current_d_numerator'] = group['d_numerator'] * group['beta3'] if group.get('beta3') is not None else group['d_numerator'] * math.sqrt(group['betas'][1])
+            state['exp_avg'] = torch.zeros_like(p.data, dtype=torch.float32, device='cpu')
+        state['exp_avg_sq'] = torch.zeros_like(p.data, dtype=torch.float32, device='cpu')
 
-
-    # Extract state and group parameters
+    # --- Extract state and group parameters ---
     beta1, beta2 = group['betas']
-    beta3 = group['beta3'] if group['beta3'] is not None else math.sqrt(beta2)
-    d = group['d']
+    d = group['d'] # Use 'd' from the previous step (k) for this update
     lr = group['lr']
-    k = group['k']
+    # k = current_k (already defined)
     use_bias_correction = group['use_bias_correction']
     decouple = group['decouple']
     slice_p = group['slice_p']
     safeguard_warmup = group['safeguard_warmup']
     d0 = group['d0']
     eps = group['eps']
+    beta3 = group['beta3'] if group['beta3'] is not None else math.sqrt(beta2) # Recalculate beta3 just in case
 
-    # Apply weight decay (coupled variant) - Must happen before grad is used for EMA
+    # Apply weight decay (coupled variant) - Before grad is used for EMA
     if group['weight_decay'] != 0 and not decouple:
         grad.add_(p.data, alpha=group['weight_decay'])
 
-    # Bias correction factor
-    bias_correction = ((1 - beta2 ** (k + 1)) ** 0.5) / (1 - beta1 ** (k + 1)) if use_bias_correction else 1.0
-    dlr = d * lr * bias_correction # Use the 'd' from the *previous* step for the current update calculation
+    # Bias correction factor - Uses current_k
+    bias_correction = ((1 - beta2 ** (current_k + 1)) ** 0.5) / (1 - beta1 ** (current_k + 1)) if use_bias_correction else 1.0
+    # Calculate learning rate for *this* parameter update - based on d from step k
+    dlr = d * lr * bias_correction
 
-    # Update Adam EMA stats
+    # --- Update Adam EMA stats ---
     exp_avg_sq = state['exp_avg_sq']
-    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=d * d * (1 - beta2))
-
+    grad_cpu = grad.to('cpu', torch.float32)
+    exp_avg_sq.mul_(beta2).addcmul_(grad_cpu, grad_cpu, value=d * d * (1 - beta2))
     if beta1 > 0:
         exp_avg = state['exp_avg']
-        exp_avg.mul_(beta1).add_(grad, alpha=d * (1 - beta1))
+        exp_avg.mul_(beta1).add_(grad_cpu, alpha=d * (1 - beta1))
 
-    # Update Prodigy specific state 's' and accumulate denominator part
+    # --- Update Prodigy state 's' and accumulate d_numerator/d_denominator ---
     s = state['s']
     p0 = state['p0']
     sliced_grad = grad.flatten()[::slice_p]
 
     if lr > 0.0:
-        # Accumulate numerator part - uses d and dlr from *previous* step
+        # Accumulate numerator part - uses d and dlr from the previous step k
+        # The key '_current_d_numerator' MUST exist now due to the initialization logic
         group['_current_d_numerator'] += (d / d0) * dlr * torch.dot(sliced_grad, p0 - p.data.flatten()[::slice_p]).item()
 
         # Update 's' state
@@ -283,73 +272,82 @@ def step_parameter(self: Prodigy, p: torch.Tensor, param_group: dict, param_inde
         else:
             s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * dlr))
 
-        # Accumulate denominator part
+        # Accumulate denominator part - the key '_current_d_denom' MUST exist now
         group['_current_d_denom'] += s.abs().sum().item()
 
-
     # --- Parameter Update ---
-    denom = exp_avg_sq.sqrt().add_(d * eps)
+    denom = exp_avg_sq.sqrt().add(d * eps).to(p.device)
 
-    # Apply weight decay (decoupled variant)
+    # Apply weight decay (decoupled variant) - using dlr from step k
     if group['weight_decay'] != 0 and decouple:
-         if p.dtype == torch.bfloat16 and self.stochastic_rounding:
-             # Cannot use add_stochastic_ directly for weight decay as it modifies input
-             temp_decay = p.data.to(torch.float32) * (-group['weight_decay'] * dlr) # Use dlr from previous step
-             add_stochastic_(p.data, temp_decay)
-             del temp_decay
-         else:
-             p.data.add_(p.data, alpha=-group['weight_decay'] * dlr) # Use dlr from previous step
+        # Check for stochastic rounding
+        if p.dtype == torch.bfloat16 and getattr(self, 'stochastic_rounding', False):
+            temp_decay = p.data.to(torch.float32) * (-group['weight_decay'] * dlr)
+            add_stochastic_(p.data, temp_decay)
+            del temp_decay
+        else:
+            p.data.add_(p.data, alpha=-group['weight_decay'] * dlr)
 
-    # Perform the parameter step update using dlr from *previous* step
-    if p.dtype == torch.bfloat16 and self.stochastic_rounding:
+    # Perform the parameter step update - using dlr from step k
+    # Check for stochastic rounding
+    if p.dtype == torch.bfloat16 and getattr(self, 'stochastic_rounding', False):
         if beta1 > 0:
-            addcdiv_stochastic_(p.data, exp_avg, denom, value=-dlr)
+            # Ensure exp_avg exists before accessing
+            if 'exp_avg' in state:
+                addcdiv_stochastic_(p.data, state['exp_avg'].to(p.device), denom, value=-dlr)
+            # else: Handle case where beta1 > 0 but exp_avg wasn't initialized? Should not happen with current logic.
         else:
             addcdiv_stochastic_(p.data, grad, denom, value=-dlr * d)
-    else:
+    else: # FP32 or no stochastic rounding
         if beta1 > 0:
-            p.data.addcdiv_(exp_avg, denom, value=-dlr)
+             # Ensure exp_avg exists before accessing
+            if 'exp_avg' in state:
+                p.data.addcdiv_(state['exp_avg'].to(p.device), denom, value=-dlr)
+            # else: Handle case?
         else:
             p.data.addcdiv_(grad, denom, value=-dlr * d)
 
     # Increment internal step counter for the parameter
     state['step'] += 1
 
-    # --- Group State Update (only after last parameter) ---
+    # --- Group State Update (only after processing the last parameter) ---
     if param_index_in_group == len(group['params']) - 1:
-        if group['_current_d_denom'] > 0.0 and lr > 0.0: # Only update 'd' if grads were non-zero and lr > 0
-             # Finalize 'd' calculation for the next step
-             d_coef = group['d_coef']
-             growth_rate = group['growth_rate']
-             d_hat = d_coef * group['_current_d_numerator'] / group['_current_d_denom']
-             d_max = group['d_max']
+        # Check if the temporary accumulators exist (they should if init_marker was set)
+        # Also check if denominator is non-zero and lr > 0 to perform the 'd' update
+        if init_marker in group and group.get('_current_d_denom', 0.0) > 0.0 and lr > 0.0:
+            # Finalize the calculation of 'd' for the *next* optimization step (k+1)
+            d_coef = group['d_coef']
+            growth_rate = group['growth_rate']
+            # Use the temporary accumulators from *this* step (k)
+            d_hat = d_coef * group['_current_d_numerator'] / group['_current_d_denom']
+            d_max = group['d_max'] # d_max carries over from previous steps
 
-             # Update d, d_max for the *next* iteration
-             new_d = d # Start with current d
-             if d == group['d0']: # First update
-                 new_d = max(d, d_hat)
-             d_max = max(d_max, d_hat)
-             new_d = min(d_max, new_d * growth_rate)
+            # Calculate the new 'd' value
+            new_d = d # Start with the 'd' used in *this* step (from step k-1)
+            if d == group['d0']: # Check if it was the first step for d
+                new_d = max(d, d_hat)
+            d_max = max(d_max, d_hat) # Update d_max
+            new_d = min(d_max, new_d * growth_rate) # Apply growth rate limit
 
-             # Store updated values back into the group state
-             group['d'] = new_d
-             group['d_max'] = d_max
-             group['d_hat'] = d_hat # Store for potential logging/debugging
-             group['d_numerator'] = group['_current_d_numerator'] # Store final numerator for next step's beta3 multiply
-             group['d_denom'] = group['_current_d_denom'] # Store final denominator for logging/debugging
+            # Store updated values back into the group's persistent state for step k+1
+            group['d'] = new_d
+            group['d_max'] = d_max
+            group['d_hat'] = d_hat # Store d_hat for logging/debugging if needed
+            # Store the final accumulated numerator in the persistent state for the *next* step's beta3 multiplication
+            group['d_numerator'] = group['_current_d_numerator']
+            group['d_denom'] = group['_current_d_denom'] # Store final denominator for logging
 
-        # Increment the main group step counter 'k'
-        group['k'] = k + 1
-        # Clean up temporary accumulators
-        del group['_current_d_denom']
-        del group['_current_d_numerator']
+        # Increment the main group step counter 'k' regardless of whether 'd' was updated
+        group['k'] = current_k + 1
+        # Clean up the initialization marker and temporary accumulators
+        if init_marker in group:
+            del group[init_marker]
+        if '_current_d_denom' in group: del group['_current_d_denom']
+        if '_current_d_numerator' in group: del group['_current_d_numerator']
 
-
-    # Release gradient memory
+    # Release gradient memory for this parameter
     p.grad = None
-# FIM DA ALTERAÇÃO INSERIDA
 
-# ALTERAÇÃO INSERIDA: Funções dummy train/eval para compatibilidade com schedule-free
 def train_mode(self: Prodigy, mode=True):
     """Sets the optimizer training mode."""
     # Prodigy doesn't have distinct modes like schedulefree, but add method for API compatibility.
@@ -362,12 +360,19 @@ def eval_mode(self: Prodigy):
 
 def patch_prodigy(optimizer: Prodigy, stochastic_rounding: bool):
     """Applies patches to the Prodigy optimizer instance."""
-    from prodigyopt import Prodigy # Import locally to avoid circular dependency if used elsewhere
+    # Import locally inside function if needed, or ensure it's imported at module level
+    # from prodigyopt import Prodigy # Assuming Prodigy is the class from the library
 
-    optimizer.stochastic_rounding = stochastic_rounding
-    optimizer.step = step_prodigy.__get__(optimizer, Prodigy)
-    optimizer.step_parameter = step_parameter.__get__(optimizer, Prodigy)
-    optimizer.train = train_mode.__get__(optimizer, Prodigy)
-    optimizer.eval = eval_mode.__get__(optimizer, Prodigy)
+    # Add or update the stochastic_rounding attribute
+    setattr(optimizer, 'stochastic_rounding', stochastic_rounding)
+    # Bind the custom step method
+    optimizer.step = step_prodigy.__get__(optimizer, type(optimizer))
+    # Bind the custom step_parameter method
+    optimizer.step_parameter = step_parameter.__get__(optimizer, type(optimizer))
+    # Bind dummy train/eval methods
+    optimizer.train = train_mode.__get__(optimizer, type(optimizer))
+    optimizer.eval = eval_mode.__get__(optimizer, type(optimizer))
     # Add supports_fused_back_pass method dynamically
     optimizer.supports_fused_back_pass = lambda: True
+    # Mark as schedule-free (important for OneTrainer's logic)
+    setattr(optimizer, 'is_schedule_free', True)

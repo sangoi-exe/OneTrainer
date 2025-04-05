@@ -677,7 +677,11 @@ class GenericTrainer(BaseTrainer):
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
+                        # print("\n=== ANTES DO LOSS.BACKWARD ===")
+                        # print(torch.cuda.memory_summary())
                         loss.backward()
+                        # print("\n=== DEPOIS DO LOSS.BACKWARD ===")
+                        # print(torch.cuda.memory_summary())
 
                     has_gradient = True
                     accumulated_loss += loss.item()
