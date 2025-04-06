@@ -21,6 +21,7 @@ from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.FileType import FileType
+from modules.util.enum.Cache import CacheMode
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -76,7 +77,7 @@ class GenericTrainer(BaseTrainer):
     def start(self):
         self.__save_config_to_workspace()
 
-        if self.config.clear_cache_before_training and self.config.latent_caching:
+        if self.config.clear_cache_before_training and self.config.cache_mode == CacheMode.DISK:
             self.__clear_cache()
 
         if self.config.train_dtype.enable_tf():
@@ -136,6 +137,13 @@ class GenericTrainer(BaseTrainer):
         self.data_loader = self.create_data_loader(
             self.model, self.model.train_progress
         )
+        # NOTE: If clear_cache_before_training is True for GPU mode,
+        # the GPUCache inside the DataLoader starts empty automatically.
+        # No explicit call here is needed for that specific flag.
+        # If explicit clearing *during* operation is needed elsewhere, use:
+        # if self.config.cache_mode == CacheMode.GPU:
+        #     self.data_loader.clear_cache()
+
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -156,16 +164,29 @@ class GenericTrainer(BaseTrainer):
             json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
 
     def __clear_cache(self):
-        print(
-            f'Clearing cache directory {self.config.cache_dir}! '
-            f'You can disable this if you want to continue using the same cache.'
-        )
-        if os.path.isdir(self.config.cache_dir):
-            for filename in os.listdir(self.config.cache_dir):
-                path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
-                    shutil.rmtree(path)
-
+        # This method now only handles clearing the DISK cache directory.
+        # GPU cache is cleared implicitly when the DataLoader is reconstructed,
+        # or can be cleared explicitly via data_loader.clear_cache() if needed elsewhere.
+        if self.config.cache_mode == CacheMode.DISK:
+            print(
+                 f'Clearing DISK cache directory {self.config.cache_dir}! '
+                 f'You can disable this in config `clear_cache_before_training`.'
+            )
+            if os.path.isdir(self.config.cache_dir):
+                 # Keep the logic to remove specific subdirectories for disk cache
+                 for filename in os.listdir(self.config.cache_dir):
+                     path = os.path.join(self.config.cache_dir, filename)
+                     if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                         try:
+                              shutil.rmtree(path)
+                         except OSError as e:
+                              print(f"Error removing directory {path}: {e}")
+        elif self.config.cache_mode == CacheMode.GPU:
+             # No action needed here for GPU cache clearing before training starts.
+             # It happens automatically on DataLoader init.
+             print("GPU cache mode selected. Cache will be built in VRAM.")
+        else:
+             print("Cache mode is None. No cache clearing needed.")
     def __prune_backups(self, backups_to_keep: int):
         backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
         if os.path.exists(backup_dirpath):
@@ -590,7 +611,8 @@ class GenericTrainer(BaseTrainer):
         for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
             self.callbacks.on_update_status("starting epoch/caching")
 
-            if self.config.latent_caching:
+            # Adjust based on cache_mode: If any cache is active, prepare dataset first.
+            if self.config.cache_mode != CacheMode.NONE:
                 self.data_loader.get_data_set().start_next_epoch()
                 self.model_setup.setup_train_device(self.model, self.config)
             else:
@@ -711,7 +733,7 @@ class GenericTrainer(BaseTrainer):
 
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
                         
-												# ALTERAÇÃO INSERIDA: Modificar a lógica de step/update para fused backward pass
+                                                # ALTERAÇÃO INSERIDA: Modificar a lógica de step/update para fused backward pass
                         # Step the optimizer and update scaler if NOT using fused back pass
                         if not (self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass()):
                             if scaler:
@@ -748,7 +770,7 @@ class GenericTrainer(BaseTrainer):
 
                         # Log loss values
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
-												
+                                                
                         ema_loss = ema_loss or accumulated_loss
                         ema_loss_steps += 1
                         ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))

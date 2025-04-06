@@ -10,8 +10,9 @@ from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
-from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.enum.Cache import CacheMode
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -273,6 +274,7 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
+    cache_mode: CacheMode
     latent_caching: bool
     clear_cache_before_training: bool
 
@@ -421,10 +423,17 @@ class TrainConfig(BaseConfig):
     # secrets - not saved into config file
     secrets: SecretsConfig
 
+    def latent_caching(self) -> bool:
+        """
+        Determina se o cache de latentes está ativo (apenas para o modo DISK).
+        Esta é uma propriedade derivada de `cache_mode`.
+        """
+        return self.cache_mode == CacheMode.DISK    
+
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=6,
+            config_version=7,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -432,6 +441,7 @@ class TrainConfig(BaseConfig):
                 3: self.__migration_3,
                 4: self.__migration_4,
                 5: self.__migration_5,
+                5: self.__migration_6,
             }
         )
 
@@ -597,6 +607,41 @@ class TrainConfig(BaseConfig):
 
         return migrated_data
 
+    def __migration_6(self, data: dict) -> dict: # <<< FUNÇÃO ALTERADA ABAIXO >>>
+        """Migra do latent_caching booleano antigo para cache_mode enum."""
+        migrated_data = data.copy()
+
+        # Tenta obter o valor booleano antigo de latent_caching
+        # Se não existir (config mais recente), assume True como era o default implícito do DISK
+        old_latent_caching_value = migrated_data.pop("latent_caching", None)
+
+        # Se old_latent_caching_value foi encontrado (é uma config antiga)
+        if old_latent_caching_value is not None:
+            if old_latent_caching_value:
+                new_cache_mode = CacheMode.DISK
+            else:
+                new_cache_mode = CacheMode.NONE
+
+            # Define o cache_mode com base no valor antigo
+            migrated_data["cache_mode"] = new_cache_mode.value # Salva como string
+
+            print(f"Migração 6: old latent_caching={old_latent_caching_value} -> cache_mode='{new_cache_mode.value}'. O novo 'latent_caching' será derivado.")
+        # Se old_latent_caching_value não foi encontrado, verifica se já existe cache_mode
+        elif "cache_mode" not in migrated_data:
+             # Se nem latent_caching nem cache_mode existem, define um default seguro (DISK)
+             migrated_data["cache_mode"] = CacheMode.DISK.value
+             print(f"Migração 6: Nenhum valor 'latent_caching' ou 'cache_mode' encontrado. Definindo cache_mode='{CacheMode.DISK.value}' por padrão. O 'latent_caching' será derivado.")
+        # Se cache_mode já existe, não faz nada, apenas loga
+        else:
+             print(f"Migração 6: 'cache_mode' já existe ('{migrated_data['cache_mode']}'). Nenhuma alteração de migração necessária para cache_mode. O 'latent_caching' será derivado.")
+
+
+        # REMOVE a linha que tentava definir 'latent_caching' diretamente, pois agora é uma propriedade derivada.
+        # A linha antiga era: migrated_data["latent_caching"] = (new_cache_mode == CacheMode.DISK)
+
+        return migrated_data
+        # <<< FIM DA ALTERAÇÃO >>>
+
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
             self.train_dtype,
@@ -757,7 +802,7 @@ class TrainConfig(BaseConfig):
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
-        data.append(("latent_caching", True, bool, False))
+        data.append(("cache_mode", CacheMode.DISK, CacheMode, False))
         data.append(("clear_cache_before_training", True, bool, False))
 
         # training settings

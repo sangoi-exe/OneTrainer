@@ -2,9 +2,11 @@ import copy
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.mixin.DataLoaderGPUCacheMixin import GPUCache
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.Cache import CacheMode
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
@@ -31,13 +33,13 @@ class StableDiffusionXLBaseDataLoader(
     DataLoaderText2ImageMixin,
 ):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            config: TrainConfig,
-            model: StableDiffusionXLModel,
-            train_progress: TrainProgress,
-            is_validation: bool = False,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
     ):
         super().__init__(
             train_device,
@@ -55,6 +57,41 @@ class StableDiffusionXLBaseDataLoader(
             is_validation=is_validation,
         )
         self.__dl = TrainDataLoader(self.__ds, config.batch_size)
+        self.__cache_module_instance = self.__find_cache_module(self.__ds)
+
+    def __find_cache_module(self, mgds_instance: MGDS) -> DiskCache | GPUCache | None:
+        """Helper to find the cache module instance within the pipeline."""
+        modules_list = mgds_instance.loading_pipeline.modules
+        for current_module in reversed(modules_list):
+            if isinstance(current_module, (DiskCache, GPUCache)):
+                return current_module
+        return None
+
+    def clear_cache(self, config: TrainConfig):
+        """Limpa o cache se um módulo de cache estiver presente e suportar."""
+        if config.cache_mode == CacheMode.DISK:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, DiskCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache em DISCO...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo DiskCache encontrado ou não suporta limpeza.")
+        elif config.cache_mode == CacheMode.GPU:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, GPUCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache na GPU...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo GPUCache encontrado ou não suporta limpeza.")
+        else:
+            print("Nenhum cache ativo para limpar.")
+        torch_gc()  # Boa prática
 
     def get_data_set(self) -> MGDS:
         return self.__ds
@@ -63,24 +100,83 @@ class StableDiffusionXLBaseDataLoader(
         return self.__dl
 
     def _preparation_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
-        rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-        rescale_conditioning_image = RescaleImageChannels(image_in_name='conditioning_image', image_out_name='conditioning_image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-        encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
-        downscale_mask = ScaleImage(in_name='mask', out_name='latent_mask', factor=0.125)
-        add_embeddings_to_prompt_1 = MapData(in_name='prompt', out_name='prompt_1', map_fn=model.add_text_encoder_1_embeddings_to_prompt)
-        add_embeddings_to_prompt_2 = MapData(in_name='prompt', out_name='prompt_2', map_fn=model.add_text_encoder_2_embeddings_to_prompt)
-        encode_conditioning_image = EncodeVAE(in_name='conditioning_image', out_name='latent_conditioning_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        conditioning_image_sample = SampleVAEDistribution(in_name='latent_conditioning_image_distribution', out_name='latent_conditioning_image', mode='mean')
-        tokenize_prompt_1 = Tokenize(in_name='prompt_1', tokens_out_name='tokens_1', mask_out_name='tokens_mask_1', tokenizer=model.tokenizer_1, max_token_length=model.tokenizer_1.model_max_length)
-        tokenize_prompt_2 = Tokenize(in_name='prompt_2', tokens_out_name='tokens_2', mask_out_name='tokens_mask_2', tokenizer=model.tokenizer_2, max_token_length=model.tokenizer_2.model_max_length)
-        encode_prompt_1 = EncodeClipText(in_name='tokens_1', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_1_hidden_state', pooled_out_name=None, add_layer_norm=False, text_encoder=model.text_encoder_1, hidden_state_output_index=-(2 + config.text_encoder_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-        encode_prompt_2 = EncodeClipText(in_name='tokens_2', tokens_attention_mask_in_name=None, hidden_state_out_name='text_encoder_2_hidden_state', pooled_out_name='text_encoder_2_pooled_state', add_layer_norm=False, text_encoder=model.text_encoder_2, hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip), autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
+        rescale_image = RescaleImageChannels(
+            image_in_name="image", image_out_name="image", in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1
+        )
+        rescale_conditioning_image = RescaleImageChannels(
+            image_in_name="conditioning_image",
+            image_out_name="conditioning_image",
+            in_range_min=0,
+            in_range_max=1,
+            out_range_min=-1,
+            out_range_max=1,
+        )
+        encode_image = EncodeVAE(
+            in_name="image",
+            out_name="latent_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        image_sample = SampleVAEDistribution(in_name="latent_image_distribution", out_name="latent_image", mode="mean")
+        downscale_mask = ScaleImage(in_name="mask", out_name="latent_mask", factor=0.125)
+        add_embeddings_to_prompt_1 = MapData(in_name="prompt", out_name="prompt_1", map_fn=model.add_text_encoder_1_embeddings_to_prompt)
+        add_embeddings_to_prompt_2 = MapData(in_name="prompt", out_name="prompt_2", map_fn=model.add_text_encoder_2_embeddings_to_prompt)
+        encode_conditioning_image = EncodeVAE(
+            in_name="conditioning_image",
+            out_name="latent_conditioning_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        conditioning_image_sample = SampleVAEDistribution(
+            in_name="latent_conditioning_image_distribution", out_name="latent_conditioning_image", mode="mean"
+        )
+        tokenize_prompt_1 = Tokenize(
+            in_name="prompt_1",
+            tokens_out_name="tokens_1",
+            mask_out_name="tokens_mask_1",
+            tokenizer=model.tokenizer_1,
+            max_token_length=model.tokenizer_1.model_max_length,
+        )
+        tokenize_prompt_2 = Tokenize(
+            in_name="prompt_2",
+            tokens_out_name="tokens_2",
+            mask_out_name="tokens_mask_2",
+            tokenizer=model.tokenizer_2,
+            max_token_length=model.tokenizer_2.model_max_length,
+        )
+        encode_prompt_1 = EncodeClipText(
+            in_name="tokens_1",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_1_hidden_state",
+            pooled_out_name=None,
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_1,
+            hidden_state_output_index=-(2 + config.text_encoder_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
+        encode_prompt_2 = EncodeClipText(
+            in_name="tokens_2",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_2_hidden_state",
+            pooled_out_name="text_encoder_2_pooled_state",
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_2,
+            hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
 
         modules = [
-            rescale_image, encode_image, image_sample,
-            add_embeddings_to_prompt_1, tokenize_prompt_1,
-            add_embeddings_to_prompt_2, tokenize_prompt_2,
+            rescale_image,
+            encode_image,
+            image_sample,
+            add_embeddings_to_prompt_1,
+            tokenize_prompt_1,
+            add_embeddings_to_prompt_2,
+            tokenize_prompt_2,
         ]
 
         if config.masked_training or config.model_type.has_mask_input():
@@ -100,106 +196,233 @@ class StableDiffusionXLBaseDataLoader(
         return modules
 
     def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
-        image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
-
-        if config.masked_training or config.model_type.has_mask_input():
-            image_split_names.append('latent_mask')
-
-        if config.model_type.has_conditioning_image_input():
-            image_split_names.append('latent_conditioning_image')
-
-        image_aggregate_names = ['crop_resolution', 'image_path']
-
-        text_split_names = []
-
-        sort_names = image_aggregate_names + image_split_names + [
-            'prompt_1', 'tokens_1', 'text_encoder_1_hidden_state',
-            'prompt_2', 'tokens_2', 'text_encoder_2_hidden_state', 'text_encoder_2_pooled_state',
-            'concept'
-        ]
-
-        if not config.train_text_encoder_or_embedding():
-            text_split_names.append('tokens_1')
-            text_split_names.append('text_encoder_1_hidden_state')
-
-        if not config.train_text_encoder_2_or_embedding():
-            text_split_names.append('tokens_2')
-            text_split_names.append('text_encoder_2_hidden_state')
-            text_split_names.append('text_encoder_2_pooled_state')
-
-        image_cache_dir = os.path.join(config.cache_dir, "image")
-        text_cache_dir = os.path.join(config.cache_dir, "text")
-
-        def before_cache_image_fun():
-            model.to(self.temp_device)
-            model.vae_to(self.train_device)
-            model.eval()
-            torch_gc()
-
-        def before_cache_text_fun():
-            model.to(self.temp_device)
-
-            if not config.train_text_encoder_or_embedding():
-                model.text_encoder_1_to(self.train_device)
-
-            if not config.train_text_encoder_2_or_embedding():
-                model.text_encoder_2_to(self.train_device)
-
-            model.eval()
-            torch_gc()
-
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
-
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
-
         modules = []
+        # Usar helper para obter nomes continua sendo uma boa ideia
+        image_split_names, text_split_names, image_aggregate_names, text_aggregate_names = self._get_cache_split_aggregate_names(config)
+        sort_names = self._get_sort_names(config)  # Usar helper
 
-        if config.latent_caching:
+        # --- Lógica de seleção de Cache ---
+        if config.cache_mode == CacheMode.DISK:
+            print("Configurando DiskCache...")
+            # A lógica que estava dentro de `if config.latent_caching:` antes
+            image_cache_dir = os.path.join(config.cache_dir, "image")
+            text_cache_dir = os.path.join(config.cache_dir, "text")
+
+            def before_cache_image_fun_disk():
+                model.to(self.temp_device)
+                model.vae_to(self.temp_device)  # Cache em disco usa temp_device
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_disk():
+                model.to(self.temp_device)
+                # Encoders em temp_device para cache em disco
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.temp_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.temp_device)
+                model.eval()
+                torch_gc()
+
+            image_disk_cache = DiskCache(
+                cache_dir=image_cache_dir,
+                split_names=image_split_names,
+                aggregate_names=image_aggregate_names,
+                variations_in_name="concept.image_variations",
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.image"],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_image_fun_disk,
+            )
             modules.append(image_disk_cache)
+            # Remover nomes cacheados de sort_names para DiskCache
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
 
-        if config.latent_caching:
-            sort_names = [x for x in sort_names if x not in image_aggregate_names]
-            sort_names = [x for x in sort_names if x not in image_split_names]
-
+            # Cache de texto se necessário
             if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                text_disk_cache = DiskCache(
+                    cache_dir=text_cache_dir,
+                    split_names=text_split_names,
+                    aggregate_names=text_aggregate_names,
+                    variations_in_name="concept.text_variations",
+                    balancing_in_name="concept.balancing",
+                    balancing_strategy_in_name="concept.balancing_strategy",
+                    variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                    group_enabled_in_name="concept.enabled",
+                    before_cache_fun=before_cache_text_fun_disk,
+                )
                 modules.append(text_disk_cache)
-                sort_names = [x for x in sort_names if x not in text_split_names]
+                # Remover nomes cacheados de texto de sort_names
+                sort_names = [x for x in sort_names if x not in text_aggregate_names and x not in text_split_names]
 
+        elif config.cache_mode == CacheMode.GPU:
+            print("Configurando GPUCache...")
+
+            all_split_names = list(set(image_split_names + text_split_names)) # Garante unicidade
+            all_aggregate_names = list(set(image_aggregate_names + text_aggregate_names)) # Garante unicidade e passa agregados
+
+            def before_cache_image_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                model.vae_to(self.train_device)  # VAE no device de treino para cache GPU
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                # Encoders no device de treino para cache GPU
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.train_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.train_device)
+                model.eval()
+                torch_gc()
+
+            # Escolher a função de setup correta baseada no que está sendo cacheado
+            before_cache_fun = None
+            if image_split_names:  # Prioriza imagem se tiver
+                before_cache_fun = before_cache_image_fun_gpu
+            elif text_split_names:  # Usa texto se só tiver texto
+                before_cache_fun = before_cache_text_fun_gpu
+
+            gpu_cache = GPUCache(
+                train_device=self.train_device,
+                split_names=list(set(all_split_names)),
+                aggregate_names=list(set(all_aggregate_names)),  # Passar nomes agregados
+                variations_in_name="concept.image_variations",  # Manter consistência
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                # Agrupar por imagem E texto para garantir unicidade se necessário
+                variations_group_in_name=[
+                    "concept.path",
+                    "concept.seed",
+                    "concept.include_subdirectories",
+                    "concept.image",
+                    "concept.text",
+                ],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_fun,
+            )
+            # from modules.dataLoader.mixin.BatchValidator import BatchValidator
+            # validator = BatchValidator(
+            #     # Validar todas as chaves que o GPUCache espera.
+            #     required_names=list(set(all_split_names + all_aggregate_names)),
+            #     target_module=gpu_cache, # O validator agora sabe quem é seu alvo
+            #     name="ValidatorBeforeGPUCache"
+            # )
+            # modules.append(validator)
+            modules.append(gpu_cache) # Adicionar o módulo GPUCache à pipeline
+            sort_names = [x for x in sort_names if x not in all_aggregate_names and x not in all_split_names]
+
+        elif config.cache_mode == CacheMode.NONE:
+            print("Nenhum cache configurado.")
+            # A lista `modules` permanece vazia (nenhum módulo de cache)
+            pass  # Não adiciona módulos de cache
+
+        # --- Lógica de Ordenação (executada após o cache ou se não houver cache) ---
         if len(sort_names) > 0:
-            variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
+            variation_sorting = VariationSorting(
+                names=sort_names,
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                # Usar grupo consistente
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                group_enabled_in_name="concept.enabled",
+            )
             modules.append(variation_sorting)
 
         return modules
 
+    def _get_cache_split_aggregate_names(self, config: TrainConfig):
+        """Helper method to determine names for caching based on config."""
+
+        image_split_names = ["latent_image", "original_resolution", "crop_offset"]
+        if config.masked_training or config.model_type.has_mask_input():
+            image_split_names.append("latent_mask")
+        if config.model_type.has_conditioning_image_input():
+            image_split_names.append("latent_conditioning_image")
+        image_aggregate_names = ["crop_resolution", "image_path"]
+
+        text_split_names = []
+        text_aggregate_names = []  # Typically text doesn't have aggregate names like images
+        if not config.train_text_encoder_or_embedding():
+            text_split_names.append("tokens_1")
+            text_split_names.append("text_encoder_1_hidden_state")
+        if not config.train_text_encoder_2_or_embedding():
+            text_split_names.append("tokens_2")
+            text_split_names.append("text_encoder_2_hidden_state")
+            text_split_names.append("text_encoder_2_pooled_state")
+
+        return image_split_names, text_split_names, image_aggregate_names, text_aggregate_names
+
+    def _get_sort_names(self, config: TrainConfig) -> list[str]:
+        """Helper method to determine names for variation sorting."""
+        image_split_names, text_split_names, image_aggregate_names, _ = self._get_cache_split_aggregate_names(config)
+
+        sort_names = (
+            image_aggregate_names
+            + image_split_names
+            + [
+                "prompt_1",
+                "tokens_1",
+                "text_encoder_1_hidden_state",
+                "prompt_2",
+                "tokens_2",
+                "text_encoder_2_hidden_state",
+                "text_encoder_2_pooled_state",
+                "concept",
+            ]
+        )
+
+        # If using DISK cache, remove names already handled by cache modules
+        if config.cache_mode == CacheMode.DISK:
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                # text_aggregate_names is empty, only remove split names
+                sort_names = [x for x in sort_names if x not in text_split_names]
+
+        # If using GPU cache or NO cache, all determined names are potentially sortable
+        # The VariationSorting module itself will only sort based on the names it receives.
+
+        # Filter out None or empty strings just in case
+        sort_names = [name for name in sort_names if name]
+
+        return list(set(sort_names))  # Return unique names
+
     def _output_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
         output_names = [
-            'image_path', 'latent_image',
-            'prompt_1', 'prompt_2',
-            'tokens_1', 'tokens_2',
-            'original_resolution', 'crop_resolution', 'crop_offset',
+            "image_path",
+            "latent_image",
+            "prompt_1",
+            "prompt_2",
+            "tokens_1",
+            "tokens_2",
+            "original_resolution",
+            "crop_resolution",
+            "crop_offset",
         ]
 
         if config.masked_training or config.model_type.has_mask_input():
-            output_names.append('latent_mask')
+            output_names.append("latent_mask")
 
         if config.model_type.has_conditioning_image_input():
-            output_names.append('latent_conditioning_image')
+            output_names.append("latent_conditioning_image")
 
         if not config.train_text_encoder_or_embedding():
-            output_names.append('text_encoder_1_hidden_state')
+            output_names.append("text_encoder_1_hidden_state")
 
         if not config.train_text_encoder_2_or_embedding():
-            output_names.append('text_encoder_2_hidden_state')
-            output_names.append('text_encoder_2_pooled_state')
+            output_names.append("text_encoder_2_hidden_state")
+            output_names.append("text_encoder_2_pooled_state")
 
-        sort_names = output_names + ['concept']
-        output_names = output_names + [('concept.loss_weight', 'loss_weight')]
+        sort_names = output_names + ["concept"]
+        output_names = output_names + [("concept.loss_weight", "loss_weight")]
 
         # add for calculating loss per concept
         if config.validation:
-            output_names.append(('concept.name', 'concept_name'))
-            output_names.append(('concept.path', 'concept_path'))
-            output_names.append(('concept.seed', 'concept_seed'))
+            output_names.append(("concept.name", "concept_name"))
+            output_names.append(("concept.path", "concept_path"))
+            output_names.append(("concept.seed", "concept_seed"))
 
         def before_cache_image_fun():
             model.to(self.temp_device)
@@ -209,13 +432,13 @@ class StableDiffusionXLBaseDataLoader(
 
         return self._output_modules_from_out_names(
             output_names=output_names,
-            sort_names=sort_names,
             config=config,
             before_cache_image_fun=before_cache_image_fun,
             use_conditioning_image=True,
             vae=model.vae,
             autocast_context=[model.autocast_context, model.vae_autocast_context],
             train_dtype=model.vae_train_dtype,
+            sort_names=self._get_sort_names(config),
         )
 
     def _debug_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
@@ -224,15 +447,50 @@ class StableDiffusionXLBaseDataLoader(
         def before_save_fun():
             model.vae_to(self.train_device)
 
-        decode_image = DecodeVAE(in_name='latent_image', out_name='decoded_image', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        decode_conditioning_image = DecodeVAE(in_name='latent_conditioning_image', out_name='decoded_conditioning_image', vae=model.vae, autocast_contexts=[model.autocast_context, model.vae_autocast_context], dtype=model.vae_train_dtype.torch_dtype())
-        upscale_mask = ScaleImage(in_name='latent_mask', out_name='decoded_mask', factor=8)
-        decode_prompt = DecodeTokens(in_name='tokens_1', out_name='decoded_prompt', tokenizer=model.tokenizer_1)
-        save_image = SaveImage(image_in_name='decoded_image', original_path_in_name='image_path', path=debug_dir, in_range_min=-1, in_range_max=1, before_save_fun=before_save_fun)
-        save_conditioning_image = SaveImage(image_in_name='decoded_conditioning_image', original_path_in_name='image_path', path=debug_dir, in_range_min=-1, in_range_max=1, before_save_fun=before_save_fun)
+        decode_image = DecodeVAE(
+            in_name="latent_image",
+            out_name="decoded_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        decode_conditioning_image = DecodeVAE(
+            in_name="latent_conditioning_image",
+            out_name="decoded_conditioning_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        upscale_mask = ScaleImage(in_name="latent_mask", out_name="decoded_mask", factor=8)
+        decode_prompt = DecodeTokens(in_name="tokens_1", out_name="decoded_prompt", tokenizer=model.tokenizer_1)
+        save_image = SaveImage(
+            image_in_name="decoded_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_conditioning_image = SaveImage(
+            image_in_name="decoded_conditioning_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
         # SaveImage(image_in_name='latent_mask', original_path_in_name='image_path', path=debug_dir, in_range_min=0, in_range_max=1, before_save_fun=before_save_fun)
-        save_mask = SaveImage(image_in_name='decoded_mask', original_path_in_name='image_path', path=debug_dir, in_range_min=0, in_range_max=1, before_save_fun=before_save_fun)
-        save_prompt = SaveText(text_in_name='decoded_prompt', original_path_in_name='image_path', path=debug_dir, before_save_fun=before_save_fun)
+        save_mask = SaveImage(
+            image_in_name="decoded_mask",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=0,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_prompt = SaveText(
+            text_in_name="decoded_prompt", original_path_in_name="image_path", path=debug_dir, before_save_fun=before_save_fun
+        )
 
         # These modules don't really work, since they are inserted after a sorting operation that does not include this data
         # SaveImage(image_in_name='mask', original_path_in_name='image_path', path=debug_dir, in_range_min=0, in_range_max=1),
@@ -257,11 +515,11 @@ class StableDiffusionXLBaseDataLoader(
         return modules
 
     def create_dataset(
-            self,
-            config: TrainConfig,
-            model: StableDiffusionXLModel,
-            train_progress: TrainProgress,
-            is_validation: bool = False,
+        self,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
     ):
         enumerate_input = self._enumerate_input_modules(config)
         load_input = self._load_input_modules(config, model.vae_train_dtype)
@@ -289,7 +547,6 @@ class StableDiffusionXLBaseDataLoader(
                 preparation_modules,
                 cache_modules,
                 output_modules,
-
                 debug_modules if config.debug_mode else None,
                 # inserted before output_modules, which contains a sorting operation
             ],

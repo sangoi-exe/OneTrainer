@@ -1,5 +1,5 @@
 # Snapshot do Projeto
-Timestamp: 20250405_131232
+Timestamp: 20250405_215441
 
 ## Estrutura do Projeto:
 +-- docs/
@@ -7,8 +7,12 @@ Timestamp: 20250405_131232
 +-- modules/
     +-- modules\cloud/
     +-- modules\dataLoader/
+        +-- modules\dataLoader\StableDiffusionXLBaseDataLoader.py
         +-- modules\dataLoader\flux/
         +-- modules\dataLoader\mixin/
+            +-- modules\dataLoader\mixin\BatchValidator.py
+            +-- modules\dataLoader\mixin\DataLoaderGPUCacheMixin.py
+            +-- modules\dataLoader\mixin\DataLoaderText2ImageMixin.py
         +-- modules\dataLoader\wuerstchen/
     +-- modules\model/
         +-- modules\model\util/
@@ -34,19 +38,17 @@ Timestamp: 20250405_131232
         +-- modules\modelSaver\stableDiffusionXL/
         +-- modules\modelSaver\wuerstchen/
     +-- modules\modelSetup/
-        +-- modules\modelSetup\BaseStableDiffusionXLSetup.py
+        +-- modules\modelSetup\StableDiffusionXLLoRASetup.py
         +-- modules\modelSetup\flux/
         +-- modules\modelSetup\mixin/
         +-- modules\modelSetup\stableDiffusion3/
     +-- modules\module/
-        +-- modules\module\LoRAModule.py
         +-- modules\module\quantized/
             +-- modules\module\quantized\mixin/
     +-- modules\trainer/
         +-- modules\trainer\GenericTrainer.py
     +-- modules\ui/
     +-- modules\util/
-        +-- modules\util\checkpointing_util.py
         +-- modules\util\args/
         +-- modules\util\callbacks/
         +-- modules\util\commands/
@@ -54,6 +56,7 @@ Timestamp: 20250405_131232
             +-- modules\util\config\TrainConfig.py
         +-- modules\util\convert/
         +-- modules\util\enum/
+            +-- modules\util\enum\Cache.py
         +-- modules\util\loss/
         +-- modules\util\modelSpec/
         +-- modules\util\optimizer/
@@ -80,8 +83,1134 @@ Timestamp: 20250405_131232
 +-- modules/
     +-- modules\cloud/
     +-- modules\dataLoader/
+        +-- modules\dataLoader\StableDiffusionXLBaseDataLoader.py
+            ```StableDiffusionXLBaseDataLoader.py
+import copy
+import os
+
+from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.mixin.DataLoaderGPUCacheMixin import GPUCache
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.Cache import CacheMode
+from modules.util.torch_util import torch_gc
+from modules.util.TrainProgress import TrainProgress
+
+from mgds.MGDS import MGDS, TrainDataLoader
+from mgds.pipelineModules.DecodeTokens import DecodeTokens
+from mgds.pipelineModules.DecodeVAE import DecodeVAE
+from mgds.pipelineModules.DiskCache import DiskCache
+from mgds.pipelineModules.EncodeClipText import EncodeClipText
+from mgds.pipelineModules.EncodeVAE import EncodeVAE
+from mgds.pipelineModules.MapData import MapData
+from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
+from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
+from mgds.pipelineModules.SaveImage import SaveImage
+from mgds.pipelineModules.SaveText import SaveText
+from mgds.pipelineModules.ScaleImage import ScaleImage
+from mgds.pipelineModules.Tokenize import Tokenize
+from mgds.pipelineModules.VariationSorting import VariationSorting
+
+import torch
+
+class StableDiffusionXLBaseDataLoader(
+    BaseDataLoader,
+    DataLoaderText2ImageMixin,
+):
+    def __init__(
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+    ):
+        super().__init__(
+            train_device,
+            temp_device,
+        )
+
+        if is_validation:
+            config = copy.copy(config)
+            config.batch_size = 1
+
+        self.__ds = self.create_dataset(
+            config=config,
+            model=model,
+            train_progress=train_progress,
+            is_validation=is_validation,
+        )
+        self.__dl = TrainDataLoader(self.__ds, config.batch_size)
+        self.__cache_module_instance = self.__find_cache_module(self.__ds)
+
+    def __find_cache_module(self, mgds_instance: MGDS) -> DiskCache | GPUCache | None:
+        """Helper to find the cache module instance within the pipeline."""
+        modules_list = mgds_instance.loading_pipeline.modules
+        for current_module in reversed(modules_list):
+            if isinstance(current_module, (DiskCache, GPUCache)):
+                return current_module
+        return None
+
+    def clear_cache(self, config: TrainConfig):
+        """Limpa o cache se um módulo de cache estiver presente e suportar."""
+        if config.cache_mode == CacheMode.DISK:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, DiskCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache em DISCO...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo DiskCache encontrado ou não suporta limpeza.")
+        elif config.cache_mode == CacheMode.GPU:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, GPUCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache na GPU...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo GPUCache encontrado ou não suporta limpeza.")
+        else:
+            print("Nenhum cache ativo para limpar.")
+        torch_gc()  # Boa prática
+
+    def get_data_set(self) -> MGDS:
+        return self.__ds
+
+    def get_data_loader(self) -> TrainDataLoader:
+        return self.__dl
+
+    def _preparation_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        rescale_image = RescaleImageChannels(
+            image_in_name="image", image_out_name="image", in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1
+        )
+        rescale_conditioning_image = RescaleImageChannels(
+            image_in_name="conditioning_image",
+            image_out_name="conditioning_image",
+            in_range_min=0,
+            in_range_max=1,
+            out_range_min=-1,
+            out_range_max=1,
+        )
+        encode_image = EncodeVAE(
+            in_name="image",
+            out_name="latent_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        image_sample = SampleVAEDistribution(in_name="latent_image_distribution", out_name="latent_image", mode="mean")
+        downscale_mask = ScaleImage(in_name="mask", out_name="latent_mask", factor=0.125)
+        add_embeddings_to_prompt_1 = MapData(in_name="prompt", out_name="prompt_1", map_fn=model.add_text_encoder_1_embeddings_to_prompt)
+        add_embeddings_to_prompt_2 = MapData(in_name="prompt", out_name="prompt_2", map_fn=model.add_text_encoder_2_embeddings_to_prompt)
+        encode_conditioning_image = EncodeVAE(
+            in_name="conditioning_image",
+            out_name="latent_conditioning_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        conditioning_image_sample = SampleVAEDistribution(
+            in_name="latent_conditioning_image_distribution", out_name="latent_conditioning_image", mode="mean"
+        )
+        tokenize_prompt_1 = Tokenize(
+            in_name="prompt_1",
+            tokens_out_name="tokens_1",
+            mask_out_name="tokens_mask_1",
+            tokenizer=model.tokenizer_1,
+            max_token_length=model.tokenizer_1.model_max_length,
+        )
+        tokenize_prompt_2 = Tokenize(
+            in_name="prompt_2",
+            tokens_out_name="tokens_2",
+            mask_out_name="tokens_mask_2",
+            tokenizer=model.tokenizer_2,
+            max_token_length=model.tokenizer_2.model_max_length,
+        )
+        encode_prompt_1 = EncodeClipText(
+            in_name="tokens_1",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_1_hidden_state",
+            pooled_out_name=None,
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_1,
+            hidden_state_output_index=-(2 + config.text_encoder_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
+        encode_prompt_2 = EncodeClipText(
+            in_name="tokens_2",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_2_hidden_state",
+            pooled_out_name="text_encoder_2_pooled_state",
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_2,
+            hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
+
+        modules = [
+            rescale_image,
+            encode_image,
+            image_sample,
+            add_embeddings_to_prompt_1,
+            tokenize_prompt_1,
+            add_embeddings_to_prompt_2,
+            tokenize_prompt_2,
+        ]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(downscale_mask)
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(rescale_conditioning_image)
+            modules.append(encode_conditioning_image)
+            modules.append(conditioning_image_sample)
+
+        if not config.train_text_encoder_or_embedding():
+            modules.append(encode_prompt_1)
+
+        if not config.train_text_encoder_2_or_embedding():
+            modules.append(encode_prompt_2)
+
+        return modules
+
+    def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        modules = []
+        image_split_names, text_split_names, image_aggregate_names, text_aggregate_names = self._get_cache_split_aggregate_names(config)
+        sort_names = self._get_sort_names(config)  # Usar helper
+
+        if config.cache_mode == CacheMode.DISK:
+            print("Configurando DiskCache...")
+            image_cache_dir = os.path.join(config.cache_dir, "image")
+            text_cache_dir = os.path.join(config.cache_dir, "text")
+
+            def before_cache_image_fun_disk():
+                model.to(self.temp_device)
+                model.vae_to(self.temp_device)  # Cache em disco usa temp_device
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_disk():
+                model.to(self.temp_device)
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.temp_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.temp_device)
+                model.eval()
+                torch_gc()
+
+            image_disk_cache = DiskCache(
+                cache_dir=image_cache_dir,
+                split_names=image_split_names,
+                aggregate_names=image_aggregate_names,
+                variations_in_name="concept.image_variations",
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.image"],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_image_fun_disk,
+            )
+            modules.append(image_disk_cache)
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
+
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                text_disk_cache = DiskCache(
+                    cache_dir=text_cache_dir,
+                    split_names=text_split_names,
+                    aggregate_names=text_aggregate_names,
+                    variations_in_name="concept.text_variations",
+                    balancing_in_name="concept.balancing",
+                    balancing_strategy_in_name="concept.balancing_strategy",
+                    variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                    group_enabled_in_name="concept.enabled",
+                    before_cache_fun=before_cache_text_fun_disk,
+                )
+                modules.append(text_disk_cache)
+                sort_names = [x for x in sort_names if x not in text_aggregate_names and x not in text_split_names]
+
+        elif config.cache_mode == CacheMode.GPU:
+            print("Configurando GPUCache...")
+
+            all_split_names = image_split_names + text_split_names
+            all_aggregate_names = image_aggregate_names + text_aggregate_names  # Passar agregados
+
+            def before_cache_image_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                model.vae_to(self.train_device)  # VAE no device de treino para cache GPU
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.train_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.train_device)
+                model.eval()
+                torch_gc()
+
+            before_cache_fun = None
+            if image_split_names:  # Prioriza imagem se tiver
+                before_cache_fun = before_cache_image_fun_gpu
+            elif text_split_names:  # Usa texto se só tiver texto
+                before_cache_fun = before_cache_text_fun_gpu
+
+            gpu_cache = GPUCache(
+                train_device=self.train_device,
+                split_names=list(set(all_split_names)),
+                aggregate_names=list(set(all_aggregate_names)),  # Passar nomes agregados
+                variations_in_name="concept.image_variations",  # Manter consistência
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=[
+                    "concept.path",
+                    "concept.seed",
+                    "concept.include_subdirectories",
+                    "concept.image",
+                    "concept.text",
+                ],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_fun,
+            )
+            from modules.dataLoader.mixin.BatchValidator import BatchValidator
+            validator = BatchValidator(
+                required_names=list(set(all_split_names + all_aggregate_names)),
+                target_module=gpu_cache,
+                name="ValidatorBeforeGPUCache"
+            )
+            modules.append(validator)
+
+        elif config.cache_mode == CacheMode.NONE:
+            print("Nenhum cache configurado.")
+            pass  # Não adiciona módulos de cache
+
+        if len(sort_names) > 0:
+            variation_sorting = VariationSorting(
+                names=sort_names,
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                group_enabled_in_name="concept.enabled",
+            )
+            modules.append(variation_sorting)
+
+        return modules
+
+    def _get_cache_split_aggregate_names(self, config: TrainConfig):
+        """Helper method to determine names for caching based on config."""
+
+        image_split_names = ["latent_image", "original_resolution", "crop_offset"]
+        if config.masked_training or config.model_type.has_mask_input():
+            image_split_names.append("latent_mask")
+        if config.model_type.has_conditioning_image_input():
+            image_split_names.append("latent_conditioning_image")
+        image_aggregate_names = ["crop_resolution", "image_path"]
+
+        text_split_names = []
+        text_aggregate_names = []  # Typically text doesn't have aggregate names like images
+        if not config.train_text_encoder_or_embedding():
+            text_split_names.append("tokens_1")
+            text_split_names.append("text_encoder_1_hidden_state")
+        if not config.train_text_encoder_2_or_embedding():
+            text_split_names.append("tokens_2")
+            text_split_names.append("text_encoder_2_hidden_state")
+            text_split_names.append("text_encoder_2_pooled_state")
+
+        return image_split_names, text_split_names, image_aggregate_names, text_aggregate_names
+
+    def _get_sort_names(self, config: TrainConfig) -> list[str]:
+        """Helper method to determine names for variation sorting."""
+        image_split_names, text_split_names, image_aggregate_names, _ = self._get_cache_split_aggregate_names(config)
+
+        sort_names = (
+            image_aggregate_names
+            + image_split_names
+            + [
+                "prompt_1",
+                "tokens_1",
+                "text_encoder_1_hidden_state",
+                "prompt_2",
+                "tokens_2",
+                "text_encoder_2_hidden_state",
+                "text_encoder_2_pooled_state",
+                "concept",
+            ]
+        )
+
+        if config.cache_mode == CacheMode.DISK:
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                sort_names = [x for x in sort_names if x not in text_split_names]
+
+        sort_names = [name for name in sort_names if name]
+
+        return list(set(sort_names))  # Return unique names
+
+    def _output_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        output_names = [
+            "image_path",
+            "latent_image",
+            "prompt_1",
+            "prompt_2",
+            "tokens_1",
+            "tokens_2",
+            "original_resolution",
+            "crop_resolution",
+            "crop_offset",
+        ]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            output_names.append("latent_mask")
+
+        if config.model_type.has_conditioning_image_input():
+            output_names.append("latent_conditioning_image")
+
+        if not config.train_text_encoder_or_embedding():
+            output_names.append("text_encoder_1_hidden_state")
+
+        if not config.train_text_encoder_2_or_embedding():
+            output_names.append("text_encoder_2_hidden_state")
+            output_names.append("text_encoder_2_pooled_state")
+
+        sort_names = output_names + ["concept"]
+        output_names = output_names + [("concept.loss_weight", "loss_weight")]
+
+        if config.validation:
+            output_names.append(("concept.name", "concept_name"))
+            output_names.append(("concept.path", "concept_path"))
+            output_names.append(("concept.seed", "concept_seed"))
+
+        def before_cache_image_fun():
+            model.to(self.temp_device)
+            model.vae_to(self.train_device)
+            model.eval()
+            torch_gc()
+
+        return self._output_modules_from_out_names(
+            output_names=output_names,
+            config=config,
+            before_cache_image_fun=before_cache_image_fun,
+            use_conditioning_image=True,
+            vae=model.vae,
+            autocast_context=[model.autocast_context, model.vae_autocast_context],
+            train_dtype=model.vae_train_dtype,
+            sort_names=self._get_sort_names(config),
+        )
+
+    def _debug_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        debug_dir = os.path.join(config.debug_dir, "dataloader")
+
+        def before_save_fun():
+            model.vae_to(self.train_device)
+
+        decode_image = DecodeVAE(
+            in_name="latent_image",
+            out_name="decoded_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        decode_conditioning_image = DecodeVAE(
+            in_name="latent_conditioning_image",
+            out_name="decoded_conditioning_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        upscale_mask = ScaleImage(in_name="latent_mask", out_name="decoded_mask", factor=8)
+        decode_prompt = DecodeTokens(in_name="tokens_1", out_name="decoded_prompt", tokenizer=model.tokenizer_1)
+        save_image = SaveImage(
+            image_in_name="decoded_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_conditioning_image = SaveImage(
+            image_in_name="decoded_conditioning_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_mask = SaveImage(
+            image_in_name="decoded_mask",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=0,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_prompt = SaveText(
+            text_in_name="decoded_prompt", original_path_in_name="image_path", path=debug_dir, before_save_fun=before_save_fun
+        )
+
+        modules = []
+
+        modules.append(decode_image)
+        modules.append(save_image)
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(decode_conditioning_image)
+            modules.append(save_conditioning_image)
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(upscale_mask)
+            modules.append(save_mask)
+
+        modules.append(decode_prompt)
+        modules.append(save_prompt)
+
+        return modules
+
+    def create_dataset(
+        self,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+    ):
+        enumerate_input = self._enumerate_input_modules(config)
+        load_input = self._load_input_modules(config, model.vae_train_dtype)
+        mask_augmentation = self._mask_augmentation_modules(config)
+        aspect_bucketing_in = self._aspect_bucketing_in(config, 64)
+        crop_modules = self._crop_modules(config)
+        augmentation_modules = self._augmentation_modules(config)
+        inpainting_modules = self._inpainting_modules(config)
+        preparation_modules = self._preparation_modules(config, model)
+        cache_modules = self._cache_modules(config, model)
+        output_modules = self._output_modules(config, model)
+
+        debug_modules = self._debug_modules(config, model)
+
+        return self._create_mgds(
+            config,
+            [
+                enumerate_input,
+                load_input,
+                mask_augmentation,
+                aspect_bucketing_in,
+                crop_modules,
+                augmentation_modules,
+                inpainting_modules,
+                preparation_modules,
+                cache_modules,
+                output_modules,
+                debug_modules if config.debug_mode else None,
+            ],
+            train_progress,
+            is_validation,
+        )
+            ```
+
         +-- modules\dataLoader\flux/
         +-- modules\dataLoader\mixin/
+            +-- modules\dataLoader\mixin\BatchValidator.py
+                ```BatchValidator.py
+from mgds.PipelineModule import PipelineModule
+
+class BatchValidator(PipelineModule):
+	def __init__(self, required_names: list[str], target_module: PipelineModule, name: str = "BatchValidator"):
+		super().__init__()
+		self.required_names = required_names
+		self.target = target_module
+		self.name = name
+
+	def start(self, epoch: int, index_offset: int):
+		if hasattr(self.target, "start"):
+			self.target.start(epoch, index_offset)
+
+		print(f"[{self.name}] 🔍 Iniciando varredura para validação de batches...")
+
+		variations = self.get_input(self.target.variations_in_name)
+		for variation in range(len(variations)):
+			samples = variations[variation]
+			for index in range(len(samples)):
+				batch = self._get_previous_batch(variation, index)
+				if batch is None:
+					print(f"[{self.name}] ❌ Batch ausente (variação={variation}, índice={index})")
+					continue
+
+				print(f"[{self.name}] 🟢 process(variation={variation}, index={index})")
+				for i, item in enumerate(batch):
+					keys = list(item.keys())
+					missing = [k for k in self.required_names if k not in keys]
+					if missing:
+						print(f"[{self.name}] ⚠️ Item {i} está sem {missing} (keys={keys})")
+
+				self.target.process(batch, variation, index)
+
+	def _get_previous_batch(self, variation: int, index: int) -> list[dict]:
+		previous = self.get_previous_modules()
+		for module in reversed(previous):
+			if hasattr(module, "get_batch"):
+				batch = module.get_batch(variation, index)
+				if batch is not None:
+					return batch
+		return None
+
+	def process(self, batch: list[dict], variation: int, index: int):
+		print(f"[{self.name}] 🟢 process(variation={variation}, index={index})")
+		for i, item in enumerate(batch):
+			if not isinstance(item, dict):
+				print(f"[{self.name}] ❌ Item {i} não é um dict (tipo: {type(item)})")
+				continue
+			missing = [k for k in self.required_names if k not in item]
+			if missing:
+				print(f"[{self.name}] ⚠️ Faltando {missing} no item {i} (keys={list(item.keys())})")
+		return self.target.process(batch, variation, index)
+
+	def get_item(self, variation: int, index: int, item_name: str):
+		result = self.target.get_item(variation, index, item_name)
+		if result is None:
+			print(f"[{self.name}] ❌ get_item() -> '{item_name}' está ausente (variação={variation}, índice={index})")
+		return result
+
+	def get_inputs(self):
+		return self.target.get_inputs()
+
+	def get_outputs(self):
+		return self.target.get_outputs()
+
+	def clear(self):
+		if hasattr(self.target, "clear"):
+			self.target.clear()
+                ```
+
+            +-- modules\dataLoader\mixin\DataLoaderGPUCacheMixin.py
+                ```DataLoaderGPUCacheMixin.py
+import torch
+from mgds.PipelineModule import PipelineModule
+from modules.dataLoader.mixin.BatchValidator import BatchValidator
+
+class GPUCache(PipelineModule):
+    def __init__(
+        self,
+        train_device: torch.device,
+        split_names: list[str],
+        aggregate_names: list[str],
+        variations_in_name: str,
+        balancing_in_name: str,
+        balancing_strategy_in_name: str,
+        variations_group_in_name: list[str],
+        group_enabled_in_name: str,
+        before_cache_fun=None,
+    ):
+        super().__init__()
+        self.train_device = train_device
+        self.split_names = split_names
+        self.aggregate_names = aggregate_names
+        self.variations_in_name = variations_in_name
+        self.balancing_in_name = balancing_in_name
+        self.balancing_strategy_in_name = balancing_strategy_in_name
+        self.variations_group_in_name = variations_group_in_name
+        self.group_enabled_in_name = group_enabled_in_name
+        self.before_cache_fun = before_cache_fun
+
+        self.cache: dict[str, dict[int, list]] = {}
+        self.cached_variation_indices: set[tuple[int, int]] = set()
+
+    def start(self, epoch: int, index_offset: int):
+        if self.before_cache_fun is not None:
+            self.before_cache_fun()
+
+        print(f"[GPUCache] 🔄 Iniciando pré-carregamento do cache na VRAM...")
+
+        variations = self.get_input(self.variations_in_name)
+        for variation in range(len(variations)):
+            samples = variations[variation]
+            for index in range(len(samples)):
+                if not self.__should_store(variation, index):
+                    continue
+
+                batch = self._get_previous_batch(variation, index)
+                if batch:
+                    for item in batch:
+                        keys = list(item.keys())
+                        if any(name not in keys for name in self.split_names + self.aggregate_names):
+                            print(f"[GPUCache] ❗ Batch incompleto em variação={variation}, índice={index} → chaves: {keys}")
+                if batch is None:
+                    raise RuntimeError(f"[GPUCache] ❌ Falha ao obter batch para variação={variation}, índice={index} (batch is None)")
+
+                print(f"[GPUCache] process() -> variation={variation}, index={index}, keys={[list(item.keys()) for item in batch]}")
+
+                self.process(batch, variation, index)
+
+        print(f"[GPUCache] ✅ Cache completo na VRAM ({len(self.cached_variation_indices)} itens)")
+
+    def _get_previous_batch(self, variation: int, index: int) -> list[dict]:
+        previous = self.get_previous_modules()
+        if not previous:
+            print("[GPUCache] ⚠️ Nenhum módulo anterior encontrado")
+            return None
+
+        for module in reversed(previous):
+            if hasattr(module, "get_batch"):
+                batch = module.get_batch(variation, index)
+                if batch is not None:
+                    print(f"[GPUCache] 🔗 Batch recebido de {module.__class__.__name__}")
+                    return batch
+                else:
+                    print(f"[GPUCache] ⚠️ {module.__class__.__name__}.get_batch() retornou None")
+
+        return None
+
+    def __store_item(self, variation: int, index: int, name: str, value):
+        if value is None:
+            return
+        if name not in self.cache:
+            self.cache[name] = {}
+
+        if variation not in self.cache[name]:
+            self.cache[name][variation] = []
+
+        cache_list = self.cache[name][variation]
+        while len(cache_list) <= index:
+            cache_list.append(None)
+
+        if isinstance(value, torch.Tensor):
+            value = value.to(self.train_device, non_blocking=True)
+
+        print(f"[GPUCache] armazenando {name} para variação={variation}, index={index}")
+        cache_list[index] = value
+
+    def __should_store(self, variation: int, index: int) -> bool:
+        return (variation, index) not in self.cached_variation_indices
+
+    def process(self, batch: list[dict], variation: int, index: int):
+        if not self.__should_store(variation, index):
+            return batch
+
+        for item in batch:
+            assert isinstance(item, dict), f"[GPUCache] ❌ item no batch não é dict: {type(item)}"
+            for name in self.split_names + self.aggregate_names:
+                if name in item:
+                    self.__store_item(variation, index, name, item[name])
+
+        self.cached_variation_indices.add((variation, index))
+        print(f"[GPUCache] process() chamado com variation={variation}, index={index}")
+        return batch
+
+    def get_item(self, variation: int, index: int, item_name: str):
+        variation_exists = item_name in self.cache and variation in self.cache[item_name]
+        if variation_exists:
+            cache_list = self.cache[item_name][variation]
+            if index < len(cache_list):
+                value = cache_list[index]
+                if value is not None:
+                    return {item_name: value}
+                else:
+                    print(f"[GPUCache] ❌ Valor NULO para {item_name} na posição [{variation}][{index}]")
+            else:
+                print(f"[GPUCache] ❌ Índice {index} fora do range para {item_name} na variação {variation}")
+        else:
+            print(f"[GPUCache] ❌ Nenhuma entrada encontrada para {item_name} na variação {variation}")
+
+        return None
+
+    def clear(self):
+        self.cache.clear()
+        self.cached_variation_indices.clear()
+
+    def get_inputs(self) -> list[str]:
+        return []
+
+    def get_outputs(self) -> list[str]:
+        return self.split_names + self.aggregate_names
+                ```
+
+            +-- modules\dataLoader\mixin\DataLoaderText2ImageMixin.py
+                ```DataLoaderText2ImageMixin.py
+import re
+from collections.abc import Callable
+
+from modules.util import path_util
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.DataType import DataType
+from modules.util.enum.Cache import CacheMode
+from modules.util.enum.DataType import DataType
+from modules.model import util as model_util  # ADDED Model util for VAE device management
+
+from mgds.OutputPipelineModule import OutputPipelineModule
+from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
+from mgds.pipelineModules.AspectBucketing import AspectBucketing
+from mgds.pipelineModules.CalcAspect import CalcAspect
+from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
+from mgds.pipelineModules.CollectPaths import CollectPaths
+from mgds.pipelineModules.DropTags import DropTags
+from mgds.pipelineModules.GenerateImageLike import GenerateImageLike
+from mgds.pipelineModules.GenerateMaskedConditioningImage import GenerateMaskedConditioningImage
+from mgds.pipelineModules.GetFilename import GetFilename
+from mgds.pipelineModules.ImageToVideo import ImageToVideo
+from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorting
+from mgds.pipelineModules.LoadImage import LoadImage
+from mgds.pipelineModules.LoadMultipleTexts import LoadMultipleTexts
+from mgds.pipelineModules.LoadVideo import LoadVideo
+from mgds.pipelineModules.ModifyPath import ModifyPath
+from mgds.pipelineModules.RandomBrightness import RandomBrightness
+from mgds.pipelineModules.RandomCircularMaskShrink import RandomCircularMaskShrink
+from mgds.pipelineModules.RandomContrast import RandomContrast
+from mgds.pipelineModules.RandomFlip import RandomFlip
+from mgds.pipelineModules.RandomHue import RandomHue
+from mgds.pipelineModules.RandomLatentMaskRemove import RandomLatentMaskRemove
+from mgds.pipelineModules.RandomMaskRotateCrop import RandomMaskRotateCrop
+from mgds.pipelineModules.RandomRotate import RandomRotate
+from mgds.pipelineModules.RandomSaturation import RandomSaturation
+from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
+from mgds.pipelineModules.SelectInput import SelectInput
+from mgds.pipelineModules.SelectRandomText import SelectRandomText
+from mgds.pipelineModules.ShuffleTags import ShuffleTags
+from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
+
+import torch
+
+from diffusers import AutoencoderKL
+
+class DataLoaderText2ImageMixin:
+    def __init__(self):
+        pass
+
+    def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
+        supported_extensions = set()
+        supported_extensions |= path_util.supported_image_extensions()
+
+        if allow_videos:
+            supported_extensions |= path_util.supported_video_extensions()
+
+        collect_paths = CollectPaths(
+            concept_in_name="concept",
+            path_in_name="path",
+            include_subdirectories_in_name="concept.include_subdirectories",
+            enabled_in_name="enabled",
+            path_out_name="image_path",
+            concept_out_name="concept",
+            extensions=supported_extensions,
+            include_postfix=None,
+            exclude_postfix=["-masklabel"],
+        )
+
+        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        sample_prompt_path = ModifyPath(in_name="image_path", out_name="sample_prompt_path", postfix="", extension=".txt")
+
+        modules = [collect_paths, sample_prompt_path]
+
+        if config.masked_training:
+            modules.append(mask_path)
+
+        return modules
+
+    def _load_input_modules(
+        self,
+        config: TrainConfig,
+        train_dtype: DataType,
+        allow_video: bool = False,
+    ) -> list:
+        load_image = LoadImage(
+            path_in_name="image_path",
+            image_out_name="image",
+            range_min=0,
+            range_max=1,
+            supported_extensions=path_util.supported_image_extensions(),
+            dtype=train_dtype.torch_dtype(),
+        )
+        load_video = LoadVideo(
+            path_in_name="image_path",
+            target_frame_count_in_name="settings.target_frames",
+            video_out_name="image",
+            range_min=0,
+            range_max=1,
+            target_frame_rate=24,
+            supported_extensions=path_util.supported_video_extensions(),
+            dtype=train_dtype.torch_dtype(),
+        )
+        image_to_video = ImageToVideo(in_name="image", out_name="image")
+
+        generate_mask = GenerateImageLike(image_in_name="image", image_out_name="mask", color=255, range_min=0, range_max=1)
+        load_mask = LoadImage(
+            path_in_name="mask_path",
+            image_out_name="mask",
+            range_min=0,
+            range_max=1,
+            channels=1,
+            supported_extensions={".png"},
+            dtype=train_dtype.torch_dtype(),
+        )
+        mask_to_video = ImageToVideo(in_name="mask", out_name="mask")
+
+        load_sample_prompts = LoadMultipleTexts(path_in_name="sample_prompt_path", texts_out_name="sample_prompts")
+        load_concept_prompts = LoadMultipleTexts(path_in_name="concept.text.prompt_path", texts_out_name="concept_prompts")
+        filename_prompt = GetFilename(path_in_name="image_path", filename_out_name="filename_prompt", include_extension=False)
+        select_prompt_input = SelectInput(
+            setting_name="concept.text.prompt_source",
+            out_name="prompts",
+            setting_to_in_name_map={
+                "sample": "sample_prompts",
+                "concept": "concept_prompts",
+                "filename": "filename_prompt",
+            },
+            default_in_name="sample_prompts",
+        )
+        select_random_text = SelectRandomText(texts_in_name="prompts", text_out_name="prompt")
+
+        modules = [load_image, load_video]
+
+        if allow_video:
+            modules.append(image_to_video)
+
+        modules.extend([load_sample_prompts, load_concept_prompts, filename_prompt, select_prompt_input, select_random_text])
+
+        if config.masked_training:
+            modules.append(generate_mask)
+            modules.append(load_mask)
+        elif config.model_type.has_mask_input():
+            modules.append(generate_mask)
+
+        if allow_video:
+            modules.append(mask_to_video)
+
+        return modules
+
+    def _mask_augmentation_modules(self, config: TrainConfig) -> list:
+        inputs = ["image"]
+
+        lowest_resolution = min([int(x.strip()) for x in re.split(r"\D", config.resolution) if x.strip() != ""])
+        circular_mask_shrink = RandomCircularMaskShrink(
+            mask_name="mask",
+            shrink_probability=1.0,
+            shrink_factor_min=0.2,
+            shrink_factor_max=1.0,
+            enabled_in_name="concept.image.enable_random_circular_mask_shrink",
+        )
+        random_mask_rotate_crop = RandomMaskRotateCrop(
+            mask_name="mask",
+            additional_names=inputs,
+            min_size=lowest_resolution,
+            min_padding_percent=10,
+            max_padding_percent=30,
+            max_rotate_angle=20,
+            enabled_in_name="concept.image.enable_random_mask_rotate_crop",
+        )
+
+        modules = []
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(circular_mask_shrink)
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(random_mask_rotate_crop)
+
+        return modules
+
+    def _aspect_bucketing_in(self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled: bool = False):
+        calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
+
+        aspect_bucketing_quantization = AspectBucketing(
+            quantization=aspect_bucketing_quantization,
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            target_frames_in_name="settings.target_frames",
+            frame_dim_enabled=frame_dim_enabled,
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
+        )
+
+        single_aspect_calculation = SingleAspectCalculation(
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
+        )
+
+        modules = [calc_aspect]
+
+        if config.aspect_ratio_bucketing:
+            modules.append(aspect_bucketing_quantization)
+        else:
+            modules.append(single_aspect_calculation)
+
+        return modules
+
+    def _crop_modules(self, config: TrainConfig):
+        inputs = ["image"]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            inputs.append("mask")
+
+        if config.model_type.has_depth_input():
+            inputs.append("depth")
+
+        scale_crop = ScaleCropImage(
+            names=inputs,
+            scale_resolution_in_name="scale_resolution",
+            crop_resolution_in_name="crop_resolution",
+            enable_crop_jitter_in_name="concept.image.enable_crop_jitter",
+            crop_offset_out_name="crop_offset",
+        )
+
+        modules = [scale_crop]
+
+        return modules
+
+    def _augmentation_modules(self, config: TrainConfig):
+        inputs = ["image"]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            inputs.append("mask")
+
+        if config.model_type.has_depth_input():
+            inputs.append("depth")
+
+        random_flip = RandomFlip(
+            names=inputs, enabled_in_name="concept.image.enable_random_flip", fixed_enabled_in_name="concept.image.enable_fixed_flip"
+        )
+        random_rotate = RandomRotate(
+            names=inputs,
+            enabled_in_name="concept.image.enable_random_rotate",
+            fixed_enabled_in_name="concept.image.enable_fixed_rotate",
+            max_angle_in_name="concept.image.random_rotate_max_angle",
+        )
+        random_brightness = RandomBrightness(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_brightness",
+            fixed_enabled_in_name="concept.image.enable_fixed_brightness",
+            max_strength_in_name="concept.image.random_brightness_max_strength",
+        )
+        random_contrast = RandomContrast(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_contrast",
+            fixed_enabled_in_name="concept.image.enable_fixed_contrast",
+            max_strength_in_name="concept.image.random_contrast_max_strength",
+        )
+        random_saturation = RandomSaturation(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_saturation",
+            fixed_enabled_in_name="concept.image.enable_fixed_saturation",
+            max_strength_in_name="concept.image.random_saturation_max_strength",
+        )
+        random_hue = RandomHue(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_hue",
+            fixed_enabled_in_name="concept.image.enable_fixed_hue",
+            max_strength_in_name="concept.image.random_hue_max_strength",
+        )
+        drop_tags = DropTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.tag_dropout_enable",
+            probability_in_name="concept.text.tag_dropout_probability",
+            dropout_mode_in_name="concept.text.tag_dropout_mode",
+            special_tags_in_name="concept.text.tag_dropout_special_tags",
+            special_tag_mode_in_name="concept.text.tag_dropout_special_tags_mode",
+            delimiter_in_name="concept.text.tag_delimiter",
+            keep_tags_count_in_name="concept.text.keep_tags_count",
+            text_out_name="prompt",
+            regex_enabled_in_name="concept.text.tag_dropout_special_tags_regex",
+        )
+        caps_randomize = CapitalizeTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.caps_randomize_enable",
+            probability_in_name="concept.text.caps_randomize_probability",
+            capitalize_mode_in_name="concept.text.caps_randomize_mode",
+            delimiter_in_name="concept.text.tag_delimiter",
+            convert_lowercase_in_name="concept.text.caps_randomize_lowercase",
+            text_out_name="prompt",
+        )
+        shuffle_tags = ShuffleTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.enable_tag_shuffling",
+            delimiter_in_name="concept.text.tag_delimiter",
+            keep_tags_count_in_name="concept.text.keep_tags_count",
+            text_out_name="prompt",
+        )
+
+        modules = [
+            random_flip,
+            random_rotate,
+            random_brightness,
+            random_contrast,
+            random_saturation,
+            random_hue,
+            drop_tags,
+            caps_randomize,
+            shuffle_tags,
+        ]
+
+        return modules
+
+    def _inpainting_modules(self, config: TrainConfig):
+        conditioning_image = GenerateMaskedConditioningImage(
+            image_in_name="image", mask_in_name="mask", image_out_name="conditioning_image", image_range_min=0, image_range_max=1
+        )
+
+        modules = []
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(conditioning_image)
+
+        return modules
+
+    def _output_modules_from_out_names(
+        self,
+        output_names: list[str | tuple[str, str]],  # Allow tuple for renaming
+        sort_names: list[str],  # sort_names is now passed in
+        config: TrainConfig,
+        before_cache_image_fun: Callable[[], None] | None = None,
+        use_conditioning_image: bool = False,
+        vae: AutoencoderKL | None = None,
+        autocast_context: list[torch.autocast | None] = None,
+        train_dtype: DataType | None = None,
+    ):
+        def before_mask_remove_fun():
+            if vae:
+                if config.cache_mode == CacheMode.GPU:  # Check CacheMode
+                    model_util.vae_to(vae, torch.device(config.train_device))  # Use device from config
+                elif before_cache_image_fun:
+                    before_cache_image_fun()
+
+        mask_remove = RandomLatentMaskRemove(
+            latent_mask_name="latent_mask",
+            latent_conditioning_image_name="latent_conditioning_image" if use_conditioning_image else None,
+            replace_probability=config.unmasked_probability,
+            vae=vae,
+            possible_resolutions_in_name="possible_resolutions",
+            autocast_contexts=autocast_context,
+            dtype=train_dtype.torch_dtype() if train_dtype else None,
+            before_cache_fun=before_mask_remove_fun,  # Use the adjusted function
+        )
+
+        if config.cache_mode == CacheMode.DISK:
+            batch_sorting = AspectBatchSorting(resolution_in_name="crop_resolution", names=sort_names, batch_size=config.batch_size)
+        else:
+            batch_sorting = InlineAspectBatchSorting(resolution_in_name="crop_resolution", names=sort_names, batch_size=config.batch_size)
+
+        output = OutputPipelineModule(names=output_names)
+
+        modules = []
+
+        if config.model_type.has_mask_input():
+            modules.append(mask_remove)
+
+        modules.append(batch_sorting)  # Add the appropriate batch sorter
+
+        modules.append(output)
+
+        return modules
+                ```
+
         +-- modules\dataLoader\wuerstchen/
     +-- modules\model/
         +-- modules\model\util/
@@ -107,1155 +1236,214 @@ Timestamp: 20250405_131232
         +-- modules\modelSaver\stableDiffusionXL/
         +-- modules\modelSaver\wuerstchen/
     +-- modules\modelSetup/
-        +-- modules\modelSetup\BaseStableDiffusionXLSetup.py
-            ```BaseStableDiffusionXLSetup.py
-from abc import ABCMeta
-from random import Random
-
-from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
-from modules.modelSetup.BaseModelSetup import BaseModelSetup
-from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
-from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiffusionLossMixin
-from modules.modelSetup.mixin.ModelSetupDiffusionMixin import ModelSetupDiffusionMixin
-from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
-from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
-from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
-from modules.util.checkpointing_util import (
-	enable_checkpointing_for_basic_transformer_blocks,
-	enable_checkpointing_for_clip_encoder_layers,
-)
+        +-- modules\modelSetup\StableDiffusionXLLoRASetup.py
+            ```StableDiffusionXLLoRASetup.py
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
+from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.conv_util import apply_circular_padding_to_conv2d
-from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
-from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.quantization_util import quantize_layers
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.optimizer_util import init_model_parameters
+from modules.util.torch_util import state_dict_has_prefix
 from modules.util.TrainProgress import TrainProgress
-from torch.utils.tensorboard import SummaryWriter
 
 import torch
-from torch import Tensor
 
-from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+PRESETS = {
+    "attn-mlp": ["attentions"],
+    "attn-only": ["attn"],
+    "full": [],
+    "input-only": ["down_blocks", "resnets", "conv", "time_emb_proj"],
+    "art-style": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "mid_block", "resnets"],
+    "face-detail": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "down_blocks", "up_blocks"],
+    "almost-full-safe": ["down_blocks", "up_blocks", "mid_block", "attn", "proj", "ff", "resnets"],
+    "danger-zone": ["conv_in", "conv_out", "mid_block", "attn", "proj", "resnets"],
+    "interaction-concept": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "resnets", "down_blocks", "mid_block"],
+    "input-encoders-only": ["time_embedding", "add_embedding", "conv_in", "down_blocks"],
+}
 
-class BaseStableDiffusionXLSetup(
-	BaseModelSetup,
-	ModelSetupDiffusionLossMixin,
-	ModelSetupDebugMixin,
-	ModelSetupNoiseMixin,
-	ModelSetupDiffusionMixin,
-	ModelSetupEmbeddingMixin,
-	metaclass=ABCMeta
+class StableDiffusionXLLoRASetup(
+    BaseStableDiffusionXLSetup,
 ):
+    def __init__(
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        debug_mode: bool,
+    ):
+        super().__init__(
+            train_device=train_device,
+            temp_device=temp_device,
+            debug_mode=debug_mode,
+        )
 
-	def setup_optimizations(
-			self,
-			model: StableDiffusionXLModel,
-			config: TrainConfig,
-	):
-		model.unet_offload_conductor = None # Inicializa como None
+    def create_parameters(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ) -> NamedParameterGroupCollection:
+        parameter_group_collection = NamedParameterGroupCollection()
 
-		if config.gradient_checkpointing.enabled():
-			model.unet_offload_conductor = None
-			model.text_encoder_1_offload_conductor = None # Não usado para CLIP, mas seguro zerar
-			model.text_encoder_2_offload_conductor = None # Não usado para CLIP, mas seguro zerar
+        if config.text_encoder.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="text_encoder_1_lora",
+                    parameters=model.text_encoder_1_lora.parameters(),
+                    learning_rate=config.text_encoder.learning_rate,
+                )
+            )
 
-		if config.gradient_checkpointing != GradientCheckpointingMethod.OFF:
-			unet_conductor_or_none = enable_checkpointing_for_basic_transformer_blocks(model.unet, config, offload_enabled=True)
-			enable_checkpointing_for_clip_encoder_layers(model.text_encoder_1, config)
-			enable_checkpointing_for_clip_encoder_layers(model.text_encoder_2, config)
+        if config.text_encoder_2.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="text_encoder_2_lora",
+                    parameters=model.text_encoder_2_lora.parameters(),
+                    learning_rate=config.text_encoder_2.learning_rate,
+                )
+            )
 
-			if config.gradient_checkpointing == GradientCheckpointingMethod.CPU_OFFLOADED:
-				model.unet_offload_conductor = unet_conductor_or_none
+        if config.train_any_embedding() or config.train_any_output_embedding():
+            if config.text_encoder.train_embedding:
+                self._add_embedding_param_groups(
+                    model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_1"
+                )
 
-		if config.force_circular_padding:
-			apply_circular_padding_to_conv2d(model.vae)
-			apply_circular_padding_to_conv2d(model.unet)
-			if model.unet_lora is not None:
-				apply_circular_padding_to_conv2d(model.unet_lora)
+            if config.text_encoder_2.train_embedding:
+                self._add_embedding_param_groups(
+                    model.all_text_encoder_2_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_2"
+                )
 
-		model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
-			config.weight_dtypes().unet,
-			config.weight_dtypes().text_encoder,
-			config.weight_dtypes().text_encoder_2,
-			config.weight_dtypes().vae,
-			config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
-			config.weight_dtypes().embedding if config.train_any_embedding() else None,
-		], config.enable_autocast_cache)
+        if config.unet.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="unet_lora",
+                    parameters=model.unet_lora.parameters(),
+                    learning_rate=config.unet.learning_rate,
+                )
+            )
 
-		model.vae_autocast_context, model.vae_train_dtype = disable_fp16_autocast_context(
-			self.train_device,
-			config.train_dtype,
-			config.fallback_train_dtype,
-			[
-				config.weight_dtypes().vae,
-			],
-			config.enable_autocast_cache,
-		)
+        return parameter_group_collection
 
-		quantize_layers(model.text_encoder_1, self.train_device, model.train_dtype)
-		quantize_layers(model.text_encoder_2, self.train_device, model.train_dtype)
-		quantize_layers(model.vae, self.train_device, model.vae_train_dtype)
-		quantize_layers(model.unet, self.train_device, model.train_dtype)
+    def __setup_requires_grad(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        self._setup_embeddings_requires_grad(model, config)
+        model.text_encoder_1.requires_grad_(False)
+        model.text_encoder_2.requires_grad_(False)
+        model.unet.requires_grad_(False)
+        model.vae.requires_grad_(False)
 
-	def _setup_embeddings(
-			self,
-			model: StableDiffusionXLModel,
-			config: TrainConfig,
-	):
-		additional_embeddings = []
-		for embedding_config in config.all_embedding_configs():
-			embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
-			if embedding_state is None:
-				embedding_state_1 = self._create_new_embedding(
-					embedding_config,
-					model.tokenizer_1,
-					model.text_encoder_1,
-					lambda text: model.encode_text(
-						text=text,
-						train_device=self.temp_device,
-					)[0][0][1:],
-				)
+        if model.text_encoder_1_lora is not None:
+            train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(config, model.train_progress)
+            model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
 
-				embedding_state_2 = self._create_new_embedding(
-					embedding_config,
-					model.tokenizer_2,
-					model.text_encoder_2,
-					lambda text: model.encode_text(
-						text=text,
-						train_device=self.temp_device,
-					)[1][0][1:],
-				)
-			else:
-				embedding_state_1 = embedding_state.get("clip_l_out", embedding_state.get("clip_l", None))
-				embedding_state_2 = embedding_state.get("clip_g_out", embedding_state.get("clip_g", None))
+        if model.text_encoder_2_lora is not None:
+            train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
+                config, model.train_progress
+            )
+            model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
 
-			embedding_state_1 = embedding_state_1.to(
-				dtype=model.text_encoder_1.get_input_embeddings().weight.dtype,
-				device=self.train_device,
-			).detach()
+        if model.unet_lora is not None:
+            train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
+            model.unet_lora.requires_grad_(train_unet)
 
-			embedding_state_2 = embedding_state_2.to(
-				dtype=model.text_encoder_2.get_input_embeddings().weight.dtype,
-				device=self.train_device,
-			).detach()
+    def setup_model(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
+        create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
 
-			embedding = StableDiffusionXLModelEmbedding(
-				embedding_config.uuid,
-				embedding_state_1,
-				embedding_state_2,
-				embedding_config.placeholder,
-				embedding_config.is_output_embedding,
-			)
-			if embedding_config.uuid == config.embedding.uuid:
-				model.embedding = embedding
-			else:
-				additional_embeddings.append(embedding)
+        model.text_encoder_1_lora = LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config) if create_te1 else None
 
-		model.additional_embeddings = additional_embeddings
+        model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
 
-		self._add_embeddings_to_tokenizer(model.tokenizer_1, model.all_text_encoder_1_embeddings())
-		self._add_embeddings_to_tokenizer(model.tokenizer_2, model.all_text_encoder_2_embeddings())
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers.split(","))
 
-	def _setup_embedding_wrapper(
-			self,
-			model: StableDiffusionXLModel,
-			config: TrainConfig,
-	):
-		model.embedding_wrapper_1 = AdditionalEmbeddingWrapper(
-			tokenizer=model.tokenizer_1,
-			orig_module=model.text_encoder_1.text_model.embeddings.token_embedding,
-			embeddings=model.all_text_encoder_1_embeddings(),
-		)
-		model.embedding_wrapper_2 = AdditionalEmbeddingWrapper(
-			tokenizer=model.tokenizer_2,
-			orig_module=model.text_encoder_2.text_model.embeddings.token_embedding,
-			embeddings=model.all_text_encoder_2_embeddings(),
-		)
+        if model.lora_state_dict:
+            if create_te1:
+                model.text_encoder_1_lora.load_state_dict(model.lora_state_dict)
+            if create_te2:
+                model.text_encoder_2_lora.load_state_dict(model.lora_state_dict)
 
-		model.embedding_wrapper_1.hook_to_module()
-		model.embedding_wrapper_2.hook_to_module()
+            model.unet_lora.load_state_dict(model.lora_state_dict)
+            model.lora_state_dict = None
 
-	def _setup_embeddings_requires_grad(
-			self,
-			model: StableDiffusionXLModel,
-			config: TrainConfig,
-	):
-		for embedding, embedding_config in zip(model.all_text_encoder_1_embeddings(),
-											   config.all_embedding_configs(), strict=True):
-			train_embedding_1 = \
-				embedding_config.train \
-				and config.text_encoder.train_embedding \
-				and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
-			embedding.requires_grad_(train_embedding_1)
+        if config.text_encoder.train:
+            model.text_encoder_1_lora.set_dropout(config.dropout_probability)
+        if config.text_encoder_2.train:
+            model.text_encoder_2_lora.set_dropout(config.dropout_probability)
+        model.unet_lora.set_dropout(config.dropout_probability)
 
-		for embedding, embedding_config in zip(model.all_text_encoder_2_embeddings(),
-											   config.all_embedding_configs(), strict=True):
-			train_embedding_2 = \
-				embedding_config.train \
-				and config.text_encoder_2.train_embedding \
-				and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
-			embedding.requires_grad_(train_embedding_2)
+        if create_te1:
+            model.text_encoder_1_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+            model.text_encoder_1_lora.hook_to_module()
+        if create_te2:
+            model.text_encoder_2_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+            model.text_encoder_2_lora.hook_to_module()
 
-	def predict(
-			self,
-			model: StableDiffusionXLModel,
-			batch: dict,
-			config: TrainConfig,
-			train_progress: TrainProgress,
-			*,
-			deterministic: bool = False,
-	) -> dict:
-		with model.autocast_context:
-			batch_seed = 0 if deterministic else train_progress.global_step
-			generator = torch.Generator(device=config.train_device)
-			generator.manual_seed(batch_seed)
-			rand = Random(batch_seed)
+        model.unet_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+        model.unet_lora.hook_to_module()
 
-			vae_scaling_factor = model.vae.config['scaling_factor']
+        if config.rescale_noise_scheduler_to_zero_terminal_snr:
+            model.rescale_noise_scheduler_to_zero_terminal_snr()
+            model.force_v_prediction()
 
-			text_encoder_output, pooled_text_encoder_2_output = model.combine_text_encoder_output(*model.encode_text(
-				train_device=self.train_device,
-				batch_size=batch['latent_image'].shape[0],
-				rand=rand,
-				tokens_1=batch['tokens_1'],
-				tokens_2=batch['tokens_2'],
-				text_encoder_1_layer_skip=config.text_encoder_layer_skip,
-				text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-				text_encoder_1_output=batch[
-					'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-				text_encoder_2_output=batch[
-					'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-				pooled_text_encoder_2_output=batch[
-					'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
-				text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
-				text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
-			))
+        self._remove_added_embeddings_from_tokenizer(model.tokenizer_1)
+        self._remove_added_embeddings_from_tokenizer(model.tokenizer_2)
+        self._setup_embeddings(model, config)
+        self._setup_embedding_wrapper(model, config)
+        self.__setup_requires_grad(model, config)
 
-			latent_image = batch['latent_image']
-			scaled_latent_image = latent_image * vae_scaling_factor
+        init_model_parameters(model, self.create_parameters(model, config), self.train_device)
 
-			scaled_latent_conditioning_image = None
-			if config.model_type.has_conditioning_image_input():
-				scaled_latent_conditioning_image = batch['latent_conditioning_image'] * vae_scaling_factor
+    def setup_train_device(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        vae_on_train_device = not config.latent_caching # True se cache NÃO for DISK (GPU ou NONE)
+        text_encoder_1_on_train_device = config.train_text_encoder_or_embedding() or not config.latent_caching # True se treinando TE1/Emb OU cache NÃO for DISK
+        text_encoder_2_on_train_device = config.train_text_encoder_2_or_embedding() or not config.latent_caching # True se treinando TE2/Emb OU cache NÃO for DISK
 
-			latent_noise = self._create_noise(scaled_latent_image, config, generator)
+        model.text_encoder_1_to(self.train_device if text_encoder_1_on_train_device else self.temp_device)
+        model.text_encoder_2_to(self.train_device if text_encoder_2_on_train_device else self.temp_device)
+        model.vae_to(self.train_device if vae_on_train_device else self.temp_device)
+        model.unet_to(self.train_device)
 
-			timestep = self._get_timestep_discrete(
-				model.noise_scheduler.config['num_train_timesteps'],
-				deterministic,
-				generator,
-				scaled_latent_image.shape[0],
-				config,
-			)
+        if config.text_encoder.train:
+            model.text_encoder_1.train()
+        else:
+            model.text_encoder_1.eval()
 
-			scaled_noisy_latent_image = self._add_noise_discrete(
-				scaled_latent_image,
-				latent_noise,
-				timestep,
-				model.noise_scheduler.betas,
-			)
+        if config.text_encoder_2.train:
+            model.text_encoder_2.train()
+        else:
+            model.text_encoder_2.eval()
 
-			original_height = batch['original_resolution'][0]
-			original_width = batch['original_resolution'][1]
-			crops_coords_top = batch['crop_offset'][0]
-			crops_coords_left = batch['crop_offset'][1]
-			target_height = batch['crop_resolution'][0]
-			target_width = batch['crop_resolution'][1]
+        model.vae.eval()
 
-			add_time_ids = torch.stack([
-				original_height,
-				original_width,
-				crops_coords_top,
-				crops_coords_left,
-				target_height,
-				target_width
-			], dim=1)
+        if config.unet.train:
+            model.unet.train()
+        else:
+            model.unet.eval()
 
-			add_time_ids = add_time_ids.to(
-				dtype=scaled_noisy_latent_image.dtype,
-				device=scaled_noisy_latent_image.device,
-			)
-
-			if config.model_type.has_mask_input() and config.model_type.has_conditioning_image_input():
-				latent_input = torch.concat(
-					[scaled_noisy_latent_image, batch['latent_mask'], scaled_latent_conditioning_image], 1
-				)
-			else:
-				latent_input = scaled_noisy_latent_image
-
-			added_cond_kwargs = {"text_embeds": pooled_text_encoder_2_output, "time_ids": add_time_ids}
-			predicted_latent_noise = model.unet(
-				sample=latent_input.to(dtype=model.train_dtype.torch_dtype()),
-				timestep=timestep,
-				encoder_hidden_states=text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
-				added_cond_kwargs=added_cond_kwargs,
-			).sample
-
-			model_output_data = {}
-
-			if model.noise_scheduler.config.prediction_type == 'epsilon':
-				model_output_data = {
-					'loss_type': 'target',
-					'timestep': timestep,
-					'predicted': predicted_latent_noise,
-					'target': latent_noise,
-				}
-			elif model.noise_scheduler.config.prediction_type == 'v_prediction':
-				target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
-				model_output_data = {
-					'loss_type': 'target',
-					'timestep': timestep,
-					'predicted': predicted_latent_noise,
-					'target': target_velocity,
-				}
-
-			if config.debug_mode:
-				with torch.no_grad():
-					self._save_text(
-						self._decode_tokens(batch['tokens_1'], model.tokenizer_1),
-						config.debug_dir + "/training_batches",
-						"7-prompt",
-						train_progress.global_step,
-					)
-
-					self._save_image(
-						self._project_latent_to_image_sdxl(latent_noise),
-						config.debug_dir + "/training_batches",
-						"1-noise",
-						train_progress.global_step,
-						True
-					)
-
-					self._save_image(
-						self._project_latent_to_image_sdxl(predicted_latent_noise),
-						config.debug_dir + "/training_batches",
-						"2-predicted_noise",
-						train_progress.global_step,
-						True
-					)
-
-					self._save_image(
-						self._project_latent_to_image_sdxl(scaled_noisy_latent_image),
-						config.debug_dir + "/training_batches",
-						"3-noisy_image",
-						train_progress.global_step,
-						True
-					)
-
-					alphas_cumprod = model.noise_scheduler.alphas_cumprod.to(config.train_device)
-					sqrt_alpha_prod = alphas_cumprod[timestep] ** 0.5
-					sqrt_alpha_prod = sqrt_alpha_prod.flatten().reshape(-1, 1, 1, 1)
-
-					sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timestep]) ** 0.5
-					sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten().reshape(-1, 1, 1, 1)
-
-					scaled_predicted_latent_image = \
-						(scaled_noisy_latent_image - predicted_latent_noise * sqrt_one_minus_alpha_prod) \
-						/ sqrt_alpha_prod
-					self._save_image(
-						self._project_latent_to_image_sdxl(scaled_predicted_latent_image),
-						config.debug_dir + "/training_batches",
-						"4-predicted_image",
-						model.train_progress.global_step,
-						True
-					)
-
-					self._save_image(
-						self._project_latent_to_image_sdxl(scaled_latent_image),
-						config.debug_dir + "/training_batches",
-						"5-image",
-						model.train_progress.global_step,
-						True
-					)
-
-		model_output_data['prediction_type'] = model.noise_scheduler.config.prediction_type
-		return model_output_data
-
-	def calculate_loss(
-			self,
-			model: StableDiffusionXLModel,
-			batch: dict,
-			data: dict,
-			config: TrainConfig,
-			progress: TrainProgress,
-			tensorboard: SummaryWriter
-	) -> Tensor:
-		return self._diffusion_losses(
-			batch=batch,
-			data=data,
-			config=config,
-			progress=progress,
-			tensorboard=tensorboard,
-			train_device=self.train_device,
-			betas=model.noise_scheduler.betas.to(device=self.train_device),
-		).mean()
+    def after_optimizer_step(self, model: StableDiffusionXLModel, config: TrainConfig, train_progress: TrainProgress):
+        if config.preserve_embedding_norm:
+            self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())
+            self._normalize_output_embeddings(model.all_text_encoder_2_embeddings())
+            model.embedding_wrapper_1.normalize_embeddings()
+            model.embedding_wrapper_2.normalize_embeddings()
+        self.__setup_requires_grad(model, config)
             ```
 
         +-- modules\modelSetup\flux/
         +-- modules\modelSetup\mixin/
         +-- modules\modelSetup\stableDiffusion3/
     +-- modules\module/
-        +-- modules\module\LoRAModule.py
-            ```LoRAModule.py
-import copy
-import math
-from abc import abstractmethod
-from collections.abc import Mapping
-from typing import Any
-import re # Adicionado
-import os # Adicionado
-
-try:
-    from modules.util.config.TrainConfig import TrainConfig
-except ImportError:
-    print("Aviso: Não foi possível importar TrainConfig. Usando um placeholder.")
-    class TrainConfig:
-        def __init__(self):
-            self.peft_type = PeftType.LORA # Exemplo
-            self.lora_rank = 4
-            self.lora_alpha = 1.0
-            self.lora_decompose = False
-            self.lora_decompose_norm_epsilon = False
-            self.train_device = "cpu"
-
-try:
-    from modules.util.enum.ModelType import PeftType
-except ImportError:
-    print("Aviso: Não foi possível importar PeftType. Usando um placeholder.")
-    from enum import Enum
-    class PeftType(Enum):
-        LORA = 0
-        LOHA = 1
-
-try:
-    from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
-except ImportError:
-    print("Aviso: Não foi possível importar funções de quantization_util. Usando placeholders.")
-    def get_unquantized_weight(module, dtype, device): return module.weight # Simplificação
-    def get_weight_shape(module): return module.weight.shape # Simplificação
-
-import torch
-import torch.nn.functional as F
-from torch import Tensor, nn
-from torch.nn import Conv2d, Dropout, Linear, Parameter
-
-BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","IN09","IN10","IN11","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
-KEY_TO_BLOCK_MAPPING = {
-    "lora_unet_conv_in": "IN00",
-    "lora_unet_time_embedding": "IN09", # Agrupando embeddings aqui por convenção
-    "lora_unet_add_embedding": "IN09",  # Agrupando embeddings aqui por convenção
-    "lora_unet_down_blocks_0_resnets_0": "IN01",
-    "lora_unet_down_blocks_0_resnets_1": "IN02",
-    "lora_unet_down_blocks_0_downsamplers_0": "IN03",
-    "lora_unet_down_blocks_1_resnets_0": "IN04",
-    "lora_unet_down_blocks_1_attentions_0": "IN04",
-    "lora_unet_down_blocks_1_resnets_1": "IN05",
-    "lora_unet_down_blocks_1_attentions_1": "IN05",
-    "lora_unet_down_blocks_1_downsamplers_0": "IN06",
-    "lora_unet_down_blocks_2_resnets_0": "IN07",
-    "lora_unet_down_blocks_2_attentions_0": "IN07",
-    "lora_unet_down_blocks_2_resnets_1": "IN08",
-    "lora_unet_down_blocks_2_attentions_1": "IN08",
-    "lora_unet_mid_block": "M00", # Cobre resnets e attentions do mid block
-    "lora_unet_up_blocks_0_resnets_0": "OUT00",
-    "lora_unet_up_blocks_0_attentions_0": "OUT00",
-    "lora_unet_up_blocks_0_resnets_1": "OUT01",
-    "lora_unet_up_blocks_0_attentions_1": "OUT01",
-    "lora_unet_up_blocks_0_resnets_2": "OUT02",
-    "lora_unet_up_blocks_0_attentions_2": "OUT02",
-    "lora_unet_up_blocks_0_upsamplers_0": "OUT02",
-    "lora_unet_up_blocks_1_resnets_0": "OUT03",
-    "lora_unet_up_blocks_1_attentions_0": "OUT03",
-    "lora_unet_up_blocks_1_resnets_1": "OUT04",
-    "lora_unet_up_blocks_1_attentions_1": "OUT04",
-    "lora_unet_up_blocks_1_resnets_2": "OUT05",
-    "lora_unet_up_blocks_1_attentions_2": "OUT05",
-    "lora_unet_up_blocks_1_upsamplers_0": "OUT05",
-    "lora_unet_up_blocks_2_resnets_0": "OUT06",
-    "lora_unet_up_blocks_2_resnets_1": "OUT07",
-    "lora_unet_up_blocks_2_resnets_2": "OUT08",
-    "lora_unet_conv_out": "OUT11",
-}
-
-class PeftBase(nn.Module):
-    is_applied: bool
-    orig_forward: Any | None
-    orig_eval: Any | None
-    orig_train: Any | None
-    _orig_module: list[nn.Module] | None  # list prevents it from registering
-    prefix: str
-    layer_kwargs: dict  # Applied during the forward op() call.
-    _initialized: bool  # Tracks whether we've created the layers or not.
-
-    def __init__(self, prefix: str, orig_module: nn.Module | None):
-        super().__init__()
-        self.prefix = prefix.replace('.', '_') + '.'
-        self._orig_module = [orig_module] if orig_module else None
-        self.is_applied = False
-        self.layer_kwargs = {}
-        self._initialized = False
-
-        if orig_module is not None:
-            match orig_module:
-                case nn.Linear():
-                    self.op = F.linear
-                    self.shape = get_weight_shape(orig_module)
-                case nn.Conv2d():
-                    self.op = F.conv2d
-                    self.shape = get_weight_shape(orig_module)
-                    self.layer_kwargs.setdefault("stride", orig_module.stride)
-                    self.layer_kwargs.setdefault("padding", orig_module.padding)
-                    self.layer_kwargs.setdefault("dilation", orig_module.dilation)
-                    self.layer_kwargs.setdefault("groups", orig_module.groups)
-                case _:
-                    print(f"Aviso: Tipo de módulo não suportado encontrado em PeftBase: {type(orig_module)}. Continuando, mas pode falhar.")
-                    self.op = None
-                    self.shape = None
-
-    def hook_to_module(self):
-        if self.orig_module is None: return # Não pode fazer hook sem módulo original
-        if not self.is_applied:
-            self.orig_forward = self.orig_module.forward
-            self.orig_train = self.orig_module.train
-            self.orig_eval = self.orig_module.eval
-            self.orig_module.forward = self.forward
-            self.orig_module.train = self._wrap_train
-            self.orig_module.eval = self._wrap_eval
-            self.is_applied = True
-
-    def remove_hook_from_module(self):
-        if self.orig_module is None or self.orig_forward is None: return
-        if self.is_applied:
-            self.orig_module.forward = self.orig_forward
-            self.orig_module.train = self.orig_train
-            self.orig_module.eval = self.orig_eval
-            self.is_applied = False
-
-    def _wrap_train(self, mode=True):
-        if self.orig_module is None or self.orig_train is None: return
-        self.orig_train(mode)
-        self.train(mode)
-
-    def _wrap_eval(self):
-        if self.orig_module is None or self.orig_eval is None: return
-        self.orig_eval()
-        self.eval()
-
-    def make_weight(self, A: Tensor, B: Tensor):
-        """Layer-type-independent way of creating a weight matrix from LoRA A/B."""
-        if self.shape is None:
-             raise RuntimeError(f"Cannot make weight for {self.prefix}: shape not determined (likely unsupported layer type).")
-        W = B.view(B.size(0), -1) @ A.view(A.size(0), -1)
-        return W.view(self.shape)
-
-    def check_initialized(self):
-        """Checks, and raises an exception, if the module is not initialized."""
-        if not self._initialized:
-            raise RuntimeError(f"Module {self.prefix} is not initialized.")
-
-        assert self.orig_module is not None, f"orig_module is None for {self.prefix}"
-        assert self.orig_forward is not None, f"orig_forward is None for {self.prefix}"
-
-    @property
-    def orig_module(self) -> nn.Module:
-        if self._orig_module is None:
-             raise AttributeError(f"Original module not set for PEFT layer with prefix {self.prefix}")
-        return self._orig_module[0]
-
-    def load_state_dict(self, state_dict: Mapping[str, Any],
-                        strict: bool = True, assign: bool = False):
-        module_prefix_with_dot = self.prefix # self.prefix já termina com '.'
-        relevant_keys = {k: v for k, v in state_dict.items() if k.startswith(module_prefix_with_dot)}
-        if not relevant_keys:
-             return nn.modules.module._IncompatibleKeys([], list(state_dict.keys()))
-
-        state_dict_local = {k.removeprefix(module_prefix_with_dot): v for k, v in relevant_keys.items()}
-
-        if not self._initialized and state_dict_local and self._orig_module is not None:
-             try:
-                 self.initialize_weights()
-                 self._initialized = True # Marca como inicializado após a tentativa
-             except NotImplementedError as e:
-                 print(f"Erro ao inicializar pesos para {self.prefix}: {e}. O módulo pode não ser carregado corretamente.")
-
-        if self._initialized:
-            load_result = super().load_state_dict(state_dict_local, strict=strict, assign=assign)
-        else:
-            missing_keys = list(state_dict_local.keys())
-            load_result = nn.modules.module._IncompatibleKeys(missing_keys, [])
-
-        keys_processed_or_skipped = list(relevant_keys.keys())
-        for key in keys_processed_or_skipped:
-            if key in state_dict: # Verifica se a chave ainda existe (pode ter sido pop'ada)
-                 state_dict.pop(key) # Remove as chaves que foram processadas (ou deveriam ter sido)
-
-        return load_result
-
-    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
-        local_state_dict = super().state_dict(*args, destination=None, prefix='', keep_vars=keep_vars)
-
-        state_dict_with_prefix = {self.prefix + k: v for k, v in local_state_dict.items()}
-
-        if prefix:
-            state_dict_with_prefix = {prefix + k: v for k, v in state_dict_with_prefix.items()}
-
-        if destination is None:
-            destination = state_dict_with_prefix
-        else:
-            destination.update(state_dict_with_prefix)
-
-        return destination
-
-    @abstractmethod
-    def initialize_weights(self):
-        pass
-
-    @abstractmethod
-    def apply_to_module(self):
-        pass
-
-    @abstractmethod
-    def extract_from_module(self, base_module: nn.Module):
-        pass
-
-    def create_layer(self) -> tuple[nn.Module, nn.Module]:
-        """Generic helper function for creating a PEFT layer, like LoRA.
-
-        Creates down/up layer modules for the given layer type in the
-        orig_module, for the given rank.
-
-        Does not perform initialization, as that usually depends on the PEFT
-        method.
-        """
-        if self.orig_module is None:
-            raise RuntimeError(f"Cannot create layer for {self.prefix}: Original module is None.")
-
-        device = self.orig_module.weight.device
-        match self.orig_module:
-            case nn.Linear():
-                in_features = self.orig_module.in_features
-                out_features = self.orig_module.out_features
-                if not hasattr(self, 'rank'): raise AttributeError(f"Rank not set for {self.prefix}")
-                lora_down = nn.Linear(in_features, self.rank, bias=False, device=device)
-                lora_up = nn.Linear(self.rank, out_features, bias=False, device=device)
-
-            case nn.Conv2d():
-                in_channels = self.orig_module.in_channels
-                out_channels = self.orig_module.out_channels
-                kernel_size = self.orig_module.kernel_size
-                stride = self.orig_module.stride
-                padding = self.orig_module.padding
-                dilation = self.orig_module.dilation
-                groups = self.orig_module.groups
-                if not hasattr(self, 'rank'): raise AttributeError(f"Rank not set for {self.prefix}")
-                lora_down = Conv2d(in_channels, self.rank, kernel_size, stride, padding, dilation=dilation, bias=False, device=device)
-                lora_up = Conv2d(self.rank, out_channels // groups, (1, 1), stride=1, padding=0, bias=False, device=device) # Stride e padding explícitos
-
-            case _:
-                raise NotImplementedError(f"Layer creation not implemented for type: {type(self.orig_module)}")
-
-        return lora_down, lora_up
-
-    @classmethod
-    def make_dummy(cls):
-        """Create a dummy version of a PEFT class."""
-        class Dummy(cls):
-            def __init__(self, *args, **kwargs):
-                prefix = args[0] if args else kwargs.get('prefix', 'dummy_prefix')
-                PeftBase.__init__(self, prefix, None) # Chama __init__ da base sem módulo real
-                self._state_dict = {}
-                self._initialized = False # Dummies não são 'inicializados' no sentido de ter pesos
-
-            def forward(self, *args, **kwargs):
-                 raise NotImplementedError("Dummy module should not perform forward pass.")
-
-            def load_state_dict(self, state_dict: Mapping[str, Any],
-                                strict: bool = True, assign: bool = False):
-                module_prefix_with_dot = self.prefix
-                relevant_keys = {k: v for k, v in state_dict.items() if k.startswith(module_prefix_with_dot)}
-                state_dict_local = {k.removeprefix(module_prefix_with_dot): v for k, v in relevant_keys.items()}
-
-                if not state_dict_local:
-                    return nn.modules.module._IncompatibleKeys([], [])
-
-                self._initialized = True # Marca como 'inicializado' para ter um state_dict
-                self._state_dict = copy.deepcopy(state_dict_local)
-
-                keys_to_remove = list(relevant_keys.keys())
-                for key in keys_to_remove:
-                     if key in state_dict:
-                         state_dict.pop(key)
-
-                return nn.modules.module._IncompatibleKeys([], [])
-
-            def state_dict(self, *args, destination=None, prefix='', keep_vars=False): # Assinatura completa
-                if not self._initialized:
-                    if destination is None:
-                         destination = {}
-                    return destination
-
-                state_dict_with_module_prefix = {self.prefix + k: v for k, v in self._state_dict.items()}
-
-                if prefix:
-                    state_dict_with_full_prefix = {prefix + k: v for k, v in state_dict_with_module_prefix.items()}
-                else:
-                    state_dict_with_full_prefix = state_dict_with_module_prefix
-
-                if destination is None:
-                    destination = state_dict_with_full_prefix
-                else:
-                    destination.update(state_dict_with_full_prefix)
-
-                return destination
-
-            def initialize_weights(self): pass # Não faz nada
-            def hook_to_module(self): raise NotImplementedError("Should never be called on a dummy module.")
-            def remove_hook_from_module(self): raise NotImplementedError("Should never be called on a dummy module.")
-            def apply_to_module(self): raise NotImplementedError("Should never be called on a dummy module.")
-            def extract_from_module(self, base_module: nn.Module): raise NotImplementedError("Should never be called on a dummy module.")
-
-        return Dummy
-
-class LoHaModule(PeftBase):
-    """Implementation of LoHa from Lycoris."""
-    rank: int
-    dropout: Dropout
-    hada_w1_a: Parameter | None
-    hada_w1_b: Parameter | None
-    hada_w2_a: Parameter | None
-    hada_w2_b: Parameter | None
-
-    def __init__(self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float):
-        super().__init__(prefix, orig_module)
-        self.rank = rank
-        self.dropout = Dropout(0)
-        self.register_buffer("alpha", torch.tensor(alpha))
-        self.hada_w1_a = None
-        self.hada_w1_b = None
-        self.hada_w2_a = None
-        self.hada_w2_b = None
-
-        if orig_module is not None:
-             try: # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
-                self.initialize_weights()
-                self.alpha = self.alpha.to(orig_module.weight.device)
-             except NotImplementedError:
-                 print(f"Aviso: Não foi possível inicializar LoHa para {prefix} devido ao tipo de camada.")
-
-    def initialize_weights(self):
-        if self._initialized: return
-        self._initialized = True
-        hada_w1_b_layer, hada_w1_a_layer = self.create_layer()
-        hada_w2_b_layer, hada_w2_a_layer = self.create_layer()
-
-        self.hada_w1_a = hada_w1_a_layer.weight
-        self.hada_w1_b = hada_w1_b_layer.weight
-        self.hada_w2_a = hada_w2_a_layer.weight
-        self.hada_w2_b = hada_w2_b_layer.weight
-
-        nn.init.normal_(self.hada_w1_a, std=0.1)
-        nn.init.normal_(self.hada_w1_b, std=1)
-        nn.init.constant_(self.hada_w2_a, 0)
-        nn.init.normal_(self.hada_w2_b, std=1)
-
-    def check_initialized(self):
-        super().check_initialized()
-        assert self.hada_w1_a is not None
-        assert self.hada_w1_b is not None
-        assert self.hada_w2_a is not None
-        assert self.hada_w2_b is not None
-
-    def forward(self, x, *args, **kwargs):
-        self.check_initialized()
-        if self.op is None: # Se a camada original não era suportada
-             print(f"Aviso: Pulando forward de LoHa para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
-             return self.orig_forward(x)
-
-        W1 = self.make_weight(self.dropout(self.hada_w1_b),
-                              self.dropout(self.hada_w1_a))
-        W2 = self.make_weight(self.dropout(self.hada_w2_b),
-                              self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha.item() / self.rank) # Usa .item()
-        return self.orig_forward(x) + self.op(x, W, bias=None, **self.layer_kwargs)
-
-    def apply_to_module(self): pass # TODO
-    def extract_from_module(self, base_module: nn.Module): pass # TODO
-
-class LoRAModule(PeftBase):
-    lora_down: nn.Module | None
-    lora_up: nn.Module | None
-    rank: int
-    alpha: torch.Tensor
-    dropout: Dropout
-
-    def __init__(self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float):
-        super().__init__(prefix, orig_module)
-        self.rank = rank
-        self.dropout = Dropout(0)
-        self.register_buffer("alpha", torch.tensor(alpha))
-        self.lora_down = None
-        self.lora_up = None
-
-        if orig_module is not None:
-            try: # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
-                self.initialize_weights()
-                self.alpha = self.alpha.to(orig_module.weight.device)
-            except NotImplementedError:
-                 print(f"Aviso: Não foi possível inicializar LoRA para {prefix} devido ao tipo de camada.")
-
-    def initialize_weights(self):
-        if self._initialized: return
-        self._initialized = True
-        self.lora_down, self.lora_up = self.create_layer()
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
-
-    def check_initialized(self):
-        super().check_initialized()
-        assert self.lora_down is not None, f"LoRA down not initialized for {self.prefix}"
-        assert self.lora_up is not None, f"LoRA up not initialized for {self.prefix}"
-
-    def forward(self, x, *args, **kwargs):
-        self.check_initialized()
-        if self.op is None: # Se a camada original não era suportada
-             print(f"Aviso: Pulando forward de LoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
-             return self.orig_forward(x)
-
-        lora_output = self.lora_up(self.lora_down(self.dropout(x)))
-        original_output = self.orig_forward(x)
-        scale = self.alpha.item() / self.rank
-        return original_output + lora_output * scale
-
-    def apply_to_module(self): pass # TODO
-    def extract_from_module(self, base_module: nn.Module): pass # TODO
-
-class DoRAModule(LoRAModule):
-    """Weight-decomposed low rank adaptation."""
-    dora_num_dims: int
-    dora_scale: Parameter | None
-    norm_epsilon: bool
-
-    def __init__(self, *args, **kwargs):
-        self.dora_scale = None
-        self.norm_epsilon = kwargs.pop('norm_epsilon', False)
-        self.train_device = kwargs.pop('train_device')
-        super().__init__(*args, **kwargs) # Chama __init__ de LoRAModule
-
-    def initialize_weights(self):
-        if self._initialized: return
-        try:
-            super().initialize_weights()
-        except NotImplementedError:
-             self._initialized = False # Garante que não seja marcado como inicializado
-             raise # Re-levanta a exceção original
-
-        if self.orig_module is not None and self.dora_scale is None:
-             orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
-             self.dora_num_dims = orig_weight.dim() - 1
-             initial_norm = torch.norm(
-                 orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
-                 dim=1, keepdim=True
-             ).reshape(orig_weight.shape[1], *[1] * self.dora_num_dims).transpose(1, 0)
-             self.dora_scale = nn.Parameter(initial_norm.to(device=self.orig_module.weight.device))
-             del orig_weight
-
-    def check_initialized(self):
-        super().check_initialized()
-        assert self.dora_scale is not None, f"DoRA scale not initialized for {self.prefix}"
-
-    def forward(self, x, *args, **kwargs):
-        self.check_initialized()
-        if self.op is None: # Se a camada original não era suportada
-             print(f"Aviso: Pulando forward de DoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original.")
-             return self.orig_forward(x)
-
-        A = self.lora_down.weight
-        B = self.lora_up.weight
-        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
-        lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
-        WP = orig_weight + lora_delta_w
-        del orig_weight, lora_delta_w
-
-        eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        norm = WP.detach() \
-                 .transpose(0, 1) \
-                 .reshape(WP.shape[1], -1) \
-                 .norm(dim=1, keepdim=True) \
-                 .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
-                 .transpose(0, 1) + eps
-        WP_normalized = WP / norm
-        WP_scaled = self.dora_scale * WP_normalized
-        x_dropout = self.dropout(x)
-        return self.op(x_dropout,
-                       WP_scaled,
-                       self.orig_module.bias,
-                       **self.layer_kwargs)
-
-DummyLoRAModule = LoRAModule.make_dummy()
-DummyDoRAModule = DoRAModule.make_dummy()
-DummyLoHaModule = LoHaModule.make_dummy()
-
-class LoRAModuleWrapper:
-    orig_module: nn.Module
-    rank: int
-    alpha: float
-    lora_modules: dict[str, PeftBase] # Dicionário para armazenar módulos LoRA/DoRA/Dummy
-
-    def __init__(
-            self,
-            orig_module: nn.Module | None,
-            prefix: str,
-            config: TrainConfig,
-            module_filter: list[str] = None,
-    ):
-        self.orig_module = orig_module
-        self.prefix = prefix # Prefixo base, ex: "lora_unet"
-        self.peft_type = config.peft_type
-        self.rank = config.lora_rank
-        self.alpha = config.lora_alpha
-        self.module_filter = [x.strip() for x in module_filter] if module_filter is not None else []
-        weight_decompose = config.lora_decompose
-
-        self.additional_args = [self.rank, self.alpha]
-        self.additional_kwargs = {}
-
-        if self.peft_type == PeftType.LORA:
-            if weight_decompose:
-                self.klass = DoRAModule
-                self.dummy_klass = DummyDoRAModule
-                self.additional_kwargs = {
-                    'norm_epsilon': config.lora_decompose_norm_epsilon,
-                    'train_device': torch.device(config.train_device),
-                }
-            else:
-                self.klass = LoRAModule
-                self.dummy_klass = DummyLoRAModule
-        elif self.peft_type == PeftType.LOHA:
-            self.klass = LoHaModule
-            self.dummy_klass = DummyLoHaModule
-        else:
-             raise ValueError(f"Unsupported PeftType: {self.peft_type}")
-
-        self.lora_modules = self.__create_modules(orig_module)
-
-        self.generate_keys_by_block_file(f"{self.prefix}_keys_by_block.txt")
-
-    def __create_modules(self, root_module: nn.Module | None) -> dict[str, PeftBase]:
-        lora_modules = {}
-        if root_module is not None:
-            for name, child_module in root_module.named_modules():
-                clean_name = name.removeprefix(self.prefix + "_") if name.startswith(self.prefix + "_") else name
-                full_peft_prefix = f"{self.prefix}_{clean_name}" if clean_name else self.prefix
-
-                passes_filter = not self.module_filter or any(f in name for f in self.module_filter)
-
-                if passes_filter and isinstance(child_module, (Linear, Conv2d)):
-                    try:
-                        lora_modules[name] = self.klass(full_peft_prefix, child_module, *self.additional_args, **self.additional_kwargs)
-                    except Exception as e:
-                         print(f"Erro ao criar módulo PEFT para {name} (prefixo {full_peft_prefix}): {e}")
-
-        return lora_modules
-
-    def requires_grad_(self, requires_grad: bool):
-        for module in self.lora_modules.values():
-            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                 module.requires_grad_(requires_grad)
-
-    def parameters(self) -> list[Parameter]:
-        parameters = []
-        for module in self.lora_modules.values():
-            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                parameters.extend(list(module.parameters())) # Garante que seja uma lista
-        return parameters
-
-    def to(self, device: torch.device = None, dtype: torch.dtype = None) -> 'LoRAModuleWrapper':
-        for module in self.lora_modules.values():
-            module.to(device, dtype)
-        return self
-
-    def load_state_dict(self, state_dict: dict[str, Tensor]):
-        """Loads the state dict into LoRA/DoRA modules and handles remaining keys with dummies."""
-        remaining_state_dict = copy.deepcopy(state_dict)
-        loaded_prefixes = set()
-
-        for name, module in self.lora_modules.items():
-             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                 module.load_state_dict(remaining_state_dict)
-                 loaded_prefixes.add(module.prefix)
-
-        potential_dummy_keys = {k: v for k, v in remaining_state_dict.items() if k.startswith(self.prefix)}
-
-        while potential_dummy_keys:
-            key_example = next(iter(potential_dummy_keys))
-            parts = key_example.split('.')
-            dummy_prefix_parts = []
-            known_suffix = False
-
-            common_suffixes = [
-                '.lora_down.weight', '.lora_up.weight', '.alpha', '.dora_scale',
-                '.hada_w1_a', '.hada_w1_b', '.hada_w2_a', '.hada_w2_b'
-            ]
-            for suffix in common_suffixes:
-                if key_example.endswith(suffix):
-                     num_parts_to_remove = suffix.count('.') + 1
-                     dummy_prefix_parts = parts[:-num_parts_to_remove]
-                     known_suffix = True
-                     break
-
-            if not known_suffix:
-                 print(f"Aviso: Não foi possível determinar o prefixo do módulo para a chave remanescente: {key_example}. Pulando.")
-                 potential_dummy_keys.pop(key_example)
-                 continue
-
-            dummy_module_prefix_with_dot = '.'.join(dummy_prefix_parts) + '.'
-
-            if dummy_module_prefix_with_dot in loaded_prefixes:
-                 keys_to_remove = [k for k in potential_dummy_keys if k.startswith(dummy_module_prefix_with_dot)]
-                 for k in keys_to_remove:
-                     if k in potential_dummy_keys: potential_dummy_keys.pop(k)
-                 continue
-
-            dummy_module_name = dummy_module_prefix_with_dot.removeprefix(self.prefix + "_").removesuffix('.') if dummy_module_prefix_with_dot != self.prefix + "." else ""
-            dummy_module = self.dummy_klass(dummy_module_prefix_with_dot, None, *self.additional_args, **self.additional_kwargs)
-            dummy_module.load_state_dict(copy.deepcopy(potential_dummy_keys))
-
-            dummy_keys_loaded = list(dummy_module.state_dict().keys())
-            for k in dummy_keys_loaded:
-                 if k in potential_dummy_keys:
-                     potential_dummy_keys.pop(k)
-
-            self.lora_modules[dummy_module_name] = dummy_module
-            loaded_prefixes.add(dummy_module_prefix_with_dot)
-
-        final_remaining_keys = list(potential_dummy_keys.keys())
-        if final_remaining_keys:
-            pass
-
-    def state_dict(self) -> dict:
-        """Returns the state dict containing keys from all managed modules (real and dummy)."""
-        state_dict = {}
-        for module in self.lora_modules.values():
-            module_sd = module.state_dict()
-            state_dict.update(module_sd)
-        return state_dict
-
-    def modules(self) -> list[nn.Module]:
-        """Returns a list of all managed modules (real and dummy)."""
-        return list(self.lora_modules.values())
-
-    def hook_to_module(self):
-        """Hooks the real LoRA modules into their corresponding original modules."""
-        for module in self.lora_modules.values():
-            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                module.hook_to_module()
-
-    def remove_hook_from_module(self):
-        """Removes the LoRA hook from the real modules."""
-        for module in self.lora_modules.values():
-             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                module.remove_hook_from_module()
-
-    def apply_to_module(self):
-        """Applies the LoRA weights directly to the original modules (real modules only)."""
-        for module in self.lora_modules.values():
-            if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                module.apply_to_module()
-
-    def extract_from_module(self, base_module: nn.Module):
-        """Extracts LoRA weights by comparing the current module state to a base module (real modules only)."""
-        for name, module in self.lora_modules.items():
-             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                try:
-                    corresponding_base_submodule = base_module.get_submodule(name)
-                    module.extract_from_module(corresponding_base_submodule)
-                except AttributeError:
-                     print(f"Warning: Could not find corresponding submodule '{name}' in base_module during extraction.")
-
-    def prune(self):
-        """Removes all dummy modules from the managed modules."""
-        dummy_to_remove = self.dummy_klass
-        self.lora_modules = {k: v for (k, v) in self.lora_modules.items() if not isinstance(v, dummy_to_remove)}
-        print(f"Pruned dummy modules. Remaining modules: {len(self.lora_modules)}")
-
-    def set_dropout(self, dropout_probability: float):
-        """Sets the dropout probability for all real managed modules."""
-        if not 0 <= dropout_probability <= 1:
-            raise ValueError("Dropout probability must be in [0, 1]")
-        for module in self.lora_modules.values():
-             if not isinstance(module, (DummyLoRAModule, DummyDoRAModule, DummyLoHaModule)):
-                 if hasattr(module, 'dropout') and isinstance(module.dropout, nn.Dropout):
-                     module.dropout.p = dropout_probability
-
-    @staticmethod
-    def get_block_id_from_key_prefix(lora_module_prefix_with_dot: str) -> str:
-        """Determina o Block ID (IN00-OUT11) a partir do prefixo completo do módulo LoRA/DoRA."""
-        lora_module_prefix = lora_module_prefix_with_dot.removesuffix('.')
-
-        if lora_module_prefix.startswith("lora_unet_mid_block"):
-            return "M00"
-
-        sorted_map_prefixes = sorted(KEY_TO_BLOCK_MAPPING.keys(), key=len, reverse=True)
-
-        for map_prefix in sorted_map_prefixes:
-            if lora_module_prefix.startswith(map_prefix):
-                return KEY_TO_BLOCK_MAPPING[map_prefix]
-
-        print(f"Aviso: Prefixo do módulo não mapeado encontrado: {lora_module_prefix}. Assumindo BASE.")
-        return "BASE"
-
-    def generate_keys_by_block_file(self, output_filename="unetKeysByBlock_generated.txt"):
-        """Gera um arquivo de texto com todas as chaves LoRA/DoRA organizadas por bloco."""
-        if not self.lora_modules:
-            print("Aviso: Nenhum módulo LoRA/DoRA encontrado no wrapper. Arquivo de chaves não gerado.")
-            return
-
-        print(f"Gerando arquivo de chaves por bloco: {output_filename}")
-        blocks_data: dict[str, list[str]] = {block_id: [] for block_id in BLOCKID26}
-
-        for module_name, module_instance in self.lora_modules.items():
-            module_prefix_with_dot = module_instance.prefix
-            block_id = self.get_block_id_from_key_prefix(module_prefix_with_dot)
-
-            try:
-                 module_state_dict = module_instance.state_dict()
-                 for key in module_state_dict.keys():
-                     blocks_data[block_id].append(key)
-            except Exception as e:
-                 print(f"Erro ao obter state_dict para o módulo {module_name} (prefixo {module_prefix_with_dot}): {e}")
-
-        for block_id in blocks_data:
-            blocks_data[block_id].sort()
-
-        output_lines = []
-        for block_id in BLOCKID26:
-            output_lines.append(f"=== {block_id} ===")
-            keys_in_block = blocks_data[block_id]
-            if keys_in_block:
-                output_lines.extend(keys_in_block)
-            else:
-                if block_id == "BASE":
-                    output_lines.append("(Nenhuma chave UNet corresponde a BASE)")
-                elif block_id in ["IN10", "IN11", "OUT09", "OUT10"]:
-                     output_lines.append("(Vazio)")
-                else:
-                    output_lines.append("(Vazio)")
-
-            output_lines.append("") # Linha em branco entre blocos
-
-        try:
-            output_dir = os.path.dirname(output_filename)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            with open(output_filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(output_lines).strip())
-            print(f"Arquivo '{output_filename}' gerado com sucesso.")
-        except Exception as e:
-            print(f"Erro ao escrever o arquivo '{output_filename}': {e}")
-
-            ```
-
         +-- modules\module\quantized/
             +-- modules\module\quantized\mixin/
     +-- modules\trainer/
@@ -1284,6 +1472,7 @@ from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.FileType import FileType
+from modules.util.enum.Cache import CacheMode
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -1338,7 +1527,7 @@ class GenericTrainer(BaseTrainer):
     def start(self):
         self.__save_config_to_workspace()
 
-        if self.config.clear_cache_before_training and self.config.latent_caching:
+        if self.config.clear_cache_before_training and self.config.cache_mode == CacheMode.DISK:
             self.__clear_cache()
 
         if self.config.train_dtype.enable_tf():
@@ -1398,6 +1587,7 @@ class GenericTrainer(BaseTrainer):
         self.data_loader = self.create_data_loader(
             self.model, self.model.train_progress
         )
+
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -1418,16 +1608,23 @@ class GenericTrainer(BaseTrainer):
             json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
 
     def __clear_cache(self):
-        print(
-            f'Clearing cache directory {self.config.cache_dir}! '
-            f'You can disable this if you want to continue using the same cache.'
-        )
-        if os.path.isdir(self.config.cache_dir):
-            for filename in os.listdir(self.config.cache_dir):
-                path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
-                    shutil.rmtree(path)
-
+        if self.config.cache_mode == CacheMode.DISK:
+            print(
+                 f'Clearing DISK cache directory {self.config.cache_dir}! '
+                 f'You can disable this in config `clear_cache_before_training`.'
+            )
+            if os.path.isdir(self.config.cache_dir):
+                 for filename in os.listdir(self.config.cache_dir):
+                     path = os.path.join(self.config.cache_dir, filename)
+                     if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                         try:
+                              shutil.rmtree(path)
+                         except OSError as e:
+                              print(f"Error removing directory {path}: {e}")
+        elif self.config.cache_mode == CacheMode.GPU:
+             print("GPU cache mode selected. Cache will be built in VRAM.")
+        else:
+             print("Cache mode is None. No cache clearing needed.")
     def __prune_backups(self, backups_to_keep: int):
         backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
         if os.path.exists(backup_dirpath):
@@ -1837,7 +2034,7 @@ class GenericTrainer(BaseTrainer):
         for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
             self.callbacks.on_update_status("starting epoch/caching")
 
-            if self.config.latent_caching:
+            if self.config.cache_mode != CacheMode.NONE:
                 self.data_loader.get_data_set().start_next_epoch()
                 self.model_setup.setup_train_device(self.model, self.config)
             else:
@@ -2065,426 +2262,6 @@ class GenericTrainer(BaseTrainer):
 
     +-- modules\ui/
     +-- modules\util/
-        +-- modules\util\checkpointing_util.py
-            ```checkpointing_util.py
-import re
-from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
-
-import inspect
-from collections.abc import Callable
-from typing import Any
-
-from modules.util.config.TrainConfig import TrainConfig
-from modules.util.LayerOffloadConductor import LayerOffloadConductor
-from modules.util.torch_util import add_dummy_grad_fn_, has_grad_fn
-
-import torch
-from torch import nn
-from torch.utils.checkpoint import checkpoint
-
-from diffusers.models.attention import BasicTransformerBlock, JointTransformerBlock
-from diffusers.models.transformers.sana_transformer import SanaTransformerBlock
-from diffusers.models.transformers.transformer_flux import FluxSingleTransformerBlock, FluxTransformerBlock
-from diffusers.models.transformers.transformer_hunyuan_video import (
-	HunyuanVideoIndividualTokenRefinerBlock,
-	HunyuanVideoSingleTransformerBlock,
-	HunyuanVideoTransformerBlock,
-)
-from diffusers.models.unets.unet_stable_cascade import SDCascadeAttnBlock, SDCascadeResBlock, SDCascadeTimestepBlock
-from transformers.models.clip.modeling_clip import CLIPEncoderLayer
-from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.t5.modeling_t5 import T5Block
-
-def __kwargs_to_args(fun: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
-	signature = dict(inspect.signature(fun).parameters)
-	parameters = []
-
-	for i, (key, value) in enumerate(signature.items()):
-		if i < len(args):
-			parameters.append(args[i])
-		elif key in kwargs:
-			parameters.append(kwargs[key])
-		elif value.default is not value.empty:
-			parameters.append(value.default)
-
-	return tuple(parameters)
-
-def __get_args_indices(fun: Callable, arg_names: list[str]) -> list[int]:
-	signature = dict(inspect.signature(fun).parameters)
-	indices = []
-
-	for i, key in enumerate(signature.keys()):
-		if key in arg_names:
-			indices.append(i)
-
-	return indices
-
-__current_call_index = 0
-
-def __generate_call_index() -> int:
-	global __current_call_index
-	__current_call_index += 1
-	return __current_call_index
-
-def create_checkpointed_forward(
-		orig_module: nn.Module,
-		train_device: torch.device,
-		include_from_offload_param_names: list[str] = None,
-		conductor: LayerOffloadConductor | None = None,
-		layer_index: int = 0,
-) -> Callable:
-	orig_forward = orig_module.forward
-	if include_from_offload_param_names is None:
-		include_from_offload_param_names = []
-	included_offload_param_indices = __get_args_indices(orig_forward, include_from_offload_param_names)
-
-	bound_conductor = conductor
-	bound_layer_index = layer_index
-	if conductor is not None:
-		conductor.add_layer(orig_module, included_offload_param_indices)
-
-	if conductor is not None and conductor.offload_activated():
-		def offloaded_custom_forward(
-				dummy: torch.Tensor,
-				call_id: int,
-				*args,
-		):
-			if bound_layer_index == 0 and not torch.is_grad_enabled():
-				bound_conductor.start_forward(True)
-
-			if not any(t.requires_grad for t in get_tensors(args)):
-				args = add_dummy_grad_fn_(args)
-
-			args = bound_conductor.before_layer(bound_layer_index, call_id, args)
-			output = orig_forward(*args)
-			bound_conductor.after_layer(bound_layer_index, call_id, args)
-
-			if torch.is_grad_enabled() and not has_grad_fn(output):
-				output = add_dummy_grad_fn_(output)
-
-			return output
-
-		def custom_forward(
-				call_index: int,
-				*args,
-		):
-			if bound_layer_index == 0:
-				bound_conductor.start_forward(False)
-
-			args = bound_conductor.before_layer(bound_layer_index, call_index, args)
-			output = orig_forward(*args)
-			bound_conductor.after_layer(bound_layer_index, call_index, args)
-			return output
-
-		def forward(
-				*args,
-				**kwargs
-		):
-			call_id = __generate_call_index()
-
-			if torch.is_grad_enabled():
-				dummy = torch.zeros((1,), device=train_device)
-				dummy.requires_grad_(True)
-
-				args = __kwargs_to_args(orig_forward, args, kwargs)
-
-				return checkpoint(
-					offloaded_custom_forward,
-					dummy,
-					call_id,
-					*args,
-					use_reentrant=True
-				)
-			else:
-				args = __kwargs_to_args(orig_forward, args, kwargs)
-				return custom_forward(call_id, *args)
-	else:
-		def custom_forward(
-				dummy: torch.Tensor = None,
-				*args,
-				**kwargs,
-		):
-			return orig_forward(
-				*args,
-				**kwargs,
-			)
-
-		def forward(
-				*args,
-				**kwargs
-		):
-			if torch.is_grad_enabled():
-				dummy = torch.zeros((1,), device=train_device)
-				dummy.requires_grad_(True)
-
-				return checkpoint(
-					custom_forward,
-					dummy,
-					*args,
-					**kwargs,
-					use_reentrant=False
-				)
-			else:
-				return custom_forward(None, *args, **kwargs)
-
-	return forward
-
-def enable_checkpointing_for_basic_transformer_blocks(
-		orig_module: nn.Module,
-		config: TrainConfig,
-		offload_enabled: bool,
-) -> LayerOffloadConductor | None:
-
-	if config.gradient_checkpointing == GradientCheckpointingMethod.OFF:
-		return None
-
-	if config.gradient_checkpointing == GradientCheckpointingMethod.CPU_OFFLOADED:
-		conductor = LayerOffloadConductor(orig_module, config)
-		layer_index = 0
-		for child_module in orig_module.modules():
-			if isinstance(child_module, BasicTransformerBlock):
-				if offload_enabled:
-					child_module.forward = create_checkpointed_forward(
-						child_module, torch.device(config.train_device),
-						[],
-						conductor, layer_index,
-					)
-				else:
-					child_module.forward = create_checkpointed_forward(
-						child_module, torch.device(config.train_device),
-						[],
-					)
-				layer_index += 1
-
-			return conductor
-
-	elif config.gradient_checkpointing == GradientCheckpointingMethod.ON:
-		layers_to_checkpoint_selectively = config.gradient_checkpointing_layers
-		print(f"INFO: Checkpointing seletivo ON. Padrões: {layers_to_checkpoint_selectively if layers_to_checkpoint_selectively else 'Todos (lista vazia)'}")
-
-		for name, child_module in orig_module.named_modules(): # Iterar com nomes
-			if isinstance(child_module, BasicTransformerBlock):
-				if should_checkpoint_layer(name, layers_to_checkpoint_selectively):
-					child_module.forward = create_checkpointed_forward(
-						child_module, torch.device(config.train_device),
-						[], # include_from_offload_param_names (provavelmente vazio para ON)
-						conductor=None, # *** IMPORTANTE: Passa None ***
-						layer_index=0,  # Irrelevante sem conductor
-					)
-				else: # Opcional para depuração
-					print(f"DEBUG: NÃO checkpointando camada: {name}")
-
-		return None # Não retorna conductor no modo ON seletivo
-
-	return None
-
-def enable_checkpointing_for_clip_encoder_layers(
-		orig_module: nn.Module,
-		config: TrainConfig,
-):
-	for child_module in orig_module.modules():
-		if isinstance(child_module, CLIPEncoderLayer):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],
-			)
-
-def enable_checkpointing_for_stable_cascade_blocks(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, SDCascadeResBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],
-				conductor, layer_index,
-			)
-			layer_index += 1
-		if isinstance(child_module, SDCascadeAttnBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],
-				conductor, layer_index,
-			)
-			layer_index += 1
-		if isinstance(child_module, SDCascadeTimestepBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_t5_encoder_layers(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, T5Block):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],  # No activation offloading, because the output might be taken from the middle of the network
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_gemma_layers(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, Gemma2DecoderLayer):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],  # No activation offloading, because the output might be taken from the middle of the network
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_llama_encoder_layers(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, LlamaDecoderLayer):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				[],  # No activation offloading, because the output might be taken from the middle of the network
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_stable_diffusion_3_transformer(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, JointTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states", "encoder_hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_flux_transformer(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, FluxTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states", "encoder_hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	for child_module in orig_module.modules():
-		if isinstance(child_module, FluxSingleTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_sana_transformer(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, SanaTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def enable_checkpointing_for_hunyuan_video_transformer(
-		orig_module: nn.Module,
-		config: TrainConfig,
-) -> LayerOffloadConductor:
-	conductor = LayerOffloadConductor(orig_module, config)
-
-	layer_index = 0
-	for child_module in orig_module.modules():
-		if isinstance(child_module, HunyuanVideoIndividualTokenRefinerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	for child_module in orig_module.modules():
-		if isinstance(child_module, HunyuanVideoTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states", "encoder_hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	for child_module in orig_module.modules():
-		if isinstance(child_module, HunyuanVideoSingleTransformerBlock):
-			child_module.forward = create_checkpointed_forward(
-				child_module, torch.device(config.train_device),
-				["hidden_states"],
-				conductor, layer_index,
-			)
-			layer_index += 1
-
-	return conductor
-
-def should_checkpoint_layer(layer_name: str, patterns: list[str]) -> bool:
-	"""Verifica se o nome da camada corresponde a algum dos padrões fornecidos."""
-	if not patterns:
-		return True
-	for pattern in patterns:
-		if pattern.strip() in layer_name:
-			return True
-	return False
-            ```
-
         +-- modules\util\args/
         +-- modules\util\callbacks/
         +-- modules\util\commands/
@@ -2503,8 +2280,9 @@ from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
-from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.enum.Cache import CacheMode
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -2757,6 +2535,7 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
+    cache_mode: CacheMode
     latent_caching: bool
     clear_cache_before_training: bool
 
@@ -2883,10 +2662,17 @@ class TrainConfig(BaseConfig):
 
     secrets: SecretsConfig
 
+    def latent_caching(self) -> bool:
+        """
+        Determina se o cache de latentes está ativo (apenas para o modo DISK).
+        Esta é uma propriedade derivada de `cache_mode`.
+        """
+        return self.cache_mode == CacheMode.DISK
+
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=6,
+            config_version=7,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -2894,6 +2680,7 @@ class TrainConfig(BaseConfig):
                 3: self.__migration_3,
                 4: self.__migration_4,
                 5: self.__migration_5,
+                5: self.__migration_6,
             }
         )
 
@@ -3058,6 +2845,29 @@ class TrainConfig(BaseConfig):
 
         return migrated_data
 
+    def __migration_6(self, data: dict) -> dict: # <<< FUNÇÃO ALTERADA ABAIXO >>>
+        """Migra do latent_caching booleano antigo para cache_mode enum."""
+        migrated_data = data.copy()
+
+        old_latent_caching_value = migrated_data.pop("latent_caching", None)
+
+        if old_latent_caching_value is not None:
+            if old_latent_caching_value:
+                new_cache_mode = CacheMode.DISK
+            else:
+                new_cache_mode = CacheMode.NONE
+
+            migrated_data["cache_mode"] = new_cache_mode.value # Salva como string
+
+            print(f"Migração 6: old latent_caching={old_latent_caching_value} -> cache_mode='{new_cache_mode.value}'. O novo 'latent_caching' será derivado.")
+        elif "cache_mode" not in migrated_data:
+             migrated_data["cache_mode"] = CacheMode.DISK.value
+             print(f"Migração 6: Nenhum valor 'latent_caching' ou 'cache_mode' encontrado. Definindo cache_mode='{CacheMode.DISK.value}' por padrão. O 'latent_caching' será derivado.")
+        else:
+             print(f"Migração 6: 'cache_mode' já existe ('{migrated_data['cache_mode']}'). Nenhuma alteração de migração necessária para cache_mode. O 'latent_caching' será derivado.")
+
+        return migrated_data
+
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
             self.train_dtype,
@@ -3204,7 +3014,7 @@ class TrainConfig(BaseConfig):
         data.append(("output_model_format", ModelFormat.SAFETENSORS, ModelFormat, False))
         data.append(("output_model_destination", "models/model.safetensors", str, False))
         data.append(("gradient_checkpointing", GradientCheckpointingMethod.ON, GradientCheckpointingMethod, False))
-        data.append(("gradient_checkpointing_layers", "attn1", list[str], False))
+        data.append(("gradient_checkpointing_layers", [], list[str], False))
         data.append(("enable_async_offloading", True, bool, False))
         data.append(("enable_activation_offloading", True, bool, False))
         data.append(("layer_offload_fraction", 0.0, float, False))
@@ -3213,7 +3023,7 @@ class TrainConfig(BaseConfig):
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
-        data.append(("latent_caching", True, bool, False))
+        data.append(("cache_mode", CacheMode.DISK, CacheMode, False))
         data.append(("clear_cache_before_training", True, bool, False))
 
         data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))
@@ -3385,6 +3195,27 @@ class TrainConfig(BaseConfig):
 
         +-- modules\util\convert/
         +-- modules\util\enum/
+            +-- modules\util\enum\Cache.py
+                ```Cache.py
+from enum import Enum
+
+class CacheMode(Enum):
+    NONE = "None"  # Sem cache
+    DISK = "Disk"  # Cache em disco (comportamento original)
+    GPU = "GPU"    # Cache na GPU (novo comportamento)
+
+    def __str__(self):
+        return self.value
+
+    @staticmethod
+    def from_str(s: str):
+        for mode in CacheMode:
+            if str(mode) == s:
+                return mode
+        print(f"Aviso: CacheMode '{s}' inválido, usando 'Disk'.")
+        return CacheMode.DISK
+                ```
+
         +-- modules\util\loss/
         +-- modules\util\modelSpec/
         +-- modules\util\optimizer/

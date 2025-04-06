@@ -203,14 +203,14 @@ def enable_checkpointing_for_basic_transformer_blocks(
 	elif config.gradient_checkpointing == GradientCheckpointingMethod.ON:
 		layers_to_checkpoint_selectively = config.gradient_checkpointing_layers
 		print(f"INFO: Checkpointing seletivo ON. Padrões: {layers_to_checkpoint_selectively if layers_to_checkpoint_selectively else 'Todos (lista vazia)'}")
-		checkpointed_count = 0 # Contador
+		checkpointed_count = 0
 
 		for name, child_module in orig_module.named_modules(): # Iterar com nomes
 			if isinstance(child_module, BasicTransformerBlock):
-				print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
+				#print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
 				# Verifica se o nome desta camada corresponde aos padrões
 				if should_checkpoint_layer(name, layers_to_checkpoint_selectively):
-					print(f"DEBUG: *** CHECKPOINTING CAMADA: {name} ***") # Destaca a camada checkpointada
+					#print(f"DEBUG: *** CHECKPOINTING CAMADA: {name} ***") # Destaca a camada checkpointada
 					# Aplica checkpointing SEM conductor
 					# print(f"DEBUG: Checkpointing camada: {name}") # Opcional para depuração
 					child_module.forward = create_checkpointed_forward(

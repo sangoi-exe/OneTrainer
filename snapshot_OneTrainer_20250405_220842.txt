@@ -1,0 +1,3276 @@
+# Snapshot do Projeto
+Timestamp: 20250405_220842
+
+## Estrutura do Projeto:
++-- docs/
++-- embedding_templates/
++-- modules/
+    +-- modules\cloud/
+    +-- modules\dataLoader/
+        +-- modules\dataLoader\StableDiffusionXLBaseDataLoader.py
+        +-- modules\dataLoader\flux/
+        +-- modules\dataLoader\mixin/
+            +-- modules\dataLoader\mixin\BatchValidator.py
+            +-- modules\dataLoader\mixin\DataLoaderGPUCacheMixin.py
+            +-- modules\dataLoader\mixin\DataLoaderText2ImageMixin.py
+        +-- modules\dataLoader\wuerstchen/
+    +-- modules\model/
+        +-- modules\model\util/
+    +-- modules\modelLoader/
+        +-- modules\modelLoader\flux/
+        +-- modules\modelLoader\hunyuanVideo/
+        +-- modules\modelLoader\mixin/
+        +-- modules\modelLoader\pixartAlpha/
+        +-- modules\modelLoader\sana/
+        +-- modules\modelLoader\stableDiffusion/
+        +-- modules\modelLoader\stableDiffusion3/
+        +-- modules\modelLoader\stableDiffusionXL/
+        +-- modules\modelLoader\wuerstchen/
+    +-- modules\modelSampler/
+    +-- modules\modelSaver/
+        +-- modules\modelSaver\flux/
+        +-- modules\modelSaver\hunyuanVideo/
+        +-- modules\modelSaver\mixin/
+        +-- modules\modelSaver\pixartAlpha/
+        +-- modules\modelSaver\sana/
+        +-- modules\modelSaver\stableDiffusion/
+        +-- modules\modelSaver\stableDiffusion3/
+        +-- modules\modelSaver\stableDiffusionXL/
+        +-- modules\modelSaver\wuerstchen/
+    +-- modules\modelSetup/
+        +-- modules\modelSetup\StableDiffusionXLLoRASetup.py
+        +-- modules\modelSetup\flux/
+        +-- modules\modelSetup\mixin/
+        +-- modules\modelSetup\stableDiffusion3/
+    +-- modules\module/
+        +-- modules\module\quantized/
+            +-- modules\module\quantized\mixin/
+    +-- modules\trainer/
+        +-- modules\trainer\GenericTrainer.py
+    +-- modules\ui/
+    +-- modules\util/
+        +-- modules\util\args/
+        +-- modules\util\callbacks/
+        +-- modules\util\commands/
+        +-- modules\util\config/
+            +-- modules\util\config\TrainConfig.py
+        +-- modules\util\convert/
+        +-- modules\util\enum/
+            +-- modules\util\enum\Cache.py
+        +-- modules\util\loss/
+        +-- modules\util\modelSpec/
+        +-- modules\util\optimizer/
+        +-- modules\util\ui/
+    +-- modules\zluda/
++-- resources/
+    +-- resources\icons/
+    +-- resources\images/
+    +-- resources\model_config/
+        +-- resources\model_config\stable_cascade/
+        +-- resources\model_config\stable_diffusion/
+        +-- resources\model_config\stable_diffusion_xl/
+    +-- resources\sd_model_spec/
++-- scripts/
+    +-- scripts\util/
++-- training_concepts/
++-- training_presets/
++-- training_samples/
+
+
+## Conteúdo do Projeto:
++-- docs/
++-- embedding_templates/
++-- modules/
+    +-- modules\cloud/
+    +-- modules\dataLoader/
+        +-- modules\dataLoader\StableDiffusionXLBaseDataLoader.py
+            ```StableDiffusionXLBaseDataLoader.py
+import copy
+import os
+
+from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.mixin.DataLoaderGPUCacheMixin import GPUCache
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.Cache import CacheMode
+from modules.util.torch_util import torch_gc
+from modules.util.TrainProgress import TrainProgress
+
+from mgds.MGDS import MGDS, TrainDataLoader
+from mgds.pipelineModules.DecodeTokens import DecodeTokens
+from mgds.pipelineModules.DecodeVAE import DecodeVAE
+from mgds.pipelineModules.DiskCache import DiskCache
+from mgds.pipelineModules.EncodeClipText import EncodeClipText
+from mgds.pipelineModules.EncodeVAE import EncodeVAE
+from mgds.pipelineModules.MapData import MapData
+from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
+from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
+from mgds.pipelineModules.SaveImage import SaveImage
+from mgds.pipelineModules.SaveText import SaveText
+from mgds.pipelineModules.ScaleImage import ScaleImage
+from mgds.pipelineModules.Tokenize import Tokenize
+from mgds.pipelineModules.VariationSorting import VariationSorting
+
+import torch
+
+class StableDiffusionXLBaseDataLoader(
+    BaseDataLoader,
+    DataLoaderText2ImageMixin,
+):
+    def __init__(
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+    ):
+        super().__init__(
+            train_device,
+            temp_device,
+        )
+
+        if is_validation:
+            config = copy.copy(config)
+            config.batch_size = 1
+
+        self.__ds = self.create_dataset(
+            config=config,
+            model=model,
+            train_progress=train_progress,
+            is_validation=is_validation,
+        )
+        self.__dl = TrainDataLoader(self.__ds, config.batch_size)
+        self.__cache_module_instance = self.__find_cache_module(self.__ds)
+
+    def __find_cache_module(self, mgds_instance: MGDS) -> DiskCache | GPUCache | None:
+        """Helper to find the cache module instance within the pipeline."""
+        modules_list = mgds_instance.loading_pipeline.modules
+        for current_module in reversed(modules_list):
+            if isinstance(current_module, (DiskCache, GPUCache)):
+                return current_module
+        return None
+
+    def clear_cache(self, config: TrainConfig):
+        """Limpa o cache se um módulo de cache estiver presente e suportar."""
+        if config.cache_mode == CacheMode.DISK:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, DiskCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache em DISCO...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo DiskCache encontrado ou não suporta limpeza.")
+        elif config.cache_mode == CacheMode.GPU:
+            if (
+                self.__cache_module_instance
+                and isinstance(self.__cache_module_instance, GPUCache)
+                and hasattr(self.__cache_module_instance, "clear")
+            ):
+                print("Limpando cache na GPU...")
+                self.__cache_module_instance.clear()
+            else:
+                print("Nenhum módulo GPUCache encontrado ou não suporta limpeza.")
+        else:
+            print("Nenhum cache ativo para limpar.")
+        torch_gc()  # Boa prática
+
+    def get_data_set(self) -> MGDS:
+        return self.__ds
+
+    def get_data_loader(self) -> TrainDataLoader:
+        return self.__dl
+
+    def _preparation_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        rescale_image = RescaleImageChannels(
+            image_in_name="image", image_out_name="image", in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1
+        )
+        rescale_conditioning_image = RescaleImageChannels(
+            image_in_name="conditioning_image",
+            image_out_name="conditioning_image",
+            in_range_min=0,
+            in_range_max=1,
+            out_range_min=-1,
+            out_range_max=1,
+        )
+        encode_image = EncodeVAE(
+            in_name="image",
+            out_name="latent_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        image_sample = SampleVAEDistribution(in_name="latent_image_distribution", out_name="latent_image", mode="mean")
+        downscale_mask = ScaleImage(in_name="mask", out_name="latent_mask", factor=0.125)
+        add_embeddings_to_prompt_1 = MapData(in_name="prompt", out_name="prompt_1", map_fn=model.add_text_encoder_1_embeddings_to_prompt)
+        add_embeddings_to_prompt_2 = MapData(in_name="prompt", out_name="prompt_2", map_fn=model.add_text_encoder_2_embeddings_to_prompt)
+        encode_conditioning_image = EncodeVAE(
+            in_name="conditioning_image",
+            out_name="latent_conditioning_image_distribution",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        conditioning_image_sample = SampleVAEDistribution(
+            in_name="latent_conditioning_image_distribution", out_name="latent_conditioning_image", mode="mean"
+        )
+        tokenize_prompt_1 = Tokenize(
+            in_name="prompt_1",
+            tokens_out_name="tokens_1",
+            mask_out_name="tokens_mask_1",
+            tokenizer=model.tokenizer_1,
+            max_token_length=model.tokenizer_1.model_max_length,
+        )
+        tokenize_prompt_2 = Tokenize(
+            in_name="prompt_2",
+            tokens_out_name="tokens_2",
+            mask_out_name="tokens_mask_2",
+            tokenizer=model.tokenizer_2,
+            max_token_length=model.tokenizer_2.model_max_length,
+        )
+        encode_prompt_1 = EncodeClipText(
+            in_name="tokens_1",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_1_hidden_state",
+            pooled_out_name=None,
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_1,
+            hidden_state_output_index=-(2 + config.text_encoder_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
+        encode_prompt_2 = EncodeClipText(
+            in_name="tokens_2",
+            tokens_attention_mask_in_name=None,
+            hidden_state_out_name="text_encoder_2_hidden_state",
+            pooled_out_name="text_encoder_2_pooled_state",
+            add_layer_norm=False,
+            text_encoder=model.text_encoder_2,
+            hidden_state_output_index=-(2 + config.text_encoder_2_layer_skip),
+            autocast_contexts=[model.autocast_context],
+            dtype=model.train_dtype.torch_dtype(),
+        )
+
+        modules = [
+            rescale_image,
+            encode_image,
+            image_sample,
+            add_embeddings_to_prompt_1,
+            tokenize_prompt_1,
+            add_embeddings_to_prompt_2,
+            tokenize_prompt_2,
+        ]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(downscale_mask)
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(rescale_conditioning_image)
+            modules.append(encode_conditioning_image)
+            modules.append(conditioning_image_sample)
+
+        if not config.train_text_encoder_or_embedding():
+            modules.append(encode_prompt_1)
+
+        if not config.train_text_encoder_2_or_embedding():
+            modules.append(encode_prompt_2)
+
+        return modules
+
+    def _cache_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        modules = []
+        image_split_names, text_split_names, image_aggregate_names, text_aggregate_names = self._get_cache_split_aggregate_names(config)
+        sort_names = self._get_sort_names(config)  # Usar helper
+
+        if config.cache_mode == CacheMode.DISK:
+            print("Configurando DiskCache...")
+            image_cache_dir = os.path.join(config.cache_dir, "image")
+            text_cache_dir = os.path.join(config.cache_dir, "text")
+
+            def before_cache_image_fun_disk():
+                model.to(self.temp_device)
+                model.vae_to(self.temp_device)  # Cache em disco usa temp_device
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_disk():
+                model.to(self.temp_device)
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.temp_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.temp_device)
+                model.eval()
+                torch_gc()
+
+            image_disk_cache = DiskCache(
+                cache_dir=image_cache_dir,
+                split_names=image_split_names,
+                aggregate_names=image_aggregate_names,
+                variations_in_name="concept.image_variations",
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.image"],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_image_fun_disk,
+            )
+            modules.append(image_disk_cache)
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
+
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                text_disk_cache = DiskCache(
+                    cache_dir=text_cache_dir,
+                    split_names=text_split_names,
+                    aggregate_names=text_aggregate_names,
+                    variations_in_name="concept.text_variations",
+                    balancing_in_name="concept.balancing",
+                    balancing_strategy_in_name="concept.balancing_strategy",
+                    variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                    group_enabled_in_name="concept.enabled",
+                    before_cache_fun=before_cache_text_fun_disk,
+                )
+                modules.append(text_disk_cache)
+                sort_names = [x for x in sort_names if x not in text_aggregate_names and x not in text_split_names]
+
+        elif config.cache_mode == CacheMode.GPU:
+            print("Configurando GPUCache...")
+
+            all_split_names = list(set(image_split_names + text_split_names)) # Garante unicidade
+            all_aggregate_names = list(set(image_aggregate_names + text_aggregate_names)) # Garante unicidade e passa agregados
+
+            def before_cache_image_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                model.vae_to(self.train_device)  # VAE no device de treino para cache GPU
+                model.eval()
+                torch_gc()
+
+            def before_cache_text_fun_gpu():  # Função específica para GPU
+                model.to(self.temp_device)
+                if not config.train_text_encoder_or_embedding():
+                    model.text_encoder_1_to(self.train_device)
+                if not config.train_text_encoder_2_or_embedding():
+                    model.text_encoder_2_to(self.train_device)
+                model.eval()
+                torch_gc()
+
+            before_cache_fun = None
+            if image_split_names:  # Prioriza imagem se tiver
+                before_cache_fun = before_cache_image_fun_gpu
+            elif text_split_names:  # Usa texto se só tiver texto
+                before_cache_fun = before_cache_text_fun_gpu
+
+            gpu_cache = GPUCache(
+                train_device=self.train_device,
+                split_names=list(set(all_split_names)),
+                aggregate_names=list(set(all_aggregate_names)),  # Passar nomes agregados
+                variations_in_name="concept.image_variations",  # Manter consistência
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=[
+                    "concept.path",
+                    "concept.seed",
+                    "concept.include_subdirectories",
+                    "concept.image",
+                    "concept.text",
+                ],
+                group_enabled_in_name="concept.enabled",
+                before_cache_fun=before_cache_fun,
+            )
+            from modules.dataLoader.mixin.BatchValidator import BatchValidator
+            validator = BatchValidator(
+                required_names=list(set(all_split_names + all_aggregate_names)),
+                target_module=gpu_cache,
+                name="ValidatorBeforeGPUCache"
+            )
+            modules.append(validator)
+
+        elif config.cache_mode == CacheMode.NONE:
+            print("Nenhum cache configurado.")
+            pass  # Não adiciona módulos de cache
+
+        if len(sort_names) > 0:
+            variation_sorting = VariationSorting(
+                names=sort_names,
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+                group_enabled_in_name="concept.enabled",
+            )
+            modules.append(variation_sorting)
+
+        return modules
+
+    def _get_cache_split_aggregate_names(self, config: TrainConfig):
+        """Helper method to determine names for caching based on config."""
+
+        image_split_names = ["latent_image", "original_resolution", "crop_offset"]
+        if config.masked_training or config.model_type.has_mask_input():
+            image_split_names.append("latent_mask")
+        if config.model_type.has_conditioning_image_input():
+            image_split_names.append("latent_conditioning_image")
+        image_aggregate_names = ["crop_resolution", "image_path"]
+
+        text_split_names = []
+        text_aggregate_names = []  # Typically text doesn't have aggregate names like images
+        if not config.train_text_encoder_or_embedding():
+            text_split_names.append("tokens_1")
+            text_split_names.append("text_encoder_1_hidden_state")
+        if not config.train_text_encoder_2_or_embedding():
+            text_split_names.append("tokens_2")
+            text_split_names.append("text_encoder_2_hidden_state")
+            text_split_names.append("text_encoder_2_pooled_state")
+
+        return image_split_names, text_split_names, image_aggregate_names, text_aggregate_names
+
+    def _get_sort_names(self, config: TrainConfig) -> list[str]:
+        """Helper method to determine names for variation sorting."""
+        image_split_names, text_split_names, image_aggregate_names, _ = self._get_cache_split_aggregate_names(config)
+
+        sort_names = (
+            image_aggregate_names
+            + image_split_names
+            + [
+                "prompt_1",
+                "tokens_1",
+                "text_encoder_1_hidden_state",
+                "prompt_2",
+                "tokens_2",
+                "text_encoder_2_hidden_state",
+                "text_encoder_2_pooled_state",
+                "concept",
+            ]
+        )
+
+        if config.cache_mode == CacheMode.DISK:
+            sort_names = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names]
+            if not config.train_text_encoder_or_embedding() or not config.train_text_encoder_2_or_embedding():
+                sort_names = [x for x in sort_names if x not in text_split_names]
+
+        sort_names = [name for name in sort_names if name]
+
+        return list(set(sort_names))  # Return unique names
+
+    def _output_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        output_names = [
+            "image_path",
+            "latent_image",
+            "prompt_1",
+            "prompt_2",
+            "tokens_1",
+            "tokens_2",
+            "original_resolution",
+            "crop_resolution",
+            "crop_offset",
+        ]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            output_names.append("latent_mask")
+
+        if config.model_type.has_conditioning_image_input():
+            output_names.append("latent_conditioning_image")
+
+        if not config.train_text_encoder_or_embedding():
+            output_names.append("text_encoder_1_hidden_state")
+
+        if not config.train_text_encoder_2_or_embedding():
+            output_names.append("text_encoder_2_hidden_state")
+            output_names.append("text_encoder_2_pooled_state")
+
+        sort_names = output_names + ["concept"]
+        output_names = output_names + [("concept.loss_weight", "loss_weight")]
+
+        if config.validation:
+            output_names.append(("concept.name", "concept_name"))
+            output_names.append(("concept.path", "concept_path"))
+            output_names.append(("concept.seed", "concept_seed"))
+
+        def before_cache_image_fun():
+            model.to(self.temp_device)
+            model.vae_to(self.train_device)
+            model.eval()
+            torch_gc()
+
+        return self._output_modules_from_out_names(
+            output_names=output_names,
+            config=config,
+            before_cache_image_fun=before_cache_image_fun,
+            use_conditioning_image=True,
+            vae=model.vae,
+            autocast_context=[model.autocast_context, model.vae_autocast_context],
+            train_dtype=model.vae_train_dtype,
+            sort_names=self._get_sort_names(config),
+        )
+
+    def _debug_modules(self, config: TrainConfig, model: StableDiffusionXLModel):
+        debug_dir = os.path.join(config.debug_dir, "dataloader")
+
+        def before_save_fun():
+            model.vae_to(self.train_device)
+
+        decode_image = DecodeVAE(
+            in_name="latent_image",
+            out_name="decoded_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        decode_conditioning_image = DecodeVAE(
+            in_name="latent_conditioning_image",
+            out_name="decoded_conditioning_image",
+            vae=model.vae,
+            autocast_contexts=[model.autocast_context, model.vae_autocast_context],
+            dtype=model.vae_train_dtype.torch_dtype(),
+        )
+        upscale_mask = ScaleImage(in_name="latent_mask", out_name="decoded_mask", factor=8)
+        decode_prompt = DecodeTokens(in_name="tokens_1", out_name="decoded_prompt", tokenizer=model.tokenizer_1)
+        save_image = SaveImage(
+            image_in_name="decoded_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_conditioning_image = SaveImage(
+            image_in_name="decoded_conditioning_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_mask = SaveImage(
+            image_in_name="decoded_mask",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=0,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_prompt = SaveText(
+            text_in_name="decoded_prompt", original_path_in_name="image_path", path=debug_dir, before_save_fun=before_save_fun
+        )
+
+        modules = []
+
+        modules.append(decode_image)
+        modules.append(save_image)
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(decode_conditioning_image)
+            modules.append(save_conditioning_image)
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(upscale_mask)
+            modules.append(save_mask)
+
+        modules.append(decode_prompt)
+        modules.append(save_prompt)
+
+        return modules
+
+    def create_dataset(
+        self,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+    ):
+        enumerate_input = self._enumerate_input_modules(config)
+        load_input = self._load_input_modules(config, model.vae_train_dtype)
+        mask_augmentation = self._mask_augmentation_modules(config)
+        aspect_bucketing_in = self._aspect_bucketing_in(config, 64)
+        crop_modules = self._crop_modules(config)
+        augmentation_modules = self._augmentation_modules(config)
+        inpainting_modules = self._inpainting_modules(config)
+        preparation_modules = self._preparation_modules(config, model)
+        cache_modules = self._cache_modules(config, model)
+        output_modules = self._output_modules(config, model)
+
+        debug_modules = self._debug_modules(config, model)
+
+        return self._create_mgds(
+            config,
+            [
+                enumerate_input,
+                load_input,
+                mask_augmentation,
+                aspect_bucketing_in,
+                crop_modules,
+                augmentation_modules,
+                inpainting_modules,
+                preparation_modules,
+                cache_modules,
+                output_modules,
+                debug_modules if config.debug_mode else None,
+            ],
+            train_progress,
+            is_validation,
+        )
+            ```
+
+        +-- modules\dataLoader\flux/
+        +-- modules\dataLoader\mixin/
+            +-- modules\dataLoader\mixin\BatchValidator.py
+                ```BatchValidator.py
+from mgds.PipelineModule import PipelineModule
+
+class BatchValidator(PipelineModule):
+	def __init__(self, required_names: list[str], target_module: PipelineModule, name: str = "BatchValidator"):
+		super().__init__()
+		self.required_names = required_names
+		self.target = target_module
+		self.name = name
+
+	def start(self, epoch: int, index_offset: int):
+		if hasattr(self.target, "start"):
+			self.target.start(epoch, index_offset)
+
+		print(f"[{self.name}] 🔍 Iniciando varredura para validação de batches...")
+
+		variations = self.get_input(self.target.variations_in_name)
+		for variation in range(len(variations)):
+			samples = variations[variation]
+			for index in range(len(samples)):
+				batch = self._get_previous_batch(variation, index)
+				if batch is None:
+					print(f"[{self.name}] 🟢 Validando batch para process(variation={variation}, index={index})")
+					batch_valid = True
+					for i, item in enumerate(batch):
+						if not isinstance(item, dict):
+							print(f"[{self.name}] ❌ Item {i} não é um dict (tipo: {type(item)}) em var={variation}, idx={index}")
+							batch_valid = False
+							break
+						keys = list(item.keys())
+						missing = [k for k in self.required_names if k not in keys]
+						if missing:
+							print(f"[{self.name}] ⚠️ Item {i} está sem {missing} (keys={keys}) em var={variation}, idx={index}")
+							batch_valid = False
+							break # Se um item falha, o batch falha a validação aqui
+
+					if not batch_valid:
+						print(f"[{self.name}] ❌ Batch inválido encontrado em var={variation}, idx={index}. Não será processado pelo target durante o start.")
+			print(f"[{self.name}] ✅ Varredura de validação de batches concluída.")
+
+	def _get_previous_batch(self, variation: int, index: int) -> list[dict] | None: # Adicionado | None
+		previous = self.get_previous_modules()
+		for module in reversed(previous):
+			if hasattr(module, "get_batch"):
+				batch = module.get_batch(variation, index)
+				if batch is not None:
+					return batch
+		return None
+
+	def process(self, batch: list[dict], variation: int, index: int):
+		print(f"[{self.name}] 🟢 process(variation={variation}, index={index})")
+		for i, item in enumerate(batch):
+			if not isinstance(item, dict):
+				print(f"[{self.name}] ❌ Item {i} não é um dict (tipo: {type(item)})")
+				continue
+			missing = [k for k in self.required_names if k not in item]
+			if missing:
+				print(f"[{self.name}] ⚠️ Faltando {missing} no item {i} (keys={list(item.keys())})")
+		return self.target.process(batch, variation, index)
+
+	def get_item(self, variation: int, index: int, item_name: str):
+		result = self.target.get_item(variation, index, item_name)
+		if result is None:
+			print(f"[{self.name}] ❌ get_item() -> '{item_name}' está ausente (variação={variation}, índice={index})")
+		return result
+
+	def get_inputs(self):
+		return self.target.get_inputs()
+
+	def get_outputs(self):
+		return self.target.get_outputs()
+
+	def clear(self):
+		if hasattr(self.target, "clear"):
+			self.target.clear()
+                ```
+
+            +-- modules\dataLoader\mixin\DataLoaderGPUCacheMixin.py
+                ```DataLoaderGPUCacheMixin.py
+import torch
+from mgds.PipelineModule import PipelineModule
+from modules.dataLoader.mixin.BatchValidator import BatchValidator
+
+class GPUCache(PipelineModule):
+    def __init__(
+        self,
+        train_device: torch.device,
+        split_names: list[str],
+        aggregate_names: list[str],
+        variations_in_name: str,
+        balancing_in_name: str,
+        balancing_strategy_in_name: str,
+        variations_group_in_name: list[str],
+        group_enabled_in_name: str,
+        before_cache_fun=None,
+    ):
+        super().__init__()
+        self.train_device = train_device
+        self.split_names = split_names
+        self.aggregate_names = aggregate_names
+        self.variations_in_name = variations_in_name
+        self.balancing_in_name = balancing_in_name
+        self.balancing_strategy_in_name = balancing_strategy_in_name
+        self.variations_group_in_name = variations_group_in_name
+        self.group_enabled_in_name = group_enabled_in_name
+        self.before_cache_fun = before_cache_fun
+
+        self.cache: dict[str, dict[int, list]] = {}
+        self.cached_variation_indices: set[tuple[int, int]] = set()
+
+    def start(self, epoch: int, index_offset: int):
+        if self.before_cache_fun is not None:
+            self.before_cache_fun()
+
+        print(f"[GPUCache] 🔄 Iniciando pré-carregamento e validação do cache na VRAM...")
+        self.clear()  # Garante que o cache esteja limpo antes de preencher
+
+        all_required_names = set(self.split_names + self.aggregate_names)
+        variations = self.get_input(self.variations_in_name)
+        expected_items_count = 0
+        cached_items_count = 0
+
+        for variation in range(len(variations)):
+            samples = variations[variation]
+            expected_items_count += len(samples)
+            for index in range(len(samples)):
+                if not self.__should_store(variation, index):  # Teoricamente desnecessário com clear() acima, mas seguro
+                    continue
+
+                batch = self._get_previous_batch(variation, index)
+                if batch is None:
+                    print(f"[GPUCache] ❌ Falha ao obter batch para variação={variation}, índice={index} durante o start. Pulando.")
+                    continue  # Não podemos cachear se não houver batch
+
+                is_valid_batch = True
+                for i, item in enumerate(batch):
+                    if not isinstance(item, dict):
+                        print(f"[GPUCache] ❌ Item {i} no batch (var={variation}, idx={index}) não é um dict: {type(item)}. Pulando item.")
+                        is_valid_batch = False
+                        break
+                    missing_keys = all_required_names - item.keys()
+                    if missing_keys:
+                        print(
+                            f"[GPUCache] ⚠️ Item {i} no batch (var={variation}, idx={index}) está sem chaves: {missing_keys}. Chaves presentes: {list(item.keys())}. Pulando cache deste batch."
+                        )
+                        is_valid_batch = False
+                        break
+
+                if not is_valid_batch:
+                    continue  # Pula para o próximo índice se o batch atual for inválido
+
+                print(f"[GPUCache] 🟢 Validado e iniciando cache para variação={variation}, índice={index}")
+                for item in batch:  # Assumindo batch size > 1 pode acontecer, MGDS geralmente retorna lista de dicts
+                    for name in all_required_names:
+                        if name in item:  # Checa novamente por segurança
+                            self.__store_item(variation, index, name, item[name])
+
+                self.cached_variation_indices.add((variation, index))
+                cached_items_count += 1
+
+        print(
+            f"[GPUCache] ✅ Cache preenchido na VRAM. Esperados: {expected_items_count}, Cacheados com sucesso: {cached_items_count}. Total de índices cacheados: {len(self.cached_variation_indices)}"
+        )
+        if expected_items_count != cached_items_count:
+            print(
+                f"[GPUCache] ⚠️ Atenção: Número de itens cacheados ({cached_items_count}) difere do esperado ({expected_items_count}). Verifique os logs para erros."
+            )
+
+    def _get_previous_batch(self, variation: int, index: int) -> list[dict]:
+        previous = self.get_previous_modules()
+        if not previous:
+            print("[GPUCache] ⚠️ Nenhum módulo anterior encontrado")
+            return None
+
+        for module in reversed(previous):
+            if hasattr(module, "get_batch"):
+                batch = module.get_batch(variation, index)
+                if batch is not None:
+                    print(f"[GPUCache] 🔗 Batch recebido de {module.__class__.__name__}")
+                    return batch
+                else:
+                    print(f"[GPUCache] ⚠️ {module.__class__.__name__}.get_batch() retornou None")
+
+        return None
+
+    def __store_item(self, variation: int, index: int, name: str, value):
+        if value is None:
+            return
+        if name not in self.cache:
+            self.cache[name] = {}
+
+        if variation not in self.cache[name]:
+            self.cache[name][variation] = []
+
+        cache_list = self.cache[name][variation]
+        while len(cache_list) <= index:
+            cache_list.append(None)
+
+        if isinstance(value, torch.Tensor):
+            value = value.to(self.train_device, non_blocking=True)
+
+        print(f"[GPUCache] armazenando {name} para variação={variation}, index={index}")
+        cache_list[index] = value
+
+    def __should_store(self, variation: int, index: int) -> bool:
+        return (variation, index) not in self.cached_variation_indices
+
+    def process(self, batch: list[dict], variation: int, index: int):
+        if not self.__should_store(variation, index):
+            return batch
+
+        print(f"[GPUCache] process() chamado com variation={variation}, index={index}")
+        return batch
+
+    def get_item(self, variation: int, index: int, item_name: str):
+        if item_name not in self.cache:
+            print(f"[GPUCache] ❌ Falha em get_item: Chave '{item_name}' não existe no cache principal.")
+            return None
+        if variation not in self.cache[item_name]:
+            print(
+                f"[GPUCache] ❌ Falha em get_item: Variação {variation} não existe no cache para a chave '{item_name}'. Variações presentes: {list(self.cache[item_name].keys())}"
+            )
+            return None
+
+        cache_list = self.cache[item_name][variation]
+        if index >= len(cache_list):
+            print(
+                f"[GPUCache] ❌ Falha em get_item: Índice {index} fora do range ({len(cache_list)}) para '{item_name}' na variação {variation}."
+            )
+            return None
+
+        value = cache_list[index]
+        if value is None:
+            print(
+                f"[GPUCache] ❌ Falha em get_item: Valor é NULO para '{item_name}' na posição [{variation}][{index}]. O item pode não ter sido cacheado corretamente durante start()."
+            )
+            return None
+
+        return {item_name: value}
+
+    def clear(self):
+        print("[GPUCache] 🗑️ Limpando cache da GPU...")
+        self.cache.clear()
+        self.cached_variation_indices.clear()
+        torch.cuda.empty_cache()  # Ajuda a liberar memória VRAM não referenciada
+
+    def get_inputs(self) -> list[str]:
+        return []
+
+    def get_outputs(self) -> list[str]:
+        return self.split_names + self.aggregate_names
+                ```
+
+            +-- modules\dataLoader\mixin\DataLoaderText2ImageMixin.py
+                ```DataLoaderText2ImageMixin.py
+import re
+from collections.abc import Callable
+
+from modules.util import path_util
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.DataType import DataType
+from modules.util.enum.Cache import CacheMode
+from modules.util.enum.DataType import DataType
+from modules.model import util as model_util  # ADDED Model util for VAE device management
+
+from mgds.OutputPipelineModule import OutputPipelineModule
+from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
+from mgds.pipelineModules.AspectBucketing import AspectBucketing
+from mgds.pipelineModules.CalcAspect import CalcAspect
+from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
+from mgds.pipelineModules.CollectPaths import CollectPaths
+from mgds.pipelineModules.DropTags import DropTags
+from mgds.pipelineModules.GenerateImageLike import GenerateImageLike
+from mgds.pipelineModules.GenerateMaskedConditioningImage import GenerateMaskedConditioningImage
+from mgds.pipelineModules.GetFilename import GetFilename
+from mgds.pipelineModules.ImageToVideo import ImageToVideo
+from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorting
+from mgds.pipelineModules.LoadImage import LoadImage
+from mgds.pipelineModules.LoadMultipleTexts import LoadMultipleTexts
+from mgds.pipelineModules.LoadVideo import LoadVideo
+from mgds.pipelineModules.ModifyPath import ModifyPath
+from mgds.pipelineModules.RandomBrightness import RandomBrightness
+from mgds.pipelineModules.RandomCircularMaskShrink import RandomCircularMaskShrink
+from mgds.pipelineModules.RandomContrast import RandomContrast
+from mgds.pipelineModules.RandomFlip import RandomFlip
+from mgds.pipelineModules.RandomHue import RandomHue
+from mgds.pipelineModules.RandomLatentMaskRemove import RandomLatentMaskRemove
+from mgds.pipelineModules.RandomMaskRotateCrop import RandomMaskRotateCrop
+from mgds.pipelineModules.RandomRotate import RandomRotate
+from mgds.pipelineModules.RandomSaturation import RandomSaturation
+from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
+from mgds.pipelineModules.SelectInput import SelectInput
+from mgds.pipelineModules.SelectRandomText import SelectRandomText
+from mgds.pipelineModules.ShuffleTags import ShuffleTags
+from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
+
+import torch
+
+from diffusers import AutoencoderKL
+
+class DataLoaderText2ImageMixin:
+    def __init__(self):
+        pass
+
+    def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
+        supported_extensions = set()
+        supported_extensions |= path_util.supported_image_extensions()
+
+        if allow_videos:
+            supported_extensions |= path_util.supported_video_extensions()
+
+        collect_paths = CollectPaths(
+            concept_in_name="concept",
+            path_in_name="path",
+            include_subdirectories_in_name="concept.include_subdirectories",
+            enabled_in_name="enabled",
+            path_out_name="image_path",
+            concept_out_name="concept",
+            extensions=supported_extensions,
+            include_postfix=None,
+            exclude_postfix=["-masklabel"],
+        )
+
+        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        sample_prompt_path = ModifyPath(in_name="image_path", out_name="sample_prompt_path", postfix="", extension=".txt")
+
+        modules = [collect_paths, sample_prompt_path]
+
+        if config.masked_training:
+            modules.append(mask_path)
+
+        return modules
+
+    def _load_input_modules(
+        self,
+        config: TrainConfig,
+        train_dtype: DataType,
+        allow_video: bool = False,
+    ) -> list:
+        load_image = LoadImage(
+            path_in_name="image_path",
+            image_out_name="image",
+            range_min=0,
+            range_max=1,
+            supported_extensions=path_util.supported_image_extensions(),
+            dtype=train_dtype.torch_dtype(),
+        )
+        load_video = LoadVideo(
+            path_in_name="image_path",
+            target_frame_count_in_name="settings.target_frames",
+            video_out_name="image",
+            range_min=0,
+            range_max=1,
+            target_frame_rate=24,
+            supported_extensions=path_util.supported_video_extensions(),
+            dtype=train_dtype.torch_dtype(),
+        )
+        image_to_video = ImageToVideo(in_name="image", out_name="image")
+
+        generate_mask = GenerateImageLike(image_in_name="image", image_out_name="mask", color=255, range_min=0, range_max=1)
+        load_mask = LoadImage(
+            path_in_name="mask_path",
+            image_out_name="mask",
+            range_min=0,
+            range_max=1,
+            channels=1,
+            supported_extensions={".png"},
+            dtype=train_dtype.torch_dtype(),
+        )
+        mask_to_video = ImageToVideo(in_name="mask", out_name="mask")
+
+        load_sample_prompts = LoadMultipleTexts(path_in_name="sample_prompt_path", texts_out_name="sample_prompts")
+        load_concept_prompts = LoadMultipleTexts(path_in_name="concept.text.prompt_path", texts_out_name="concept_prompts")
+        filename_prompt = GetFilename(path_in_name="image_path", filename_out_name="filename_prompt", include_extension=False)
+        select_prompt_input = SelectInput(
+            setting_name="concept.text.prompt_source",
+            out_name="prompts",
+            setting_to_in_name_map={
+                "sample": "sample_prompts",
+                "concept": "concept_prompts",
+                "filename": "filename_prompt",
+            },
+            default_in_name="sample_prompts",
+        )
+        select_random_text = SelectRandomText(texts_in_name="prompts", text_out_name="prompt")
+
+        modules = [load_image, load_video]
+
+        if allow_video:
+            modules.append(image_to_video)
+
+        modules.extend([load_sample_prompts, load_concept_prompts, filename_prompt, select_prompt_input, select_random_text])
+
+        if config.masked_training:
+            modules.append(generate_mask)
+            modules.append(load_mask)
+        elif config.model_type.has_mask_input():
+            modules.append(generate_mask)
+
+        if allow_video:
+            modules.append(mask_to_video)
+
+        return modules
+
+    def _mask_augmentation_modules(self, config: TrainConfig) -> list:
+        inputs = ["image"]
+
+        lowest_resolution = min([int(x.strip()) for x in re.split(r"\D", config.resolution) if x.strip() != ""])
+        circular_mask_shrink = RandomCircularMaskShrink(
+            mask_name="mask",
+            shrink_probability=1.0,
+            shrink_factor_min=0.2,
+            shrink_factor_max=1.0,
+            enabled_in_name="concept.image.enable_random_circular_mask_shrink",
+        )
+        random_mask_rotate_crop = RandomMaskRotateCrop(
+            mask_name="mask",
+            additional_names=inputs,
+            min_size=lowest_resolution,
+            min_padding_percent=10,
+            max_padding_percent=30,
+            max_rotate_angle=20,
+            enabled_in_name="concept.image.enable_random_mask_rotate_crop",
+        )
+
+        modules = []
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(circular_mask_shrink)
+
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(random_mask_rotate_crop)
+
+        return modules
+
+    def _aspect_bucketing_in(self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled: bool = False):
+        calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
+
+        aspect_bucketing_quantization = AspectBucketing(
+            quantization=aspect_bucketing_quantization,
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            target_frames_in_name="settings.target_frames",
+            frame_dim_enabled=frame_dim_enabled,
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
+        )
+
+        single_aspect_calculation = SingleAspectCalculation(
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
+        )
+
+        modules = [calc_aspect]
+
+        if config.aspect_ratio_bucketing:
+            modules.append(aspect_bucketing_quantization)
+        else:
+            modules.append(single_aspect_calculation)
+
+        return modules
+
+    def _crop_modules(self, config: TrainConfig):
+        inputs = ["image"]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            inputs.append("mask")
+
+        if config.model_type.has_depth_input():
+            inputs.append("depth")
+
+        scale_crop = ScaleCropImage(
+            names=inputs,
+            scale_resolution_in_name="scale_resolution",
+            crop_resolution_in_name="crop_resolution",
+            enable_crop_jitter_in_name="concept.image.enable_crop_jitter",
+            crop_offset_out_name="crop_offset",
+        )
+
+        modules = [scale_crop]
+
+        return modules
+
+    def _augmentation_modules(self, config: TrainConfig):
+        inputs = ["image"]
+
+        if config.masked_training or config.model_type.has_mask_input():
+            inputs.append("mask")
+
+        if config.model_type.has_depth_input():
+            inputs.append("depth")
+
+        random_flip = RandomFlip(
+            names=inputs, enabled_in_name="concept.image.enable_random_flip", fixed_enabled_in_name="concept.image.enable_fixed_flip"
+        )
+        random_rotate = RandomRotate(
+            names=inputs,
+            enabled_in_name="concept.image.enable_random_rotate",
+            fixed_enabled_in_name="concept.image.enable_fixed_rotate",
+            max_angle_in_name="concept.image.random_rotate_max_angle",
+        )
+        random_brightness = RandomBrightness(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_brightness",
+            fixed_enabled_in_name="concept.image.enable_fixed_brightness",
+            max_strength_in_name="concept.image.random_brightness_max_strength",
+        )
+        random_contrast = RandomContrast(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_contrast",
+            fixed_enabled_in_name="concept.image.enable_fixed_contrast",
+            max_strength_in_name="concept.image.random_contrast_max_strength",
+        )
+        random_saturation = RandomSaturation(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_saturation",
+            fixed_enabled_in_name="concept.image.enable_fixed_saturation",
+            max_strength_in_name="concept.image.random_saturation_max_strength",
+        )
+        random_hue = RandomHue(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_hue",
+            fixed_enabled_in_name="concept.image.enable_fixed_hue",
+            max_strength_in_name="concept.image.random_hue_max_strength",
+        )
+        drop_tags = DropTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.tag_dropout_enable",
+            probability_in_name="concept.text.tag_dropout_probability",
+            dropout_mode_in_name="concept.text.tag_dropout_mode",
+            special_tags_in_name="concept.text.tag_dropout_special_tags",
+            special_tag_mode_in_name="concept.text.tag_dropout_special_tags_mode",
+            delimiter_in_name="concept.text.tag_delimiter",
+            keep_tags_count_in_name="concept.text.keep_tags_count",
+            text_out_name="prompt",
+            regex_enabled_in_name="concept.text.tag_dropout_special_tags_regex",
+        )
+        caps_randomize = CapitalizeTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.caps_randomize_enable",
+            probability_in_name="concept.text.caps_randomize_probability",
+            capitalize_mode_in_name="concept.text.caps_randomize_mode",
+            delimiter_in_name="concept.text.tag_delimiter",
+            convert_lowercase_in_name="concept.text.caps_randomize_lowercase",
+            text_out_name="prompt",
+        )
+        shuffle_tags = ShuffleTags(
+            text_in_name="prompt",
+            enabled_in_name="concept.text.enable_tag_shuffling",
+            delimiter_in_name="concept.text.tag_delimiter",
+            keep_tags_count_in_name="concept.text.keep_tags_count",
+            text_out_name="prompt",
+        )
+
+        modules = [
+            random_flip,
+            random_rotate,
+            random_brightness,
+            random_contrast,
+            random_saturation,
+            random_hue,
+            drop_tags,
+            caps_randomize,
+            shuffle_tags,
+        ]
+
+        return modules
+
+    def _inpainting_modules(self, config: TrainConfig):
+        conditioning_image = GenerateMaskedConditioningImage(
+            image_in_name="image", mask_in_name="mask", image_out_name="conditioning_image", image_range_min=0, image_range_max=1
+        )
+
+        modules = []
+
+        if config.model_type.has_conditioning_image_input():
+            modules.append(conditioning_image)
+
+        return modules
+
+    def _output_modules_from_out_names(
+        self,
+        output_names: list[str | tuple[str, str]],  # Allow tuple for renaming
+        sort_names: list[str],  # sort_names is now passed in
+        config: TrainConfig,
+        before_cache_image_fun: Callable[[], None] | None = None,
+        use_conditioning_image: bool = False,
+        vae: AutoencoderKL | None = None,
+        autocast_context: list[torch.autocast | None] = None,
+        train_dtype: DataType | None = None,
+    ):
+        def before_mask_remove_fun():
+            if vae:
+                if config.cache_mode == CacheMode.GPU:  # Check CacheMode
+                    model_util.vae_to(vae, torch.device(config.train_device))  # Use device from config
+                elif before_cache_image_fun:
+                    before_cache_image_fun()
+
+        mask_remove = RandomLatentMaskRemove(
+            latent_mask_name="latent_mask",
+            latent_conditioning_image_name="latent_conditioning_image" if use_conditioning_image else None,
+            replace_probability=config.unmasked_probability,
+            vae=vae,
+            possible_resolutions_in_name="possible_resolutions",
+            autocast_contexts=autocast_context,
+            dtype=train_dtype.torch_dtype() if train_dtype else None,
+            before_cache_fun=before_mask_remove_fun,  # Use the adjusted function
+        )
+
+        if config.cache_mode == CacheMode.DISK:
+            batch_sorting = AspectBatchSorting(resolution_in_name="crop_resolution", names=sort_names, batch_size=config.batch_size)
+        else:
+            batch_sorting = InlineAspectBatchSorting(resolution_in_name="crop_resolution", names=sort_names, batch_size=config.batch_size)
+
+        output = OutputPipelineModule(names=output_names)
+
+        modules = []
+
+        if config.model_type.has_mask_input():
+            modules.append(mask_remove)
+
+        modules.append(batch_sorting)  # Add the appropriate batch sorter
+
+        modules.append(output)
+
+        return modules
+                ```
+
+        +-- modules\dataLoader\wuerstchen/
+    +-- modules\model/
+        +-- modules\model\util/
+    +-- modules\modelLoader/
+        +-- modules\modelLoader\flux/
+        +-- modules\modelLoader\hunyuanVideo/
+        +-- modules\modelLoader\mixin/
+        +-- modules\modelLoader\pixartAlpha/
+        +-- modules\modelLoader\sana/
+        +-- modules\modelLoader\stableDiffusion/
+        +-- modules\modelLoader\stableDiffusion3/
+        +-- modules\modelLoader\stableDiffusionXL/
+        +-- modules\modelLoader\wuerstchen/
+    +-- modules\modelSampler/
+    +-- modules\modelSaver/
+        +-- modules\modelSaver\flux/
+        +-- modules\modelSaver\hunyuanVideo/
+        +-- modules\modelSaver\mixin/
+        +-- modules\modelSaver\pixartAlpha/
+        +-- modules\modelSaver\sana/
+        +-- modules\modelSaver\stableDiffusion/
+        +-- modules\modelSaver\stableDiffusion3/
+        +-- modules\modelSaver\stableDiffusionXL/
+        +-- modules\modelSaver\wuerstchen/
+    +-- modules\modelSetup/
+        +-- modules\modelSetup\StableDiffusionXLLoRASetup.py
+            ```StableDiffusionXLLoRASetup.py
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
+from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.optimizer_util import init_model_parameters
+from modules.util.torch_util import state_dict_has_prefix
+from modules.util.TrainProgress import TrainProgress
+
+import torch
+
+PRESETS = {
+    "attn-mlp": ["attentions"],
+    "attn-only": ["attn"],
+    "full": [],
+    "input-only": ["down_blocks", "resnets", "conv", "time_emb_proj"],
+    "art-style": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "mid_block", "resnets"],
+    "face-detail": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "down_blocks", "up_blocks"],
+    "almost-full-safe": ["down_blocks", "up_blocks", "mid_block", "attn", "proj", "ff", "resnets"],
+    "danger-zone": ["conv_in", "conv_out", "mid_block", "attn", "proj", "resnets"],
+    "interaction-concept": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "resnets", "down_blocks", "mid_block"],
+    "input-encoders-only": ["time_embedding", "add_embedding", "conv_in", "down_blocks"],
+}
+
+class StableDiffusionXLLoRASetup(
+    BaseStableDiffusionXLSetup,
+):
+    def __init__(
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        debug_mode: bool,
+    ):
+        super().__init__(
+            train_device=train_device,
+            temp_device=temp_device,
+            debug_mode=debug_mode,
+        )
+
+    def create_parameters(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ) -> NamedParameterGroupCollection:
+        parameter_group_collection = NamedParameterGroupCollection()
+
+        if config.text_encoder.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="text_encoder_1_lora",
+                    parameters=model.text_encoder_1_lora.parameters(),
+                    learning_rate=config.text_encoder.learning_rate,
+                )
+            )
+
+        if config.text_encoder_2.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="text_encoder_2_lora",
+                    parameters=model.text_encoder_2_lora.parameters(),
+                    learning_rate=config.text_encoder_2.learning_rate,
+                )
+            )
+
+        if config.train_any_embedding() or config.train_any_output_embedding():
+            if config.text_encoder.train_embedding:
+                self._add_embedding_param_groups(
+                    model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_1"
+                )
+
+            if config.text_encoder_2.train_embedding:
+                self._add_embedding_param_groups(
+                    model.all_text_encoder_2_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_2"
+                )
+
+        if config.unet.train:
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="unet_lora",
+                    parameters=model.unet_lora.parameters(),
+                    learning_rate=config.unet.learning_rate,
+                )
+            )
+
+        return parameter_group_collection
+
+    def __setup_requires_grad(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        self._setup_embeddings_requires_grad(model, config)
+        model.text_encoder_1.requires_grad_(False)
+        model.text_encoder_2.requires_grad_(False)
+        model.unet.requires_grad_(False)
+        model.vae.requires_grad_(False)
+
+        if model.text_encoder_1_lora is not None:
+            train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(config, model.train_progress)
+            model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
+
+        if model.text_encoder_2_lora is not None:
+            train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
+                config, model.train_progress
+            )
+            model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
+
+        if model.unet_lora is not None:
+            train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
+            model.unet_lora.requires_grad_(train_unet)
+
+    def setup_model(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
+        create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
+
+        model.text_encoder_1_lora = LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config) if create_te1 else None
+
+        model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
+
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers.split(","))
+
+        if model.lora_state_dict:
+            if create_te1:
+                model.text_encoder_1_lora.load_state_dict(model.lora_state_dict)
+            if create_te2:
+                model.text_encoder_2_lora.load_state_dict(model.lora_state_dict)
+
+            model.unet_lora.load_state_dict(model.lora_state_dict)
+            model.lora_state_dict = None
+
+        if config.text_encoder.train:
+            model.text_encoder_1_lora.set_dropout(config.dropout_probability)
+        if config.text_encoder_2.train:
+            model.text_encoder_2_lora.set_dropout(config.dropout_probability)
+        model.unet_lora.set_dropout(config.dropout_probability)
+
+        if create_te1:
+            model.text_encoder_1_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+            model.text_encoder_1_lora.hook_to_module()
+        if create_te2:
+            model.text_encoder_2_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+            model.text_encoder_2_lora.hook_to_module()
+
+        model.unet_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+        model.unet_lora.hook_to_module()
+
+        if config.rescale_noise_scheduler_to_zero_terminal_snr:
+            model.rescale_noise_scheduler_to_zero_terminal_snr()
+            model.force_v_prediction()
+
+        self._remove_added_embeddings_from_tokenizer(model.tokenizer_1)
+        self._remove_added_embeddings_from_tokenizer(model.tokenizer_2)
+        self._setup_embeddings(model, config)
+        self._setup_embedding_wrapper(model, config)
+        self.__setup_requires_grad(model, config)
+
+        init_model_parameters(model, self.create_parameters(model, config), self.train_device)
+
+    def setup_train_device(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+    ):
+        vae_on_train_device = not config.latent_caching # True se cache NÃO for DISK (GPU ou NONE)
+        text_encoder_1_on_train_device = config.train_text_encoder_or_embedding() or not config.latent_caching # True se treinando TE1/Emb OU cache NÃO for DISK
+        text_encoder_2_on_train_device = config.train_text_encoder_2_or_embedding() or not config.latent_caching # True se treinando TE2/Emb OU cache NÃO for DISK
+
+        model.text_encoder_1_to(self.train_device if text_encoder_1_on_train_device else self.temp_device)
+        model.text_encoder_2_to(self.train_device if text_encoder_2_on_train_device else self.temp_device)
+        model.vae_to(self.train_device if vae_on_train_device else self.temp_device)
+        model.unet_to(self.train_device)
+
+        if config.text_encoder.train:
+            model.text_encoder_1.train()
+        else:
+            model.text_encoder_1.eval()
+
+        if config.text_encoder_2.train:
+            model.text_encoder_2.train()
+        else:
+            model.text_encoder_2.eval()
+
+        model.vae.eval()
+
+        if config.unet.train:
+            model.unet.train()
+        else:
+            model.unet.eval()
+
+    def after_optimizer_step(self, model: StableDiffusionXLModel, config: TrainConfig, train_progress: TrainProgress):
+        if config.preserve_embedding_norm:
+            self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())
+            self._normalize_output_embeddings(model.all_text_encoder_2_embeddings())
+            model.embedding_wrapper_1.normalize_embeddings()
+            model.embedding_wrapper_2.normalize_embeddings()
+        self.__setup_requires_grad(model, config)
+            ```
+
+        +-- modules\modelSetup\flux/
+        +-- modules\modelSetup\mixin/
+        +-- modules\modelSetup\stableDiffusion3/
+    +-- modules\module/
+        +-- modules\module\quantized/
+            +-- modules\module\quantized\mixin/
+    +-- modules\trainer/
+        +-- modules\trainer\GenericTrainer.py
+            ```GenericTrainer.py
+import contextlib
+import copy
+import json
+import os
+import shutil
+import traceback
+from collections.abc import Callable
+from pathlib import Path
+
+from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.model.BaseModel import BaseModel
+from modules.modelLoader.BaseModelLoader import BaseModelLoader
+from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
+from modules.modelSaver.BaseModelSaver import BaseModelSaver
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.trainer.BaseTrainer import BaseTrainer
+from modules.util import create, path_util
+from modules.util.callbacks.TrainCallbacks import TrainCallbacks
+from modules.util.commands.TrainCommands import TrainCommands
+from modules.util.config.SampleConfig import SampleConfig
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
+from modules.util.enum.FileType import FileType
+from modules.util.enum.Cache import CacheMode
+from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.memory_util import TorchMemoryRecorder
+from modules.util.time_util import get_string_timestamp
+from modules.util.torch_util import torch_gc
+from modules.util.TrainProgress import TrainProgress
+
+import torch
+from torch import Tensor, nn
+from torch.nn import Parameter
+from torch.utils.hooks import RemovableHandle
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.transforms.functional import pil_to_tensor
+
+import huggingface_hub
+from requests.exceptions import ConnectionError
+from tqdm import tqdm
+
+class GenericTrainer(BaseTrainer):
+    model_loader: BaseModelLoader
+    model_setup: BaseModelSetup
+    data_loader: BaseDataLoader
+    model_saver: BaseModelSaver
+    model_sampler: BaseModelSampler
+    model: BaseModel | None
+    validation_data_loader: BaseDataLoader
+
+    previous_sample_time: float
+    sample_queue: list[Callable]
+
+    parameters: list[Parameter]
+
+    tensorboard: SummaryWriter
+
+    grad_hook_handles: list[RemovableHandle]
+
+    def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
+        super().__init__(config, callbacks, commands)
+
+        tensorboard_log_dir = os.path.join(config.workspace_dir, "tensorboard")
+        os.makedirs(Path(tensorboard_log_dir).absolute(), exist_ok=True)
+        self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, f"{config.save_filename_prefix}{get_string_timestamp()}"))
+        if config.tensorboard:
+            super()._start_tensorboard()
+
+        self.model = None
+        self.one_step_trained = False
+
+        self.grad_hook_handles = []
+
+    def start(self):
+        self.__save_config_to_workspace()
+
+        if self.config.clear_cache_before_training and self.config.cache_mode == CacheMode.DISK:
+            self.__clear_cache()
+
+        if self.config.train_dtype.enable_tf():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        self.model_loader = self.create_model_loader()
+        self.model_setup = self.create_model_setup()
+
+        self.callbacks.on_update_status("loading the model")
+
+        model_names = self.config.model_names()
+
+        if self.config.continue_last_backup:
+            self.callbacks.on_update_status("searching for previous backups")
+            last_backup_path = self.config.get_last_backup_path()
+
+            if last_backup_path:
+                if self.config.training_method == TrainingMethod.LORA:
+                    model_names.lora = last_backup_path
+                elif self.config.training_method == TrainingMethod.EMBEDDING:
+                    model_names.embedding.model_name = last_backup_path
+                else:  # fine-tunes
+                    model_names.base_model = last_backup_path
+
+                print(f"Continuing training from backup '{last_backup_path}'...")
+            else:
+                print("No backup found, continuing without backup...")
+
+        if self.config.secrets.huggingface_token != "":
+            self.callbacks.on_update_status("logging into Hugging Face")
+            with contextlib.suppress(ConnectionError):
+                huggingface_hub.login(
+                    token = self.config.secrets.huggingface_token,
+                    new_session = False,
+                )
+
+        self.callbacks.on_update_status("loading the model")
+        self.model = self.model_loader.load(
+            model_type=self.config.model_type,
+            model_names=model_names,
+            weight_dtypes=self.config.weight_dtypes(),
+        )
+        self.model.train_config = self.config
+
+        self.callbacks.on_update_status("running model setup")
+
+        self.model_setup.setup_optimizations(self.model, self.config)
+        self.model_setup.setup_train_device(self.model, self.config)
+        self.model_setup.setup_model(self.model, self.config)
+        self.model.to(self.temp_device)
+        self.model.eval()
+        torch_gc()
+
+        self.callbacks.on_update_status("creating the data loader/caching")
+
+        self.data_loader = self.create_data_loader(
+            self.model, self.model.train_progress
+        )
+
+        self.model_saver = self.create_model_saver()
+
+        self.model_sampler = self.create_model_sampler(self.model)
+        self.previous_sample_time = -1
+        self.sample_queue = []
+
+        self.parameters = self.model.parameters.parameters()
+        if self.config.validation:
+            self.validation_data_loader = self.create_data_loader(
+                self.model, self.model.train_progress, is_validation=True
+            )
+
+    def __save_config_to_workspace(self):
+        path = path_util.canonical_join(self.config.workspace_dir, "config")
+        os.makedirs(Path(path).absolute(), exist_ok=True)
+        path = path_util.canonical_join(path, f"{get_string_timestamp()}.json")
+        with open(path, "w") as f:
+            json.dump(self.config.to_pack_dict(secrets=False), f, indent=4)
+
+    def __clear_cache(self):
+        if self.config.cache_mode == CacheMode.DISK:
+            print(
+                 f'Clearing DISK cache directory {self.config.cache_dir}! '
+                 f'You can disable this in config `clear_cache_before_training`.'
+            )
+            if os.path.isdir(self.config.cache_dir):
+                 for filename in os.listdir(self.config.cache_dir):
+                     path = os.path.join(self.config.cache_dir, filename)
+                     if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                         try:
+                              shutil.rmtree(path)
+                         except OSError as e:
+                              print(f"Error removing directory {path}: {e}")
+        elif self.config.cache_mode == CacheMode.GPU:
+             print("GPU cache mode selected. Cache will be built in VRAM.")
+        else:
+             print("Cache mode is None. No cache clearing needed.")
+    def __prune_backups(self, backups_to_keep: int):
+        backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
+        if os.path.exists(backup_dirpath):
+            backup_directories = sorted(
+                [dirpath for dirpath in os.listdir(backup_dirpath) if
+                 os.path.isdir(os.path.join(backup_dirpath, dirpath))],
+                reverse=True,
+            )
+
+            for dirpath in backup_directories[backups_to_keep:]:
+                dirpath = os.path.join(backup_dirpath, dirpath)
+                try:
+                    shutil.rmtree(dirpath)
+                except Exception:
+                    print(f"Could not delete old rolling backup {dirpath}")
+
+        return
+
+    def __enqueue_sample_during_training(self, fun: Callable):
+        self.sample_queue.append(fun)
+
+    def __execute_sample_during_training(self):
+        for fun in self.sample_queue:
+            fun()
+        self.sample_queue = []
+
+    def __sample_loop(
+            self,
+            train_progress: TrainProgress,
+            train_device: torch.device,
+            sample_config_list: list[SampleConfig],
+            folder_postfix: str = "",
+            is_custom_sample: bool = False,
+    ):
+        for i, sample_config in enumerate(sample_config_list):
+            if sample_config.enabled:
+                try:
+                    safe_prompt = path_util.safe_filename(sample_config.prompt)
+
+                    if is_custom_sample:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            "custom",
+                        )
+                    else:
+                        sample_dir = os.path.join(
+                            self.config.workspace_dir,
+                            "samples",
+                            f"{str(i)} - {safe_prompt}{folder_postfix}",
+                        )
+
+                    sample_path = os.path.join(
+                        sample_dir,
+                        f"{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
+                    )
+
+                    def on_sample_default(sampler_output: ModelSamplerOutput):
+                        if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
+                            self.tensorboard.add_image(
+                                f"sample{str(i)} - {safe_prompt}", pil_to_tensor(sampler_output.data),  # noqa: B023
+                                train_progress.global_step
+                            )
+                        self.callbacks.on_sample_default(sampler_output)
+
+                    def on_sample_custom(sampler_output: ModelSamplerOutput):
+                        self.callbacks.on_sample_custom(sampler_output)
+
+                    on_sample = on_sample_custom if is_custom_sample else on_sample_default
+                    on_update_progress = self.callbacks.on_update_sample_custom_progress if is_custom_sample else self.callbacks.on_update_sample_default_progress
+
+                    self.model.to(self.temp_device)
+                    self.model.eval()
+
+                    sample_config = copy.copy(sample_config)
+                    sample_config.from_train_config(self.config)
+
+                    self.model_sampler.sample(
+                        sample_config=sample_config,
+                        destination=sample_path,
+                        image_format=self.config.sample_image_format,
+                        video_format=self.config.sample_video_format,
+                        audio_format=self.config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_update_progress=on_update_progress,
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    print("Error during sampling, proceeding without sampling")
+
+                torch_gc()
+
+    def __sample_during_training(
+            self,
+            train_progress: TrainProgress,
+            train_device: torch.device,
+            sample_params_list: list[SampleConfig] = None,
+    ):
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+        torch_gc()
+
+        self.callbacks.on_update_status("sampling")
+
+        is_custom_sample = False
+        if not sample_params_list:
+            if self.config.samples is not None:
+                sample_params_list = self.config.samples
+            else:
+                with open(self.config.sample_definition_file_name, 'r') as f:
+                    samples = json.load(f)
+                    for i in range(len(samples)):
+                        samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                    sample_params_list = samples
+        else:
+            is_custom_sample = True
+
+        if self.model.ema:
+            self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+
+        self.__sample_loop(
+            train_progress=train_progress,
+            train_device=train_device,
+            sample_config_list=sample_params_list,
+            is_custom_sample=is_custom_sample,
+        )
+
+        if self.model.ema:
+            self.model.ema.copy_temp_to(self.parameters)
+
+        if self.model.ema and not is_custom_sample and self.config.non_ema_sampling:
+            self.__sample_loop(
+                train_progress=train_progress,
+                train_device=train_device,
+                sample_config_list=sample_params_list,
+                folder_postfix=" - no-ema",
+            )
+
+        self.model_setup.setup_train_device(self.model, self.config)
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.train()
+
+        torch_gc()
+
+    def __validate(self, train_progress: TrainProgress):
+        if self.__needs_validate(train_progress):
+            self.validation_data_loader.get_data_set().start_next_epoch()
+            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+
+            if current_epoch_length_validation == 0:
+                return
+
+            self.callbacks.on_update_status("calculating validation loss")
+            self.model_setup.setup_train_device(self.model, self.config)
+
+            torch_gc()
+
+            step_tqdm_validation = tqdm(
+                self.validation_data_loader.get_data_loader(),
+                desc="validation_step",
+                total=current_epoch_length_validation)
+
+            accumulated_loss_per_concept = {}
+            concept_counts = {}
+            mapping_seed_to_label = {}
+            mapping_label_to_seed = {}
+
+            for validation_batch in step_tqdm_validation:
+                if self.__needs_gc(train_progress):
+                    torch_gc()
+
+                with torch.no_grad():
+                    model_output_data = self.model_setup.predict(
+                        self.model, validation_batch, self.config, train_progress, deterministic=True)
+                    loss_validation = self.model_setup.calculate_loss(
+                        self.model, validation_batch, model_output_data, self.config)
+
+                concept_name = validation_batch["concept_name"][0]
+                concept_path = validation_batch["concept_path"][0]
+                concept_seed = validation_batch["concept_seed"].item()
+                loss = loss_validation.item()
+
+                label = concept_name if concept_name else os.path.basename(concept_path)
+                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
+                    suffix = 1
+                    new_label = f"{label}({suffix})"
+                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
+                        suffix += 1
+                        new_label = f"{label}({suffix})"
+                    label = new_label
+
+                if concept_seed not in mapping_seed_to_label:
+                    mapping_seed_to_label[concept_seed] = label
+                    mapping_label_to_seed[label] = concept_seed
+
+                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
+                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+
+            for concept_seed, total_loss in accumulated_loss_per_concept.items():
+                average_loss = total_loss / concept_counts[concept_seed]
+
+                self.tensorboard.add_scalar(f"loss/validation_step/{mapping_seed_to_label[concept_seed]}",
+                                            average_loss,
+                                            train_progress.global_step)
+
+            if len(concept_counts) > 1:
+                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
+                total_count = sum(concept_counts[key] for key in concept_counts)
+                total_average_loss = total_loss / total_count
+
+                self.tensorboard.add_scalar("loss/validation_step/total_average",
+                                            total_average_loss,
+                                            train_progress.global_step)
+
+    def __save_backup_config(self, backup_path):
+        config_path = os.path.join(backup_path, "onetrainer_config")
+        args_path = path_util.canonical_join(config_path, "args.json")
+        concepts_path = path_util.canonical_join(config_path, "concepts.json")
+        samples_path = path_util.canonical_join(config_path, "samples.json")
+
+        os.makedirs(Path(config_path).absolute(), exist_ok=True)
+
+        with open(args_path, "w") as f:
+            json.dump(self.config.to_settings_dict(secrets=False), f, indent=4)
+        if os.path.isfile(self.config.concept_file_name):
+            shutil.copy2(self.config.concept_file_name, concepts_path)
+        if os.path.isfile(self.config.sample_definition_file_name):
+            shutil.copy2(self.config.sample_definition_file_name, samples_path)
+
+    def backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        torch_gc()
+
+        self.callbacks.on_update_status("creating backup")
+
+        backup_name = f"{get_string_timestamp()}-backup-{train_progress.filename_string()}"
+        backup_path = os.path.join(self.config.workspace_dir, "backup", backup_name)
+
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+
+        try:
+            if print_msg:
+                print_cb("Creating Backup " + backup_path)
+
+            self.model_saver.save(
+                self.model,
+                self.config.model_type,
+                ModelFormat.INTERNAL,
+                backup_path,
+                None,
+            )
+
+            self.__save_backup_config(backup_path)
+        except Exception:
+            traceback.print_exc()
+            print("Could not save backup. Check your disk space!")
+            try:
+                if os.path.isdir(backup_path):
+                    shutil.rmtree(backup_path)
+            except Exception:
+                traceback.print_exc()
+                print("Could not delete partial backup")
+        finally:
+            if self.config.rolling_backup:
+                self.__prune_backups(self.config.rolling_backup_count)
+
+        self.model_setup.setup_train_device(self.model, self.config)
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.train()
+
+        torch_gc()
+
+    def save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        torch_gc()
+
+        self.callbacks.on_update_status("saving")
+
+        save_path = os.path.join(
+            self.config.workspace_dir,
+            "save",
+            f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{train_progress.filename_string()}{self.config.output_model_format.file_extension()}"
+        )
+        if print_msg:
+            print_cb("Saving " + save_path)
+
+        try:
+            if self.model.ema:
+                self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.eval()
+            self.model_saver.save(
+                model=self.model,
+                model_type=self.config.model_type,
+                output_model_format=self.config.output_model_format,
+                output_model_destination=save_path,
+                dtype=self.config.output_dtype.torch_dtype()
+            )
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.train()
+        except Exception:
+            traceback.print_exc()
+            print("Could not save model. Check your disk space!")
+            try:
+                if os.path.isfile(save_path):
+                    shutil.rmtree(save_path)
+            except Exception:
+                traceback.print_exc()
+                print("Could not delete partial save")
+        finally:
+            if self.model.ema:
+                self.model.ema.copy_temp_to(self.parameters)
+
+        torch_gc()
+
+    def __needs_sample(self, train_progress: TrainProgress):
+        return self.single_action_elapsed(
+            "sample_skip_first", self.config.sample_skip_first, self.config.sample_after_unit, train_progress
+        ) and self.repeating_action_needed(
+            "sample", self.config.sample_after, self.config.sample_after_unit, train_progress
+        )
+
+    def __needs_backup(self, train_progress: TrainProgress):
+        return self.repeating_action_needed(
+            "backup", self.config.backup_after, self.config.backup_after_unit, train_progress, start_at_zero=False
+        )
+
+    def __needs_save(self, train_progress: TrainProgress):
+        return self.single_action_elapsed(
+            "save_skip_first", self.config.save_skip_first, self.config.save_every_unit, train_progress
+        ) and self.repeating_action_needed(
+            "save", self.config.save_every, self.config.save_every_unit, train_progress, start_at_zero=False
+        )
+
+    def __needs_gc(self, train_progress: TrainProgress):
+        return self.repeating_action_needed("gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False)
+
+    def __needs_validate(self, train_progress: TrainProgress):
+        return self.repeating_action_needed(
+            "validate", self.config.validate_after, self.config.validate_after_unit, train_progress
+        )
+
+    def __is_update_step(self, train_progress: TrainProgress) -> bool:
+        return self.repeating_action_needed(
+            "update_step", self.config.gradient_accumulation_steps, TimeUnit.STEP, train_progress, start_at_zero=False
+        )
+
+    def __apply_fused_back_pass(self, scaler):
+        if self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+            if self.config.gradient_accumulation_steps > 1:
+                print("Warning: activating fused_back_pass with gradient_accumulation_steps > 1 does not reduce VRAM usage.")
+
+            for param_group in self.model.optimizer.param_groups:
+                for i, parameter in enumerate(param_group["params"]):
+                    if parameter.requires_grad:
+                        if scaler:
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                                if self.__is_update_step(self.model.train_progress):
+                                    scaler.unscale_parameter_(tensor, self.model.optimizer)
+                                    if self.config.clip_grad_norm is not None:
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
+                                    tensor.grad = None
+                        else:
+                            def __grad_hook(tensor: Tensor, param_group=param_group, i=i):
+                                if self.__is_update_step(self.model.train_progress):
+                                    if self.config.clip_grad_norm is not None:
+                                        nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                                    self.model.optimizer.step_parameter(tensor, param_group, i)
+                                    tensor.grad = None
+
+                        handle = parameter.register_post_accumulate_grad_hook(__grad_hook)
+                        self.grad_hook_handles.append(handle)
+
+    def __before_eval(self):
+        if self.config.optimizer.optimizer.is_schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+
+    def train(self):
+        train_device = torch.device(self.config.train_device)
+
+        train_progress = self.model.train_progress
+
+        if self.config.only_cache:
+            self.callbacks.on_update_status("caching")
+            for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+                self.data_loader.get_data_set().start_next_epoch()
+            return
+
+        scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+
+        self.__apply_fused_back_pass(scaler)
+
+        has_gradient = False
+
+        lr_scheduler = None
+        accumulated_loss = 0.0
+        ema_loss = None
+        ema_loss_steps = 0
+        for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
+            self.callbacks.on_update_status("starting epoch/caching")
+
+            if self.config.cache_mode != CacheMode.NONE:
+                self.data_loader.get_data_set().start_next_epoch()
+                self.model_setup.setup_train_device(self.model, self.config)
+            else:
+                self.model_setup.setup_train_device(self.model, self.config)
+                self.data_loader.get_data_set().start_next_epoch()
+
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.train()
+
+            torch_gc()
+
+            if lr_scheduler is None:
+                lr_scheduler = create.create_lr_scheduler(
+                    config=self.config,
+                    optimizer=self.model.optimizer,
+                    learning_rate_scheduler=self.config.learning_rate_scheduler,
+                    warmup_steps=self.config.learning_rate_warmup_steps,
+                    num_cycles=self.config.learning_rate_cycles,
+                    min_factor=self.config.learning_rate_min_factor,
+                    num_epochs=self.config.epochs,
+                    approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
+                    batch_size=self.config.batch_size,
+                    gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                    global_step=train_progress.global_step
+                )
+
+            current_epoch_length = self.data_loader.get_data_set().approximate_length()
+            step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
+                             initial=train_progress.epoch_step)
+            for batch in step_tqdm:
+                if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                    self.__enqueue_sample_during_training(
+                        lambda: self.__sample_during_training(train_progress, train_device)
+                    )
+
+                if self.__needs_backup(train_progress):
+                    self.commands.backup()
+
+                if self.__needs_save(train_progress):
+                    self.commands.save()
+
+                sample_commands = self.commands.get_and_reset_sample_custom_commands()
+                if sample_commands:
+                    def create_sample_commands_fun(sample_commands):
+                        def sample_commands_fun():
+                            self.__sample_during_training(train_progress, train_device, sample_commands)
+
+                        return sample_commands_fun
+
+                    self.__enqueue_sample_during_training(create_sample_commands_fun(sample_commands))
+
+                if self.__needs_gc(train_progress):
+                    torch_gc()
+
+                if not has_gradient:
+                    self.__execute_sample_during_training()
+                    transferred_to_temp_device = False
+
+                    if self.commands.get_and_reset_backup_command():
+                        self.model.to(self.temp_device)
+                        self.backup(train_progress, True, step_tqdm.write)
+                        transferred_to_temp_device = True
+
+                    if self.commands.get_and_reset_save_command():
+                        self.model.to(self.temp_device)
+                        self.save(train_progress, True, step_tqdm.write)
+                        transferred_to_temp_device = True
+
+                    if transferred_to_temp_device:
+                        self.model_setup.setup_train_device(self.model, self.config)
+
+                self.callbacks.on_update_status("training")
+
+                with TorchMemoryRecorder(enabled=False):
+                    model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
+
+                    loss = loss / self.config.gradient_accumulation_steps
+                    if scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                    has_gradient = True
+                    accumulated_loss += loss.item()
+
+                    if self.__is_update_step(train_progress):
+                        if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                            scaler.step_after_unscale_parameter_(self.model.optimizer)
+                            scaler.update()
+                        elif scaler:
+                            scaler.unscale_(self.model.optimizer)
+                            if self.config.clip_grad_norm is not None:
+                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            scaler.step(self.model.optimizer)
+                            scaler.update()
+                        else:
+                            if self.config.clip_grad_norm is not None:
+                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            self.model.optimizer.step()
+
+                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                        self.model.optimizer.zero_grad(set_to_none=True)
+                        has_gradient = False
+
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler, self.tensorboard
+                        )
+
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+
+                        if not (self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass()):
+                            if scaler:
+                                scaler.unscale_(self.model.optimizer)
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                scaler.step(self.model.optimizer)
+                            else:
+                                if self.config.clip_grad_norm is not None:
+                                    nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                self.model.optimizer.step()
+
+                            self.model.optimizer.zero_grad(set_to_none=True)
+                            has_gradient = False # Gradients are gone now
+
+                        if scaler:
+                             scaler.update()
+
+                        lr_scheduler.step()
+
+                        if self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass():
+                             self.model.optimizer.zero_grad(set_to_none=True)
+                             has_gradient = False # Ensure flag is correct
+
+                        self.model_setup.report_to_tensorboard(
+                            self.model, self.config, lr_scheduler, self.tensorboard
+                        )
+
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+
+                        ema_loss = ema_loss or accumulated_loss
+                        ema_loss_steps += 1
+                        ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
+                        ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss * (1 - ema_loss_decay))
+                        step_tqdm.set_postfix({
+                            'loss': accumulated_loss,
+                            'smooth loss': ema_loss,
+                        })
+                        self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                        accumulated_loss = 0.0
+
+                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        if self.model.ema:
+                            update_step = train_progress.global_step // self.config.gradient_accumulation_steps
+                            self.tensorboard.add_scalar(
+                                "ema_decay",
+                                self.model.ema.get_current_decay(update_step),
+                                train_progress.global_step
+                            )
+                            self.model.ema.step(
+                                self.parameters,
+                                update_step
+                            )
+
+                        self.one_step_trained = True
+
+                if self.config.validation:
+                    self.__validate(train_progress)
+
+                train_progress.next_step(self.config.batch_size)
+                self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+                if self.commands.get_stop_command():
+                    return
+
+            train_progress.next_epoch()
+            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
+            if self.commands.get_stop_command():
+                return
+
+    def end(self):
+        if self.one_step_trained:
+            self.model.to(self.temp_device)
+
+            if self.config.backup_before_save:
+                self.backup(self.model.train_progress)
+            if self.config.optimizer.optimizer.is_schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.eval()
+
+            self.callbacks.on_update_status("saving the final model")
+
+            if self.model.ema:
+                self.model.ema.copy_ema_to(self.parameters, store_temp=False)
+            if os.path.isdir(self.config.output_model_destination) and self.config.output_model_format.is_single_file():
+                save_path = os.path.join(
+                    self.config.output_model_destination,
+                    f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}"
+                )
+            else:
+                save_path = self.config.output_model_destination
+            print("Saving " + save_path)
+
+            self.model_saver.save(
+                model=self.model,
+                model_type=self.config.model_type,
+                output_model_format=self.config.output_model_format,
+                output_model_destination=save_path,
+                dtype=self.config.output_dtype.torch_dtype()
+            )
+        elif self.model is not None:
+            self.model.to(self.temp_device)
+
+        self.tensorboard.close()
+
+        if self.config.tensorboard:
+            super()._stop_tensorboard()
+
+        for handle in self.grad_hook_handles:
+            handle.remove()
+            ```
+
+    +-- modules\ui/
+    +-- modules\util/
+        +-- modules\util\args/
+        +-- modules\util\callbacks/
+        +-- modules\util\commands/
+        +-- modules\util\config/
+            +-- modules\util\config\TrainConfig.py
+                ```TrainConfig.py
+import json
+import os
+import uuid
+from copy import deepcopy
+from typing import Any
+
+from modules.util.config.BaseConfig import BaseConfig
+from modules.util.config.CloudConfig import CloudConfig
+from modules.util.config.CloudConfig import CloudConfig
+from modules.util.config.ConceptConfig import ConceptConfig
+from modules.util.config.SampleConfig import SampleConfig
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.enum.Cache import CacheMode
+from modules.util.enum.ConfigPart import ConfigPart
+from modules.util.enum.DataType import DataType
+from modules.util.enum.EMAMode import EMAMode
+from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+from modules.util.enum.ImageFormat import ImageFormat
+from modules.util.enum.LearningRateScaler import LearningRateScaler
+from modules.util.enum.LearningRateScheduler import LearningRateScheduler
+from modules.util.enum.LossScaler import LossScaler
+from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.LossMode import LossMode
+from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import ModelType, PeftType
+from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.TimestepDistribution import TimestepDistribution
+from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.ModelNames import EmbeddingName, ModelNames
+from modules.util.ModelWeightDtypes import ModelWeightDtypes
+from modules.util.torch_util import default_device
+
+class TrainOptimizerConfig(BaseConfig):
+    optimizer: Optimizer
+    adam_w_mode: bool
+    alpha: float
+    amsgrad: bool
+    beta1: float
+    beta2: float
+    beta3: float
+    bias_correction: bool
+    block_wise: bool
+    capturable: bool
+    centered: bool
+    clip_threshold: float
+    d0: float
+    d_coef: float
+    dampening: float
+    decay_rate: float
+    decouple: bool
+    differentiable: bool
+    eps: float
+    eps2: float
+    foreach: bool
+    fsdp_in_use: bool
+    fused: bool
+    fused_back_pass: bool
+    growth_rate: float
+    initial_accumulator_value: int
+    initial_accumulator: float
+    is_paged: bool
+    log_every: int
+    lr_decay: float
+    max_unorm: float
+    maximize: bool
+    min_8bit_size: int
+    momentum: float
+    nesterov: bool
+    no_prox: bool
+    optim_bits: int
+    percentile_clipping: int
+    percentile_clipping: int
+    r: float
+    relative_step: bool
+    safeguard_warmup: bool
+    scale_parameter: bool
+    stochastic_rounding: bool
+    use_bias_correction: bool
+    use_triton: bool
+    warmup_init: bool
+    weight_decay: float
+    weight_lr_power: float
+    decoupled_decay: bool
+    fixed_decay: bool
+    weight_decouple: bool
+    rectify: bool
+    degenerated_to_sgd: bool
+    k: int
+    xi: float
+    n_sma_threshold: int
+    ams_bound: bool
+    r: float
+    adanorm: bool
+    adam_debias: bool
+    slice_p: int
+    cautious: bool
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("optimizer", Optimizer.ADAMW, Optimizer, False))
+        data.append(("adam_w_mode", False, bool, False))
+        data.append(("alpha", None, float, True))
+        data.append(("amsgrad", False, bool, False))
+        data.append(("beta1", None, float, True))
+        data.append(("beta2", None, float, True))
+        data.append(("beta3", None, float, True))
+        data.append(("bias_correction", False, bool, False))
+        data.append(("block_wise", False, bool, False))
+        data.append(("capturable", False, bool, False))
+        data.append(("centered", False, bool, False))
+        data.append(("clip_threshold", None, float, True))
+        data.append(("d0", None, float, True))
+        data.append(("d_coef", None, float, True))
+        data.append(("dampening", None, float, True))
+        data.append(("decay_rate", None, float, True))
+        data.append(("decouple", False, bool, False))
+        data.append(("differentiable", False, bool, False))
+        data.append(("eps", None, float, True))
+        data.append(("eps2", None, float, True))
+        data.append(("foreach", False, bool, True))  # Disabled, because it uses too much VRAM
+        data.append(("fsdp_in_use", False, bool, False))
+        data.append(("fused", False, bool, False))
+        data.append(("fused_back_pass", False, bool, False))
+        data.append(("growth_rate", None, float, True))
+        data.append(("initial_accumulator_value", None, int, True))
+        data.append(("initial_accumulator", None, float, True))
+        data.append(("is_paged", False, bool, False))
+        data.append(("log_every", None, int, True))
+        data.append(("lr_decay", None, float, True))
+        data.append(("max_unorm", None, float, True))
+        data.append(("maximize", False, bool, False))
+        data.append(("min_8bit_size", None, int, True))
+        data.append(("momentum", None, float, True))
+        data.append(("nesterov", False, bool, False))
+        data.append(("no_prox", False, bool, False))
+        data.append(("optim_bits", None, int, True))
+        data.append(("percentile_clipping", None, int, True))
+        data.append(("percentile_clipping", None, int, True))
+        data.append(("r", None, float, True))
+        data.append(("relative_step", False, bool, False))
+        data.append(("safeguard_warmup", False, bool, False))
+        data.append(("scale_parameter", False, bool, False))
+        data.append(("stochastic_rounding", True, bool, False))
+        data.append(("use_bias_correction", False, bool, False))
+        data.append(("use_triton", False, bool, False))
+        data.append(("warmup_init", False, bool, False))
+        data.append(("weight_decay", None, float, True))
+        data.append(("weight_lr_power", None, float, True))
+        data.append(("decoupled_decay", False, bool, False))
+        data.append(("fixed_decay", False, bool, False))
+        data.append(("rectify", False, bool, False))
+        data.append(("degenerated_to_sgd", False, bool, False))
+        data.append(("k", None, int, True))
+        data.append(("xi", None, float, True))
+        data.append(("n_sma_threshold", None, int, True))
+        data.append(("ams_bound", False, bool, False))
+        data.append(("adanorm", False, bool, False))
+        data.append(("adam_debias", False, bool, False))
+        data.append(("slice_p", None, int, True))
+        data.append(("cautious", False, bool, False))
+
+        return TrainOptimizerConfig(data)
+
+class TrainModelPartConfig(BaseConfig):
+    model_name: str
+    include: bool
+    train: bool
+    stop_training_after: int
+    stop_training_after_unit: TimeUnit
+    learning_rate: float
+    weight_dtype: DataType
+    dropout_probability: float
+    train_embedding: bool
+    attention_mask: bool
+    guidance_scale: float
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("model_name", "", str, False))
+        data.append(("include", True, bool, False))
+        data.append(("train", True, bool, False))
+        data.append(("stop_training_after", None, int, True))
+        data.append(("stop_training_after_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("learning_rate", None, float, True))
+        data.append(("weight_dtype", DataType.NONE, DataType, False))
+        data.append(("dropout_probability", 0.0, float, False))
+        data.append(("train_embedding", True, bool, False))
+        data.append(("attention_mask", False, bool, False))
+        data.append(("guidance_scale", 1.0, float, False))
+
+        return TrainModelPartConfig(data)
+
+class TrainEmbeddingConfig(BaseConfig):
+    uuid: str
+    model_name: str
+    placeholder: str
+    train: bool
+    stop_training_after: int
+    stop_training_after_unit: TimeUnit
+    token_count: int | None
+    initial_embedding_text: str
+    is_output_embedding: bool
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        data.append(("uuid", str(uuid.uuid4()), str, False))
+        data.append(("model_name", "", str, False))
+        data.append(("placeholder", "<embedding>", str, False))
+        data.append(("train", True, bool, False))
+        data.append(("stop_training_after", None, int, True))
+        data.append(("stop_training_after_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("token_count", 1, int, True))
+        data.append(("initial_embedding_text", "*", str, False))
+        data.append(("is_output_embedding", False, bool, False))
+
+        return TrainEmbeddingConfig(data)
+
+class TrainConfig(BaseConfig):
+    training_method: TrainingMethod
+    model_type: ModelType
+    debug_mode: bool
+    debug_dir: str
+    workspace_dir: str
+    cache_dir: str
+    tensorboard: bool
+    tensorboard_expose: bool
+    tensorboard_port: str
+    validation: bool
+    validate_after: float
+    validate_after_unit: TimeUnit
+    continue_last_backup: bool
+    include_train_config: ConfigPart
+
+    base_model_name: str
+    weight_dtype: DataType
+    output_dtype: DataType
+    output_model_format: ModelFormat
+    output_model_destination: str
+    gradient_checkpointing: GradientCheckpointingMethod
+    gradient_checkpointing_layers: list[str]
+    enable_async_offloading: bool
+    enable_activation_offloading: bool
+    layer_offload_fraction: float
+    force_circular_padding: bool
+
+    concept_file_name: str
+    concepts: list[ConceptConfig]
+    aspect_ratio_bucketing: bool
+    cache_mode: CacheMode
+    latent_caching: bool
+    clear_cache_before_training: bool
+
+    learning_rate_scheduler: LearningRateScheduler
+    custom_learning_rate_scheduler: str | None
+    scheduler_params: list[dict[str, str]]
+    learning_rate: float
+    learning_rate_warmup_steps: float
+    learning_rate_cycles: float
+    learning_rate_min_factor: float
+    learning_rate_min_factor: float
+    epochs: int
+    batch_size: int
+    gradient_accumulation_steps: int
+    ema: EMAMode
+    ema_decay: float
+    ema_update_step_interval: int
+    dataloader_threads: int
+    train_device: str
+    temp_device: str
+    train_dtype: DataType
+    fallback_train_dtype: DataType
+    enable_autocast_cache: bool
+    only_cache: bool
+    resolution: str
+    frames: str
+    loss_mode_fn: LossMode
+    mse_strength: float
+    mae_strength: float
+    log_cosh_strength: float
+    vb_loss_strength: float
+    loss_weight_fn: LossWeight
+    loss_weight_strength: float
+    dropout_probability: float
+    loss_scaler: LossScaler
+    learning_rate_scaler: LearningRateScaler
+    clip_grad_norm: float
+
+    offset_noise_weight: float
+    perturbation_noise_weight: float
+    rescale_noise_scheduler_to_zero_terminal_snr: bool
+    force_v_prediction: bool
+    force_epsilon_prediction: bool
+    timestep_distribution: TimestepDistribution
+    min_noising_strength: float
+    max_noising_strength: float
+
+    noising_weight: float
+    noising_bias: float
+
+    timestep_shift: float
+    dynamic_timestep_shifting: bool
+
+    unet: TrainModelPartConfig
+
+    prior: TrainModelPartConfig
+
+    text_encoder: TrainModelPartConfig
+    text_encoder_layer_skip: int
+
+    text_encoder_2: TrainModelPartConfig
+    text_encoder_2_layer_skip: int
+
+    text_encoder_3: TrainModelPartConfig
+    text_encoder_3_layer_skip: int
+
+    vae: TrainModelPartConfig
+
+    effnet_encoder: TrainModelPartConfig
+
+    decoder: TrainModelPartConfig
+
+    decoder_text_encoder: TrainModelPartConfig
+
+    decoder_vqgan: TrainModelPartConfig
+
+    masked_training: bool
+    unmasked_probability: float
+    unmasked_weight: float
+    normalize_masked_area_loss: bool
+
+    embedding_learning_rate: float
+    preserve_embedding_norm: bool
+    embedding: TrainEmbeddingConfig
+    additional_embeddings: list[TrainEmbeddingConfig]
+    embedding_weight_dtype: DataType
+
+    peft_type: PeftType
+    lora_model_name: str
+    lora_rank: int
+    lora_alpha: float
+    lora_decompose: bool
+    lora_decompose_norm_epsilon: bool
+    lora_weight_dtype: DataType
+    lora_layers: str  # comma-separated
+    lora_layer_preset: str
+    bundle_additional_embeddings: bool
+
+    optimizer: TrainOptimizerConfig
+    optimizer_defaults: dict[str, TrainOptimizerConfig]
+
+    sample_definition_file_name: str
+    samples: list[SampleConfig]
+    sample_after: float
+    sample_after_unit: TimeUnit
+    sample_skip_first: int
+    sample_image_format: ImageFormat
+    sample_video_format: VideoFormat
+    sample_audio_format: AudioFormat
+    samples_to_tensorboard: bool
+    non_ema_sampling: bool
+
+    cloud: CloudConfig
+
+    backup_after: float
+    backup_after_unit: TimeUnit
+    rolling_backup: bool
+    rolling_backup_count: int
+    backup_before_save: bool
+    save_every: int
+    save_every_unit: TimeUnit
+    save_skip_first: int
+    save_filename_prefix: str
+
+    secrets: SecretsConfig
+
+    def latent_caching(self) -> bool:
+        """
+        Determina se o cache de latentes está ativo (apenas para o modo DISK).
+        Esta é uma propriedade derivada de `cache_mode`.
+        """
+        return self.cache_mode == CacheMode.DISK
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(
+            data,
+            config_version=7,
+            config_migrations={
+                0: self.__migration_0,
+                1: self.__migration_1,
+                2: self.__migration_2,
+                3: self.__migration_3,
+                4: self.__migration_4,
+                5: self.__migration_5,
+                5: self.__migration_6,
+            }
+        )
+
+    def __migration_0(self, data: dict) -> dict:
+        optimizer_settings = {}
+        migrated_data = {}
+        for key, value in data.items():
+            if key == 'optimizer':
+                optimizer_settings['optimizer'] = value
+            elif key.startswith('optimizer'):
+                optimizer_settings[key.removeprefix('optimizer_')] = value
+            else:
+                migrated_data[key] = value
+
+        if 'optimizer' in optimizer_settings:
+            migrated_data['optimizer'] = optimizer_settings
+            migrated_data['optimizer_defaults'] = {
+                optimizer_settings['optimizer']: deepcopy(optimizer_settings)
+            }
+
+        return migrated_data
+
+    def __migration_1(self, data: dict) -> dict:
+        migrated_data = {
+            "unet": {},
+            "prior": {},
+            "text_encoder": {},
+            "text_encoder_2": {},
+            "vae": {},
+            "effnet_encoder": {},
+            "decoder": {},
+            "decoder_text_encoder": {},
+            "decoder_vqgan": {},
+            "embeddings": [{}],
+        }
+
+        for key, value in data.items():
+            if key == "train_unet":
+                migrated_data["unet"]["train"] = value
+            elif key == "train_unet_epochs":
+                migrated_data["unet"]["stop_training_after"] = value
+                migrated_data["unet"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "unet_learning_rate":
+                migrated_data["unet"]["learning_rate"] = value
+            elif key == "unet_weight_dtype":
+                migrated_data["unet"]["weight_dtype"] = value
+
+            elif key == "train_prior":
+                migrated_data["prior"]["train"] = value
+            elif key == "prior_model_name":
+                migrated_data["prior"]["model_name"] = value
+            elif key == "train_prior_epochs":
+                migrated_data["prior"]["stop_training_after"] = value
+                migrated_data["prior"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "prior_learning_rate":
+                migrated_data["prior"]["learning_rate"] = value
+            elif key == "prior_weight_dtype":
+                migrated_data["prior"]["weight_dtype"] = value
+
+            elif key == "train_text_encoder":
+                migrated_data["text_encoder"]["train"] = value
+            elif key == "train_text_encoder_epochs":
+                migrated_data["text_encoder"]["stop_training_after"] = value
+                migrated_data["text_encoder"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "text_encoder_learning_rate":
+                migrated_data["text_encoder"]["learning_rate"] = value
+            elif key == "text_encoder_weight_dtype":
+                migrated_data["text_encoder"]["weight_dtype"] = value
+
+            elif key == "train_text_encoder_2":
+                migrated_data["text_encoder_2"]["train"] = value
+            elif key == "train_text_encoder_2_epochs":
+                migrated_data["text_encoder_2"]["stop_training_after"] = value
+                migrated_data["text_encoder_2"]["stop_training_after_unit"] = TimeUnit.EPOCH
+            elif key == "text_encoder_2_learning_rate":
+                migrated_data["text_encoder_2"]["learning_rate"] = value
+            elif key == "text_encoder_2_weight_dtype":
+                migrated_data["text_encoder_2"]["weight_dtype"] = value
+
+            elif key == "vae_model_name":
+                migrated_data["vae"]["model_name"] = value
+            elif key == "vae_weight_dtype":
+                migrated_data["vae"]["weight_dtype"] = value
+
+            elif key == "effnet_encoder_model_name":
+                migrated_data["effnet_encoder"]["model_name"] = value
+            elif key == "effnet_encoder_weight_dtype":
+                migrated_data["effnet_encoder"]["weight_dtype"] = value
+
+            elif key == "decoder_model_name":
+                migrated_data["decoder"]["model_name"] = value
+            elif key == "decoder_weight_dtype":
+                migrated_data["decoder"]["weight_dtype"] = value
+
+            elif key == "decoder_text_encoder_weight_dtype":
+                migrated_data["decoder_text_encoder"]["weight_dtype"] = value
+
+            elif key == "decoder_vqgan_weight_dtype":
+                migrated_data["decoder_vqgan"]["weight_dtype"] = value
+
+            elif key == "embedding_model_names" and len(value) > 0:
+                migrated_data["embeddings"][0]["model_name"] = value[0]
+            elif key == "token_count":
+                migrated_data["embeddings"][0]["token_count"] = value
+            elif key == "initial_embedding_text":
+                migrated_data["embeddings"][0]["initial_embedding_text"] = value
+
+            else:
+                migrated_data[key] = value
+
+        return migrated_data
+
+    def __migration_2(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        min_snr_gamma = migrated_data.pop("min_snr_gamma", 0.0)
+        model_type = ModelType(migrated_data.get("model_type", ModelType.STABLE_DIFFUSION_15))
+        if min_snr_gamma:
+            migrated_data["loss_weight_fn"] = LossWeight.MIN_SNR_GAMMA
+            migrated_data["loss_weight_strength"] = min_snr_gamma
+        elif model_type.is_wuerstchen():
+            migrated_data["loss_weight_fn"] = LossWeight.P2
+            migrated_data["loss_weight_strength"] = 1.0
+
+        return migrated_data
+
+    def __migration_3(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        noising_weight = migrated_data.pop("noising_weight", 0.0)
+        noising_bias = migrated_data.pop("noising_bias", 0.5)
+
+        if noising_weight != 0:
+            migrated_data["timestep_distribution"] = TimestepDistribution.SIGMOID
+            migrated_data["noising_weight"] = noising_weight
+            migrated_data["noising_bias"] = noising_bias - 0.5
+        else:
+            migrated_data["timestep_distribution"] = TimestepDistribution.UNIFORM
+            migrated_data["noising_weight"] = 0.0
+            migrated_data["noising_bias"] = 0.0
+
+        return migrated_data
+
+    def __migration_4(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        gradient_checkpointing = migrated_data.pop("gradient_checkpointing", True)
+
+        if gradient_checkpointing:
+            migrated_data["gradient_checkpointing"] = GradientCheckpointingMethod.ON
+        else:
+            migrated_data["gradient_checkpointing"] = GradientCheckpointingMethod.OFF
+
+        return migrated_data
+
+    def __migration_5(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        if "save_after" in migrated_data:
+            migrated_data["save_every"] = migrated_data.pop("save_after")
+        if "save_after_unit" in migrated_data:
+            migrated_data["save_every_unit"] = migrated_data.pop("save_after_unit")
+
+        return migrated_data
+
+    def __migration_6(self, data: dict) -> dict: # <<< FUNÇÃO ALTERADA ABAIXO >>>
+        """Migra do latent_caching booleano antigo para cache_mode enum."""
+        migrated_data = data.copy()
+
+        old_latent_caching_value = migrated_data.pop("latent_caching", None)
+
+        if old_latent_caching_value is not None:
+            if old_latent_caching_value:
+                new_cache_mode = CacheMode.DISK
+            else:
+                new_cache_mode = CacheMode.NONE
+
+            migrated_data["cache_mode"] = new_cache_mode.value # Salva como string
+
+            print(f"Migração 6: old latent_caching={old_latent_caching_value} -> cache_mode='{new_cache_mode.value}'. O novo 'latent_caching' será derivado.")
+        elif "cache_mode" not in migrated_data:
+             migrated_data["cache_mode"] = CacheMode.DISK.value
+             print(f"Migração 6: Nenhum valor 'latent_caching' ou 'cache_mode' encontrado. Definindo cache_mode='{CacheMode.DISK.value}' por padrão. O 'latent_caching' será derivado.")
+        else:
+             print(f"Migração 6: 'cache_mode' já existe ('{migrated_data['cache_mode']}'). Nenhuma alteração de migração necessária para cache_mode. O 'latent_caching' será derivado.")
+
+        return migrated_data
+
+    def weight_dtypes(self) -> ModelWeightDtypes:
+        return ModelWeightDtypes(
+            self.train_dtype,
+            self.fallback_train_dtype,
+            self.weight_dtype if self.unet.weight_dtype == DataType.NONE else self.unet.weight_dtype,
+            self.weight_dtype if self.prior.weight_dtype == DataType.NONE else self.prior.weight_dtype,
+            self.weight_dtype if self.text_encoder.weight_dtype == DataType.NONE else self.text_encoder.weight_dtype,
+            self.weight_dtype if self.text_encoder_2.weight_dtype == DataType.NONE else self.text_encoder_2.weight_dtype,
+            self.weight_dtype if self.text_encoder_3.weight_dtype == DataType.NONE else self.text_encoder_3.weight_dtype,
+            self.weight_dtype if self.vae.weight_dtype == DataType.NONE else self.vae.weight_dtype,
+            self.weight_dtype if self.effnet_encoder.weight_dtype == DataType.NONE else self.effnet_encoder.weight_dtype,
+            self.weight_dtype if self.decoder.weight_dtype == DataType.NONE else self.decoder.weight_dtype,
+            self.weight_dtype if self.decoder_text_encoder.weight_dtype == DataType.NONE else self.decoder_text_encoder.weight_dtype,
+            self.weight_dtype if self.decoder_vqgan.weight_dtype == DataType.NONE else self.decoder_vqgan.weight_dtype,
+            self.weight_dtype if self.lora_weight_dtype == DataType.NONE else self.lora_weight_dtype,
+            self.weight_dtype if self.embedding_weight_dtype == DataType.NONE else self.embedding_weight_dtype,
+        )
+
+    def model_names(self) -> ModelNames:
+        return ModelNames(
+            base_model=self.base_model_name,
+            prior_model=self.prior.model_name,
+            effnet_encoder_model=self.effnet_encoder.model_name,
+            decoder_model=self.decoder.model_name,
+            vae_model=self.vae.model_name,
+            lora=self.lora_model_name,
+            embedding=EmbeddingName(self.embedding.uuid, self.embedding.model_name) \
+                if self.training_method == TrainingMethod.EMBEDDING else None,
+            additional_embeddings=[EmbeddingName(embedding.uuid, embedding.model_name) for embedding in
+                                   self.additional_embeddings],
+            include_text_encoder=self.text_encoder.include,
+            include_text_encoder_2=self.text_encoder_2.include,
+            include_text_encoder_3=self.text_encoder_3.include,
+        )
+
+    def train_any_embedding(self) -> bool:
+        return ((self.training_method == TrainingMethod.EMBEDDING) and not self.embedding.is_output_embedding) \
+            or any((embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings)
+
+    def train_any_output_embedding(self) -> bool:
+        return ((self.training_method == TrainingMethod.EMBEDDING) and self.embedding.is_output_embedding) \
+            or any((embedding.train and embedding.is_output_embedding) for embedding in self.additional_embeddings)
+
+    def train_text_encoder_or_embedding(self) -> bool:
+        return (self.text_encoder.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def train_text_encoder_2_or_embedding(self) -> bool:
+        return (self.text_encoder_2.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder_2.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def train_text_encoder_3_or_embedding(self) -> bool:
+        return (self.text_encoder_3.train and self.training_method != TrainingMethod.EMBEDDING
+                and not self.embedding.is_output_embedding) \
+            or ((self.text_encoder_3.train_embedding or not self.model_type.has_multiple_text_encoders())
+                and self.train_any_embedding())
+
+    def all_embedding_configs(self):
+        if self.training_method == TrainingMethod.EMBEDDING:
+            return self.additional_embeddings + [self.embedding]
+        else:
+            return self.additional_embeddings
+
+    def get_last_backup_path(self) -> str | None:
+        backups_path = os.path.join(self.workspace_dir, "backup")
+        if os.path.exists(backups_path):
+            backup_paths = sorted(
+                [path for path in os.listdir(backups_path) if
+                 os.path.isdir(os.path.join(backups_path, path))],
+                reverse=True,
+            )
+
+            if backup_paths:
+                last_backup_path = backup_paths[0]
+                return os.path.join(backups_path, last_backup_path)
+
+        return None
+
+    def to_settings_dict(self, secrets: bool) -> dict:
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+
+        config.concepts = None
+        config.samples = None
+
+        config_dict = config.to_dict()
+        if not secrets:
+            config_dict.pop('secrets',None)
+        return config_dict
+
+    def to_pack_dict(self, secrets: bool) -> dict:
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+
+        if config.concepts is None:
+            with open(config.concept_file_name, 'r') as f:
+                concepts = json.load(f)
+                for i in range(len(concepts)):
+                    concepts[i] = ConceptConfig.default_values().from_dict(concepts[i])
+                config.concepts = concepts
+
+        if config.samples is None:
+            with open(config.sample_definition_file_name, 'r') as f:
+                samples = json.load(f)
+                for i in range(len(samples)):
+                    samples[i] = SampleConfig.default_values().from_dict(samples[i])
+                config.samples = samples
+
+        config_dict = config.to_dict()
+        if not secrets:
+            config_dict.pop('secrets',None)
+        return config_dict
+
+    def to_unpacked_config(self) -> 'TrainConfig':
+        config = TrainConfig.default_values().from_dict(self.to_dict())
+        config.concepts = None
+        config.samples = None
+        return config
+
+    @staticmethod
+    def default_values() -> 'TrainConfig':
+        data = []
+
+        data.append(("training_method", TrainingMethod.FINE_TUNE, TrainingMethod, False))
+        data.append(("model_type", ModelType.STABLE_DIFFUSION_15, ModelType, False))
+        data.append(("debug_mode", False, bool, False))
+        data.append(("debug_dir", "debug", str, False))
+        data.append(("workspace_dir", "workspace/run", str, False))
+        data.append(("cache_dir", "workspace-cache/run", str, False))
+        data.append(("tensorboard", True, bool, False))
+        data.append(("tensorboard_expose", False, bool, False))
+        data.append(("tensorboard_port", 6006, int, False))
+        data.append(("validation", False, bool, False))
+        data.append(("validate_after", 1, int, False))
+        data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
+        data.append(("continue_last_backup", False, bool, False))
+        data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
+
+        data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))
+        data.append(("weight_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("output_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("output_model_format", ModelFormat.SAFETENSORS, ModelFormat, False))
+        data.append(("output_model_destination", "models/model.safetensors", str, False))
+        data.append(("gradient_checkpointing", GradientCheckpointingMethod.ON, GradientCheckpointingMethod, False))
+        data.append(("gradient_checkpointing_layers", [], list[str], False))
+        data.append(("enable_async_offloading", True, bool, False))
+        data.append(("enable_activation_offloading", True, bool, False))
+        data.append(("layer_offload_fraction", 0.0, float, False))
+        data.append(("force_circular_padding", False, bool, False))
+
+        data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
+        data.append(("concepts", None, list[ConceptConfig], True))
+        data.append(("aspect_ratio_bucketing", True, bool, False))
+        data.append(("cache_mode", CacheMode.DISK, CacheMode, False))
+        data.append(("clear_cache_before_training", True, bool, False))
+
+        data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))
+        data.append(("custom_learning_rate_scheduler", None, str, True))
+        data.append(("scheduler_params", [], list[dict[str, str]], True))
+        data.append(("learning_rate", 3e-6, float, False))
+        data.append(("learning_rate_warmup_steps", 200.0, float, False))
+        data.append(("learning_rate_cycles", 1.0, float, False))
+        data.append(("learning_rate_min_factor", 0.0, float, False))
+        data.append(("epochs", 100, int, False))
+        data.append(("batch_size", 1, int, False))
+        data.append(("gradient_accumulation_steps", 1, int, False))
+        data.append(("ema", EMAMode.OFF, EMAMode, False))
+        data.append(("ema_decay", 0.999, float, False))
+        data.append(("ema_update_step_interval", 5, int, False))
+        data.append(("dataloader_threads", 2, int, False))
+        data.append(("train_device", default_device.type, str, False))
+        data.append(("temp_device", "cpu", str, False))
+        data.append(("train_dtype", DataType.FLOAT_16, DataType, False))
+        data.append(("fallback_train_dtype", DataType.BFLOAT_16, DataType, False))
+        data.append(("enable_autocast_cache", True, bool, False))
+        data.append(("only_cache", False, bool, False))
+        data.append(("resolution", "512", str, False))
+        data.append(("frames", "25", str, False))
+        data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
+        data.append(("mse_strength", 1.0, float, False))
+        data.append(("mae_strength", 0.0, float, False))
+        data.append(("log_cosh_strength", 0.0, float, False))
+        data.append(("vb_loss_strength", 1.0, float, False))
+        data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))
+        data.append(("loss_weight_strength", 5.0, float, False))
+        data.append(("dropout_probability", 0.0, float, False))
+        data.append(("loss_scaler", LossScaler.NONE, LossScaler, False))
+        data.append(("learning_rate_scaler", LearningRateScaler.NONE, LearningRateScaler, False))
+        data.append(("clip_grad_norm", 1.0, float, True))
+
+        data.append(("offset_noise_weight", 0.0, float, False))
+        data.append(("perturbation_noise_weight", 0.0, float, False))
+        data.append(("rescale_noise_scheduler_to_zero_terminal_snr", False, bool, False))
+        data.append(("force_v_prediction", False, bool, False))
+        data.append(("force_epsilon_prediction", False, bool, False))
+        data.append(("min_noising_strength", 0.0, float, False))
+        data.append(("max_noising_strength", 1.0, float, False))
+        data.append(("timestep_distribution", TimestepDistribution.UNIFORM, TimestepDistribution, False))
+        data.append(("noising_weight", 0.0, float, False))
+        data.append(("noising_bias", 0.0, float, False))
+        data.append(("timestep_shift", 1.0, float, False))
+        data.append(("dynamic_timestep_shifting", False, bool, False))
+
+        unet = TrainModelPartConfig.default_values()
+        unet.train = True
+        unet.stop_training_after = 0
+        unet.learning_rate = None
+        unet.weight_dtype = DataType.NONE
+        data.append(("unet", unet, TrainModelPartConfig, False))
+
+        prior = TrainModelPartConfig.default_values()
+        prior.model_name = ""
+        prior.train = True
+        prior.stop_training_after = 0
+        prior.learning_rate = None
+        prior.weight_dtype = DataType.NONE
+        data.append(("prior", prior, TrainModelPartConfig, False))
+
+        text_encoder = TrainModelPartConfig.default_values()
+        text_encoder.train = True
+        text_encoder.stop_training_after = 30
+        text_encoder.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder.learning_rate = None
+        text_encoder.weight_dtype = DataType.NONE
+        data.append(("text_encoder", text_encoder, TrainModelPartConfig, False))
+        data.append(("text_encoder_layer_skip", 0, int, False))
+
+        text_encoder_2 = TrainModelPartConfig.default_values()
+        text_encoder_2.train = True
+        text_encoder_2.stop_training_after = 30
+        text_encoder_2.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder_2.learning_rate = None
+        text_encoder_2.weight_dtype = DataType.NONE
+        data.append(("text_encoder_2", text_encoder_2, TrainModelPartConfig, False))
+        data.append(("text_encoder_2_layer_skip", 0, int, False))
+
+        text_encoder_3 = TrainModelPartConfig.default_values()
+        text_encoder_3.train = True
+        text_encoder_3.stop_training_after = 30
+        text_encoder_3.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder_3.learning_rate = None
+        text_encoder_3.weight_dtype = DataType.NONE
+        data.append(("text_encoder_3", text_encoder_3, TrainModelPartConfig, False))
+        data.append(("text_encoder_3_layer_skip", 0, int, False))
+
+        vae = TrainModelPartConfig.default_values()
+        vae.model_name = ""
+        vae.weight_dtype = DataType.FLOAT_32
+        data.append(("vae", vae, TrainModelPartConfig, False))
+
+        effnet_encoder = TrainModelPartConfig.default_values()
+        effnet_encoder.model_name = ""
+        effnet_encoder.weight_dtype = DataType.NONE
+        data.append(("effnet_encoder", effnet_encoder, TrainModelPartConfig, False))
+
+        decoder = TrainModelPartConfig.default_values()
+        decoder.model_name = ""
+        decoder.weight_dtype = DataType.NONE
+        data.append(("decoder", decoder, TrainModelPartConfig, False))
+
+        decoder_text_encoder = TrainModelPartConfig.default_values()
+        decoder_text_encoder.weight_dtype = DataType.NONE
+        data.append(("decoder_text_encoder", decoder_text_encoder, TrainModelPartConfig, False))
+
+        decoder_vqgan = TrainModelPartConfig.default_values()
+        decoder_vqgan.weight_dtype = DataType.NONE
+        data.append(("decoder_vqgan", decoder_vqgan, TrainModelPartConfig, False))
+
+        data.append(("masked_training", False, bool, False))
+        data.append(("unmasked_probability", 0.1, float, False))
+        data.append(("unmasked_weight", 0.1, float, False))
+        data.append(("normalize_masked_area_loss", False, bool, False))
+
+        data.append(("embedding_learning_rate", None, float, True))
+        data.append(("preserve_embedding_norm", False, bool, False))
+        data.append(("embedding", TrainEmbeddingConfig.default_values(), TrainEmbeddingConfig, False))
+        data.append(("additional_embeddings", [], list[TrainEmbeddingConfig], False))
+        data.append(("embedding_weight_dtype", DataType.FLOAT_32, DataType, False))
+
+        data.append(("cloud", CloudConfig.default_values(), CloudConfig, False))
+
+        data.append(("peft_type", PeftType.LORA, PeftType, False))
+        data.append(("lora_model_name", "", str, False))
+        data.append(("lora_rank", 16, int, False))
+        data.append(("lora_alpha", 1.0, float, False))
+        data.append(("lora_decompose", False, bool, False))
+        data.append(("lora_decompose_norm_epsilon", True, bool, False))
+        data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("lora_layers", "", str, False))
+        data.append(("lora_layer_preset", None, str, True))
+        data.append(("bundle_additional_embeddings", True, bool, False))
+
+        data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
+        data.append(("optimizer_defaults", {}, dict[str, TrainOptimizerConfig], False))
+
+        data.append(("sample_definition_file_name", "training_samples/samples.json", str, False))
+        data.append(("samples", None, list[SampleConfig], True))
+        data.append(("sample_after", 10, int, False))
+        data.append(("sample_after_unit", TimeUnit.MINUTE, TimeUnit, False))
+        data.append(("sample_skip_first", 0, int, False))
+        data.append(("sample_image_format", ImageFormat.JPG, ImageFormat, False))
+        data.append(("sample_video_format", VideoFormat.MP4, VideoFormat, False))
+        data.append(("sample_audio_format", AudioFormat.MP3, AudioFormat, False))
+        data.append(("samples_to_tensorboard", True, bool, False))
+        data.append(("non_ema_sampling", True, bool, False))
+        data.append(("skip_sample_on_train_start", False, bool, False))
+
+        data.append(("backup_after", 30, int, False))
+        data.append(("backup_after_unit", TimeUnit.MINUTE, TimeUnit, False))
+        data.append(("rolling_backup", False, bool, False))
+        data.append(("rolling_backup_count", 3, int, False))
+        data.append(("backup_before_save", True, bool, False))
+        data.append(("save_every", 0, int, False))
+        data.append(("save_every_unit", TimeUnit.NEVER, TimeUnit, False))
+        data.append(("save_skip_first", 0, int, False))
+        data.append(("save_filename_prefix", "", str, False))
+
+        secrets = SecretsConfig.default_values()
+        data.append(("secrets", secrets, SecretsConfig, False))
+
+        return TrainConfig(data)
+                ```
+
+        +-- modules\util\convert/
+        +-- modules\util\enum/
+            +-- modules\util\enum\Cache.py
+                ```Cache.py
+from enum import Enum
+
+class CacheMode(Enum):
+    NONE = "None"  # Sem cache
+    DISK = "Disk"  # Cache em disco (comportamento original)
+    GPU = "GPU"    # Cache na GPU (novo comportamento)
+
+    def __str__(self):
+        return self.value
+
+    @staticmethod
+    def from_str(s: str):
+        for mode in CacheMode:
+            if str(mode) == s:
+                return mode
+        print(f"Aviso: CacheMode '{s}' inválido, usando 'Disk'.")
+        return CacheMode.DISK
+                ```
+
+        +-- modules\util\loss/
+        +-- modules\util\modelSpec/
+        +-- modules\util\optimizer/
+        +-- modules\util\ui/
+    +-- modules\zluda/
++-- resources/
+    +-- resources\icons/
+    +-- resources\images/
+    +-- resources\model_config/
+        +-- resources\model_config\stable_cascade/
+        +-- resources\model_config\stable_diffusion/
+        +-- resources\model_config\stable_diffusion_xl/
+    +-- resources\sd_model_spec/
++-- scripts/
+    +-- scripts\util/
++-- training_concepts/
++-- training_presets/
++-- training_samples/

@@ -261,8 +261,8 @@ class TrainUI(ctk.CTk):
         components.switch(frame, 0, 1, self.ui_state, "aspect_ratio_bucketing")
 
         # latent caching
-        components.label(frame, 1, 0, "Latent Caching", tooltip="Caching of intermediate training data that can be re-used between epochs")
-        components.switch(frame, 1, 1, self.ui_state, "latent_caching")
+        # components.label(frame, 1, 0, "Latent Caching", tooltip="Caching of intermediate training data that can be re-used between epochs")
+        # components.switch(frame, 1, 1, self.ui_state, "latent_caching")
 
         # clear cache before training
         components.label(

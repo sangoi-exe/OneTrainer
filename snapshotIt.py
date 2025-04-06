@@ -9,14 +9,18 @@ except ImportError:
 # Variáveis globais
 SNAPSHOT_MODE = "only_listed"  # opções: "all", "only_listed"
 included_files_list = [
-    "BaseStableDiffusionXLSetup.py",
-    "LoRAModule.py",
-    "GenericTrainer.py",
-    "checkpointing_util.py",
     "TrainConfig.py",
+    "Cache.py",    
+    "StableDiffusionXLBaseDataLoader.py",
+    "StableDiffusionXLLoRASetup.py",
+    "DataLoaderText2ImageMixin.py",
+    "DataLoaderGPUCacheMixin.py",
+    "BaseDataLoader.py",
+    "GenericTrainer.py",
+    "BatchValidator.py",
 ]
 include_extensions = {"py"}
-ignore_dirs = {".git", "dist", "node_modules", "test", "__pycache__", "cache", "asten-workflow", "public", "views", "utils", "venv"}
+ignore_dirs = {".git", "__pycache__", "venv"}
 ignore_files = {"snapshotIt.py"}
 ignore_file_patterns = [re.compile(r".*\.spec\.(js|py)$"), re.compile(r".*\.min\.(js|css)$")]
 
