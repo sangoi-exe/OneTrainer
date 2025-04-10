@@ -137,7 +137,7 @@ class StableDiffusionXLLoRASetup(
 
         model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
 
-        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers.split(","))
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers)
 
         if model.lora_state_dict:
             if create_te1:

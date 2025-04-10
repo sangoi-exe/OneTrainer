@@ -67,7 +67,7 @@ def init_model_parameters(
         print(f" - keys: {list(g.keys())}")
         print(f" - param count: {len(g['params'])}")
         print(f" - lr: {g.get('lr')}")
-        print(f" - names (if available): {[getattr(p, 'name', 'n/a') for p in g['params']]}")
+        #print(f" - names (if available): {[getattr(p, 'name', 'n/a') for p in g['params']]}")
 
     model.ema = create.create_ema(parameters.parameters(), model.ema_state_dict, model.train_config)
     model.ema_state_dict = None
