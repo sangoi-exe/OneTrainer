@@ -301,7 +301,6 @@ class TrainConfig(BaseConfig):
     only_cache: bool
     resolution: str
     frames: str
-    loss_mode_fn: LossMode
     mse_strength: float
     mae_strength: float
     log_cosh_strength: float
@@ -312,6 +311,11 @@ class TrainConfig(BaseConfig):
     loss_scaler: LossScaler
     learning_rate_scaler: LearningRateScaler
     clip_grad_norm: float
+    loss_mode_fn: LossMode
+    delta_pattern_save_it: bool
+    delta_pattern_use_it: bool
+    delta_pattern_path: str
+    delta_pattern_weight: float
 
     # noise
     offset_noise_weight: float
@@ -786,6 +790,10 @@ class TrainConfig(BaseConfig):
         data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
+        data.append(("delta_pattern_save_it", True, bool, False))
+        data.append(("delta_pattern_use_it", False, bool, False))
+        data.append(("delta_pattern_weight", 0.0, float, False))
+        data.append(("delta_pattern_path", "", str, False))
         data.append(("log_cosh_strength", 0.0, float, False))
         data.append(("vb_loss_strength", 1.0, float, False))
         data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))

@@ -39,6 +39,7 @@ from torchvision.transforms.functional import pil_to_tensor
 import huggingface_hub
 from requests.exceptions import ConnectionError
 from tqdm import tqdm
+from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
 
 
 class GenericTrainer(BaseTrainer):
@@ -59,6 +60,8 @@ class GenericTrainer(BaseTrainer):
 
     grad_hook_handles: list[RemovableHandle]
 
+    delta_pattern: DeltaPatternRegularizer | None
+
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
 
@@ -72,6 +75,11 @@ class GenericTrainer(BaseTrainer):
         self.one_step_trained = False
 
         self.grad_hook_handles = []
+
+        if config.delta_pattern_save_it:
+            self.delta_pattern = DeltaPatternRegularizer(self)
+        else:
+            self.delta_pattern = None
 
     def start(self):
         self.__save_config_to_workspace()
@@ -711,7 +719,7 @@ class GenericTrainer(BaseTrainer):
 
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
                         
-												# ALTERAÇÃO INSERIDA: Modificar a lógica de step/update para fused backward pass
+                        # ALTERAÇÃO INSERIDA: Modificar a lógica de step/update para fused backward pass
                         # Step the optimizer and update scaler if NOT using fused back pass
                         if not (self.config.optimizer.fused_back_pass and self.model.optimizer.supports_fused_back_pass()):
                             if scaler:
@@ -748,7 +756,7 @@ class GenericTrainer(BaseTrainer):
 
                         # Log loss values
                         self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
-												
+                        
                         ema_loss = ema_loss or accumulated_loss
                         ema_loss_steps += 1
                         ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
@@ -813,6 +821,19 @@ class GenericTrainer(BaseTrainer):
             else:
                 save_path = self.config.output_model_destination
             print("Saving " + save_path)
+
+            # INÍCIO ALTERAÇÃO: Salva padrão de deltas se ativado para SAVE
+            # Verifica se delta_pattern existe e se a flag SAVE está ativa
+            if self.config.delta_pattern_save_it and hasattr(self.model, 'delta_pattern') and self.delta_pattern is not None:
+                # O cálculo do delta agora é feito dentro do save_pattern
+                # Usa o diretório especificado em config.delta_pattern_path ou o padrão
+                save_directory = os.path.dirname(self.config.delta_pattern_path) if self.config.delta_pattern_path else "./training_pattern"
+                pattern_path = self.delta_pattern.save_pattern(save_dir=save_directory)
+                if pattern_path:
+                    print(f"[DeltaPattern] Saved training delta pattern to {pattern_path}")
+                else:
+                    print("[DeltaPattern] Failed to save training delta pattern.")
+            # FIM ALTERAÇÃO
 
             self.model_saver.save(
                 model=self.model,
