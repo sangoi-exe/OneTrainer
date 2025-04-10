@@ -9,33 +9,78 @@ from modules.util.TrainProgress import TrainProgress
 
 import torch
 
+# INÍCIO ALTERAÇÃO - Nova estrutura de PRESETS
 PRESETS = {
-    "attn-mlp": ["attentions"],
-    "attn-only": ["attn"],
-    "full": [],
-    "rosto": [
+    "attn-mlp": {
+        # Usa rank/alpha padrão para todos os matches
+        "*attentions*": {},
+        "*transformer_blocks*ff*": {}, # Exemplo: Padrão mais específico para FF
+    },
+    "attn-only": {
+        # Usa rank/alpha padrão apenas para attn1 e attn2
+        "*attn1*": {},
+        "*attn2*": {},
+    },
+    "full": None, # Um valor especial para indicar "nenhum filtro específico do preset, usar padrões globais"
+                  # Ou poderia ser um dict vazio {} dependendo da lógica desejada no Wrapper
+    "rosto_specific_dims": {
         # ===== MIDBLOCK =====
-        "mid_block.attentions.*.transformer_blocks.*.attn1.*",
-        "mid_block.attentions.*.transformer_blocks.*.attn2.*",
-        "mid_block.attentions.*.transformer_blocks.*.ff.*",
-        "mid_block.resnets.*",
-        # ===== IN04 e IN05 =====
-        "down_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
-        "down_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
-        "down_blocks.1.attentions.*.transformer_blocks.*.ff.*",
-        "down_blocks.1.resnets.*",
-        # ===== IN07 e IN08 =====
-        "down_blocks.2.attentions.*.transformer_blocks.*.attn1.*",
-        "down_blocks.2.attentions.*.transformer_blocks.*.attn2.*",
-        "down_blocks.2.attentions.*.transformer_blocks.*.ff.*",
-        "down_blocks.2.resnets.*",
-        # ===== OUT03 a OUT05 =====
-        "up_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
-        "up_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
-        "up_blocks.1.attentions.*.transformer_blocks.*.ff.*",
-        "up_blocks.1.resnets.*",
-    ],
+        # Rank 8 e Alpha 4 para atenções do midblock
+        "mid_block.attentions.*.transformer_blocks.*.attn*.*": {"rank": 8, "alpha": 4},
+        # Rank 16 (alpha padrão) para feed-forward do midblock
+        "mid_block.attentions.*.transformer_blocks.*.ff.*": {"rank": 16},
+        # Rank/Alpha padrão para resnets do midblock
+        "mid_block.resnets.*": {},
+
+        # ===== IN04 e IN05 (down_blocks.1) =====
+        # Rank 32 e Alpha 16 para todo o bloco down_blocks.1 (atenções e resnets)
+        "down_blocks.1.*": {"rank": 32, "alpha": 16},
+
+        # ===== IN07 e IN08 (down_blocks.2) =====
+        # Rank 4 (alpha padrão) especificamente para as atenções em down_blocks.2
+        "down_blocks.2.attentions.*": {"rank": 4},
+        # Rank/Alpha padrão para os resnets em down_blocks.2
+        "down_blocks.2.resnets.*": {}, # Note: down_blocks.2.attentions terá rank 4 devido à regra mais específica acima
+
+        # ===== OUT03 a OUT05 (up_blocks.1) =====
+        # Rank 32 e Alpha 16 para todo o bloco up_blocks.1 (espelhando down_blocks.1)
+        "up_blocks.1.*": {"rank": 32, "alpha": 16},
+    },
+     # Exemplo de preset que só usa filtros, sem overrides de rank/alpha (compatível com lógica antiga)
+     "simple_filter": {
+         "down_blocks.0.*": {},
+         "up_blocks.2.*": {},
+     }
 }
+# FIM ALTERAÇÃO - Nova estrutura de PRESETS	
+
+# PRESETS = {
+#     "attn-mlp": ["attentions"],
+#     "attn-only": ["attn"],
+#     "full": [],
+#     "rosto": [
+#         # ===== MIDBLOCK =====
+#         "mid_block.attentions.*.transformer_blocks.*.attn1.*",
+#         "mid_block.attentions.*.transformer_blocks.*.attn2.*",
+#         "mid_block.attentions.*.transformer_blocks.*.ff.*",
+#         "mid_block.resnets.*",
+#         # ===== IN04 e IN05 =====
+#         "down_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
+#         "down_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
+#         "down_blocks.1.attentions.*.transformer_blocks.*.ff.*",
+#         "down_blocks.1.resnets.*",
+#         # ===== IN07 e IN08 =====
+#         "down_blocks.2.attentions.*.transformer_blocks.*.attn1.*",
+#         "down_blocks.2.attentions.*.transformer_blocks.*.attn2.*",
+#         "down_blocks.2.attentions.*.transformer_blocks.*.ff.*",
+#         "down_blocks.2.resnets.*",
+#         # ===== OUT03 a OUT05 =====
+#         "up_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
+#         "up_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
+#         "up_blocks.1.attentions.*.transformer_blocks.*.ff.*",
+#         "up_blocks.1.resnets.*",
+#     ],
+# }
 
 
 class StableDiffusionXLLoRASetup(

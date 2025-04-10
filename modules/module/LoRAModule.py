@@ -589,6 +589,7 @@ class LoRAModuleWrapper:
     default_rank: int  # Rank padrão global
     default_alpha: float  # Alpha padrão global
     lora_layer_patterns: dict[str, dict[str, int | float]]  # Configs por padrão
+    ruleset: RuleSet
     _sorted_patterns: list[str]  # Chaves de lora_layer_patterns ordenadas por especificidade
     module_filter: list[str]  # Filtro inicial de nomes de camadas
     klass: type[PeftBase]  # Classe PEFT a ser usada (LoRA, LoHa, DoRA)
@@ -601,6 +602,10 @@ class LoRAModuleWrapper:
         orig_module: nn.Module | None,
         prefix: str,
         config: TrainConfig,
+        # INÍCIO ALTERAÇÃO - Modificado para aceitar nome do preset
+        preset_name: str | None = None, # Nome do preset a ser carregado de PRESETS
+        external_module_filter: list[str] | None = None, # Filtro adicional/override externo
+        # FIM ALTERAÇÃO
         module_filter: list[str] | None = None,
     ):
         """
@@ -635,6 +640,56 @@ class LoRAModuleWrapper:
         self.default_rank = config.lora_rank
         self.default_alpha = config.lora_alpha
 
+        # INÍCIO ALTERAÇÃO - Lógica para carregar e mesclar presets e filtros
+        # Começa com os padrões globais da config principal
+        self.lora_layer_patterns = config.lora_layer_patterns.copy() if config.lora_layer_patterns else {}
+        preset_module_filter = [] # Filtro derivado apenas do preset
+        
+        if preset_name and preset_name != "full":
+          # Importa PRESETS aqui ou garante que esteja acessível no escopo
+          from .presets import PRESETS # Ajuste o caminho da importação conforme necessário
+
+          preset_config = PRESETS.get(preset_name)
+
+          if isinstance(preset_config, dict):
+              # Nova estrutura: {"pattern": {"rank": r, "alpha": a}, ...}
+              preset_module_filter = list(preset_config.keys())
+              # Mescla/sobrescreve os padrões globais com os do preset
+              self.lora_layer_patterns.update(preset_config)
+              print(f"LoRA Wrapper: Usando preset '{preset_name}' com {len(preset_module_filter)} padrões e overrides específicos.")
+          elif isinstance(preset_config, list):
+              # Estrutura antiga (apenas filtros): ["pattern1", "pattern2", ...]
+              # Mantém compatibilidade: usa a lista como filtro, sem overrides do preset.
+              preset_module_filter = preset_config
+              # Mantém os lora_layer_patterns globais da config
+              print(f"LoRA Wrapper: Usando preset '{preset_name}' (formato antigo) com {len(preset_module_filter)} filtros. Usando overrides globais.")
+          elif preset_config is None and preset_name in PRESETS:
+              # Preset definido como None (ex: "full") -> sem filtro/overrides do preset
+              print(f"LoRA Wrapper: Preset '{preset_name}' encontrado como None. Usando filtros externos e overrides globais.")
+          else:
+              print(f"Aviso: Preset '{preset_name}' não encontrado ou inválido em PRESETS. Usando filtros externos e overrides globais.")
+        elif preset_name == "full":
+            print(f"LoRA Wrapper: Preset 'full' selecionado. Usando filtros externos e overrides globais.")
+        else:
+            print("LoRA Wrapper: Nenhum preset especificado. Usando filtros externos e overrides globais.")
+
+        # Combina filtros: Uma camada só será criada se passar em AMBOS os filtros
+        # (Se external_module_filter for None/vazio, ele permite tudo)
+        # (Se preset_module_filter for vazio (e.g., "full"), ele permite tudo)
+        # Usaremos self.module_filter para a checagem inicial em __create_modules,
+        # que será a união dos padrões para eficiência no fnmatch, mas a lógica
+        # de filtragem dupla pode ser aplicada depois se necessário, ou ajustar __create_modules.
+        # Por simplicidade agora, vamos usar a união como o filtro principal a ser verificado.
+        # Se um filtro mais estrito (interseção lógica) for necessário, a lógica em __create_modules
+        # precisaria ser ajustada.
+
+        # Filtro final considera ambos:
+        effective_filter = set(preset_module_filter)
+        if external_module_filter:
+             effective_filter.update(external_module_filter) # Ou use interseção se a lógica for E em vez de OU
+
+        # Se effective_filter estiver vazio, significa que NENHUM filtro foi aplicado (incluir tudo)
+        self.module_filter = list(effective_filter) if effective_filter else [] # Lista vazia significa "sem filtro"
         self.ruleset = RuleSet(config.lora_layer_patterns)
 
         # Armazena o filtro de módulo
@@ -685,17 +740,17 @@ class LoRAModuleWrapper:
             if not isinstance(child_module, (Linear, Conv2d)):
                 continue
 
-            # 1. Aplica o filtro inicial (`module_filter` vindo da UI de presets/custom)
+            # INÍCIO ALTERAÇÃO - Usa self.module_filter (combinado)
+            # 1. Aplica o filtro combinado (`self.module_filter`)
             passes_filter = False
-            if not self.module_filter:
+            if not self.module_filter: # Lista vazia significa sem filtro -> passa tudo
                 passes_filter = True
             else:
-                for f in self.module_filter:
-                    result = fnmatch.fnmatch(name, f)
-                    # print(f"[LoRA-DEBUG] fnmatch: '{name}' ? '{f}' => {result}")
-                    if result:
+                for f_pattern in self.module_filter:
+                    if fnmatch.fnmatch(name, f_pattern):
                         passes_filter = True
                         break
+            # FIM ALTERAÇÃO
 
             if not passes_filter:
                 continue  # Pula esta camada se não passar no filtro inicial
@@ -704,17 +759,27 @@ class LoRAModuleWrapper:
             clean_name = name.removeprefix(self.prefix + "_") if name.startswith(self.prefix + "_") else name
             full_peft_prefix = f"{self.prefix}_{clean_name}" if clean_name else self.prefix
 
-            # 2. Determina Rank e Alpha para esta camada específica
+            # INÍCIO ALTERAÇÃO - Usa self.ruleset diretamente
+            # 2. Determina Rank e Alpha para esta camada específica usando RuleSet
             rank_to_use = self.default_rank
             alpha_to_use = self.default_alpha
+            matched_pattern = None # Para debug
 
             # Itera sobre os padrões ORDENADOS (do mais específico/longo para o mais geral)
             matched_config = self.ruleset.match(name)
             if matched_config:
+                # matched_config é o dict {"rank": r, "alpha": a} ou {}
                 rank_to_use = matched_config.get("rank", self.default_rank)
                 alpha_to_use = matched_config.get("alpha", self.default_alpha)
+                # Encontra qual padrão deu match (opcional, para debug)
+                # for pattern in self.ruleset._sorted_patterns:
+                #     if fnmatch.fnmatch(name, pattern):
+                #         matched_pattern = pattern
+                #         break
 
-            # 3. Cria a instância do módulo PEFT
+            # FIM ALTERAÇÃO
+
+            # 3. Cria a instância do módulo PEFT (sem alterações na lógica de criação)
             args_for_this_module = [rank_to_use, alpha_to_use]
             kwargs_for_this_module = self.global_additional_kwargs.copy()
 
@@ -727,7 +792,7 @@ class LoRAModuleWrapper:
                 print(
                     f"Erro ao criar módulo PEFT para {name} (prefixo {full_peft_prefix}) com rank={rank_to_use}, alpha={alpha_to_use}: {e}"
                 )
-
+        print(f"LoRA Wrapper: Criados {len(lora_modules)} módulos PEFT para o prefixo '{self.prefix}'.")
         return lora_modules
 
     def load_state_dict(self, state_dict: dict[str, Tensor]):
