@@ -7,7 +7,7 @@ except ImportError:
     Tk = None
 
 # Variáveis globais
-SNAPSHOT_MODE = "only_listed"  # opções: "all", "only_listed"
+SNAPSHOT_MODE = "all"  # opções: "all", "only_listed"
 included_files_list = [
     "BaseStableDiffusionXLSetup.py",
     "LoRAModule.py",

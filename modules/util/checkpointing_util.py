@@ -202,15 +202,15 @@ def enable_checkpointing_for_basic_transformer_blocks(
 
 	elif config.gradient_checkpointing == GradientCheckpointingMethod.ON:
 		layers_to_checkpoint_selectively = config.gradient_checkpointing_layers
-		print(f"INFO: Checkpointing seletivo ON. Padrões: {layers_to_checkpoint_selectively if layers_to_checkpoint_selectively else 'Todos (lista vazia)'}")
+		#print(f"INFO: Checkpointing seletivo ON. Padrões: {layers_to_checkpoint_selectively if layers_to_checkpoint_selectively else 'Todos (lista vazia)'}")
 		checkpointed_count = 0 # Contador
 
 		for name, child_module in orig_module.named_modules(): # Iterar com nomes
 			if isinstance(child_module, BasicTransformerBlock):
-				print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
+				#print(f"DEBUG: Encontrado BasicTransformerBlock: {name}") # Print para cada bloco encontrado
 				# Verifica se o nome desta camada corresponde aos padrões
 				if should_checkpoint_layer(name, layers_to_checkpoint_selectively):
-					print(f"DEBUG: *** CHECKPOINTING CAMADA: {name} ***") # Destaca a camada checkpointada
+					#print(f"DEBUG: *** CHECKPOINTING CAMADA: {name} ***") # Destaca a camada checkpointada
 					# Aplica checkpointing SEM conductor
 					# print(f"DEBUG: Checkpointing camada: {name}") # Opcional para depuração
 					child_module.forward = create_checkpointed_forward(
@@ -220,7 +220,7 @@ def enable_checkpointing_for_basic_transformer_blocks(
 						layer_index=0,  # Irrelevante sem conductor
 					)
 					checkpointed_count += 1
-		print(f"INFO: Total de camadas BasicTransformerBlock checkpointadas seletivamente: {checkpointed_count}")
+		#print(f"INFO: Total de camadas BasicTransformerBlock checkpointadas seletivamente: {checkpointed_count}")
 		return None # Não retorna conductor no modo ON seletivo
 
 	# Caso algo inesperado ocorra
@@ -431,25 +431,17 @@ def enable_checkpointing_for_hunyuan_video_transformer(
 	return conductor
 
 def should_checkpoint_layer(layer_name: str, patterns: list[str]) -> bool:
-    print(f"--- DEBUG_SHOULD ---")
-    print(f"DEBUG_SHOULD: Layer Name = '{layer_name}'")
-    print(f"DEBUG_SHOULD: Patterns = {patterns}") # MUITO IMPORTANTE VER ISSO
+    #print(f"[CHECK] Layer='{layer_name}' | Patterns={patterns}")
 
     if not patterns:
-        print("DEBUG_SHOULD: No patterns provided, returning True")
+        #print("[CHECK] No patterns. -> True")
         return True
 
-    match_found = False
     for pattern in patterns:
-        stripped_pattern = pattern.strip()
-        print(f"DEBUG_SHOULD: Checking if '{stripped_pattern}' is in '{layer_name}'")
-        if stripped_pattern in layer_name:
-            print(f"DEBUG_SHOULD: <<< MATCH FOUND! >>> Pattern '{stripped_pattern}' in '{layer_name}'. Returning True.")
-            match_found = True
-            break # Sai do loop se encontrar
+        stripped = pattern.strip()
+        if stripped in layer_name:
+            #print(f"[CHECK] MATCH: '{stripped}' in '{layer_name}' -> True")
+            return True
 
-    if not match_found:
-        print(f"DEBUG_SHOULD: No patterns matched for '{layer_name}'. Returning False.")
-
-    print(f"--- END DEBUG_SHOULD ---")
-    return match_found
+    #print(f"[CHECK] No match for '{layer_name}' -> False")
+    return False

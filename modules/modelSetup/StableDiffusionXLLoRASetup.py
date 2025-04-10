@@ -13,26 +13,28 @@ PRESETS = {
     "attn-mlp": ["attentions"],
     "attn-only": ["attn"],
     "full": [],
-    # 🎯 Trains only the input-side of the UNet (early feature extraction layers)
-    # Great for capturing structural characteristics, colors, and style without touching image reconstruction.
-    "input-only": ["down_blocks", "resnets", "conv", "time_emb_proj"],
-    # 🎨 Focused on artistic style transfer — painting, illustration, graffiti, etc.
-    # Includes attention + feedforward + mid_block for creative transformations.
-    "art-style": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "mid_block", "resnets"],
-    # 👤 Portrait fidelity preset — for fine-tuning personal faces (e.g. LinkedIn photos)
-    # Covers attention + feedforward + encoder/decoder blocks, but avoids low-level convs to prevent structural distortions.
-    "face-detail": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "down_blocks", "up_blocks"],
-    # 🧪 Experimental "almost full" — touches everything relevant except `conv_in`/`conv_out`
-    # Balanced trade-off between power and safety. Great for strong style adaptation without wrecking core structure.
-    "almost-full-safe": ["down_blocks", "up_blocks", "mid_block", "attn", "proj", "ff", "resnets"],
-    # 🧯 Dangerous territory — includes conv_in/conv_out (can radically alter the model's latent space)
-    # Use only if you know what you're doing and want to change how the model "thinks".
-    "danger-zone": ["conv_in", "conv_out", "mid_block", "attn", "proj", "resnets"],
-    # 🤝 Interaction Concept — for training visual interactions or specific contextual combinations
-    # (e.g. characters doing unique gestures, wearing specific outfits, etc.)
-    # Focuses on attention + feedforward + structural layers for spatial and semantic bonding.
-    "interaction-concept": ["to_q", "to_k", "to_v", "to_out.0", "proj", "ff", "resnets", "down_blocks", "mid_block"],
-    "input-encoders-only": ["time_embedding", "add_embedding", "conv_in", "down_blocks"],
+    "rosto": [
+        # ===== MIDBLOCK =====
+        "mid_block.attentions.*.transformer_blocks.*.attn1.*",
+        "mid_block.attentions.*.transformer_blocks.*.attn2.*",
+        "mid_block.attentions.*.transformer_blocks.*.ff.*",
+        "mid_block.resnets.*",
+        # ===== IN04 e IN05 =====
+        "down_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
+        "down_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
+        "down_blocks.1.attentions.*.transformer_blocks.*.ff.*",
+        "down_blocks.1.resnets.*",
+        # ===== IN07 e IN08 =====
+        "down_blocks.2.attentions.*.transformer_blocks.*.attn1.*",
+        "down_blocks.2.attentions.*.transformer_blocks.*.attn2.*",
+        "down_blocks.2.attentions.*.transformer_blocks.*.ff.*",
+        "down_blocks.2.resnets.*",
+        # ===== OUT03 a OUT05 =====
+        "up_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
+        "up_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
+        "up_blocks.1.attentions.*.transformer_blocks.*.ff.*",
+        "up_blocks.1.resnets.*",
+    ],
 }
 
 

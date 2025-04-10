@@ -853,8 +853,6 @@ def create_optimizer(
             # Determinar se rounding deve ser ativo (ex: se dtype for bf16)
             use_stochastic_rounding = config.optimizer.stochastic_rounding and config.train_dtype == config.train_dtype.BFLOAT_16
             patch_prodigy(optimizer, use_stochastic_rounding)
-            # Marcar como schedule-free para compatibilidade com OneTrainer
-            optimizer.is_schedule_free = True
 
         # ADAFactor Optimizer
         case Optimizer.ADAFACTOR:

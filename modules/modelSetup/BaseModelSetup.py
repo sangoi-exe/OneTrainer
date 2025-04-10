@@ -99,10 +99,14 @@ class BaseModelSetup(
         for lr, parameter in zip(lrs, parameters, strict=True):
             # only use the prefix. this prevents multiple embedding reports. TODO: find a better solution
             name = parameter.split('/')[0]
+            
+            tensorboard.add_scalar(
+                f"lr/{name}_orig", lr, model.train_progress.global_step
+            )
 
             if name not in reported_learning_rates:
                 reported_learning_rates[name] = lr
-
+            
         reported_learning_rates = config.optimizer.optimizer.maybe_adjust_lrs(reported_learning_rates, model.optimizer)
 
         for name, lr in reported_learning_rates.items():

@@ -24,6 +24,7 @@ debug*.py
 config.json
 secrets.json
 snapshotLegacy.py
+*.txt
 
 # environments
 /.venv*

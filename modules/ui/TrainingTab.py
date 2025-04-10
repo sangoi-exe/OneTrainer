@@ -218,11 +218,6 @@ class TrainingTab:
                          tooltip="Unit = float. Method = percentage. For a factor of 0.1, the final LR will be 10% of the initial LR. If the initial LR is 1e-4, the final LR will be 1e-5.")
         components.entry(frame, 4, 1, self.ui_state, "learning_rate_min_factor")
 
-        # learning rate min factor
-        components.label(frame, 4, 0, "Learning Rate Min Factor",
-                         tooltip="Unit = float. Method = percentage. For a factor of 0.1, the final LR will be 10% of the initial LR. If the initial LR is 1e-4, the final LR will be 1e-5.")
-        components.entry(frame, 4, 1, self.ui_state, "learning_rate_min_factor")
-
         # learning rate cycles
         components.label(frame, 5, 0, "Learning Rate Cycles",
                          tooltip="The number of learning rate cycles. This is only applicable if the learning rate scheduler supports cycles")

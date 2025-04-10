@@ -26,7 +26,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
 	def __init__(self):
 		super().__init__()
-		self.__align_prop_loss_fn = None
 		self.__coefficients = None
 		self.__alphas_cumprod_fun = None
 		self.__sigmas = None
