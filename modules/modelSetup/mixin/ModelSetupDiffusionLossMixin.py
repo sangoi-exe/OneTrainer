@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter # Adicionado para type hint
 from modules.util.TrainProgress import TrainProgress # Adicionado para type hint
 from modules.util.config.TrainConfig import TrainConfig # Adicionado para type hint
 from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
 import torch
 import torch.nn.functional as F

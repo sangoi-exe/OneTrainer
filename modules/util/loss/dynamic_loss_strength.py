@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 from collections import deque
 from typing import Iterable, Tuple, List, Dict, Union, Optional
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 
 ###############################################################################
 # NOVO: Variável global para controlar o modo (scalar vs. batch)
