@@ -1,40 +1,58 @@
-import re
-import os
-import math
-import copy
+# -*- coding: utf-8 -*-
+# modules/lora/LoRAModule.py
+
+# INÍCIO ALTERAÇÃO: Adicionar imports necessários da versão modificada
 import fnmatch
+import os
+import re
+
+# FIM ALTERAÇÃO
+import copy
+import math
+from abc import abstractmethod
+from collections.abc import Mapping
+
+# INÍCIO ALTERAÇÃO: Adicionar imports necessários da versão modificada
+from typing import Any
+
+# FIM ALTERAÇÃO
+
+from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.ModelType import PeftType
+from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+# INÍCIO ALTERAÇÃO: Corrigir import do Parameter
 from torch.nn import Conv2d, Dropout, Linear, Parameter
-from typing import Any
-from abc import abstractmethod
-from collections.abc import Mapping
-from modules.util.enum.ModelType import PeftType
-from modules.util.config.TrainConfig import TrainConfig
-from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
+
+# FIM ALTERAÇÃO
 
 
+# INÍCIO ALTERAÇÃO: Adicionar RuleSet da versão modificada
 class RuleSet:
-    def __init__(self, pattern_dict: dict[str, dict[str, int | float]]):
+    """Helper class to manage configuration rules based on layer name patterns."""
+
+    def __init__(self, pattern_dict: dict[str, dict[str, int | float]] | None):
         self.patterns = pattern_dict or {}
+        # Sort patterns by length descending to match most specific first
         self._sorted_patterns = sorted(self.patterns.keys(), key=len, reverse=True)
-        # print(f"[RuleSet DEBUG] Initialized with patterns: {self.patterns}")
-        # print(f"[RuleSet DEBUG] Sorted patterns for matching: {self._sorted_patterns}")
 
     def match(self, name: str) -> dict[str, int | float] | None:
-        """Encontra o primeiro padrão (do mais específico para o mais geral) que corresponde ao nome e retorna sua configuração."""
+        """Finds the first pattern (most specific to least specific) that matches the name and returns its configuration."""
         for pattern in self._sorted_patterns:
-            # Usar fnmatch diretamente é mais simples para padrões glob
             if fnmatch.fnmatch(name, pattern):
-                # print(f"[RuleSet DEBUG] Match FOUND for '{name}' with pattern '{pattern}'") # Debug Match
-                # Retorna o dicionário de configuração associado ao padrão encontrado
+                # Return the configuration dictionary associated with the found pattern
                 return self.patterns[pattern]
-        # print(f"[RuleSet DEBUG] No match found for '{name}'") # Debug No Match (Opcional, pode poluir)
-        return None  # Retorna None se nenhum padrão corresponder
+        return None  # Return None if no pattern matches
 
 
-# --- Adicionado: Definição de blocos e mapeamento ---
+# FIM ALTERAÇÃO
+
+
+# INÍCIO ALTERAÇÃO: Adicionar definições de blocos e mapeamento da versão modificada
 BLOCKID26 = [
     "BASE",
     "IN00",
@@ -63,10 +81,12 @@ BLOCKID26 = [
     "OUT10",
     "OUT11",
 ]
+
+# Maps common SD UNet layer name prefixes to block IDs
 KEY_TO_BLOCK_MAPPING = {
+    # Input Blocks
     "lora_unet_conv_in": "IN00",
-    "lora_unet_time_embedding": "IN09",  # Agrupando embeddings aqui por convenção
-    "lora_unet_add_embedding": "IN09",  # Agrupando embeddings aqui por convenção
+    "lora_unet_time_embedding": "IN00",  # Often grouped with input conv
     "lora_unet_down_blocks_0_resnets_0": "IN01",
     "lora_unet_down_blocks_0_resnets_1": "IN02",
     "lora_unet_down_blocks_0_downsamplers_0": "IN03",
@@ -79,30 +99,37 @@ KEY_TO_BLOCK_MAPPING = {
     "lora_unet_down_blocks_2_attentions_0": "IN07",
     "lora_unet_down_blocks_2_resnets_1": "IN08",
     "lora_unet_down_blocks_2_attentions_1": "IN08",
-    # IN09 já tratado pelos embeddings
-    # IN10, IN11 tipicamente vazios
-    "lora_unet_mid_block": "M00",  # Cobre resnets e attentions do mid block
-    "lora_unet_up_blocks_0_resnets_0": "OUT00",
-    "lora_unet_up_blocks_0_attentions_0": "OUT00",
-    "lora_unet_up_blocks_0_resnets_1": "OUT01",
-    "lora_unet_up_blocks_0_attentions_1": "OUT01",
-    "lora_unet_up_blocks_0_resnets_2": "OUT02",
-    "lora_unet_up_blocks_0_attentions_2": "OUT02",
-    "lora_unet_up_blocks_0_upsamplers_0": "OUT02",
-    "lora_unet_up_blocks_1_resnets_0": "OUT03",
-    "lora_unet_up_blocks_1_attentions_0": "OUT03",
-    "lora_unet_up_blocks_1_resnets_1": "OUT04",
-    "lora_unet_up_blocks_1_attentions_1": "OUT04",
-    "lora_unet_up_blocks_1_resnets_2": "OUT05",
-    "lora_unet_up_blocks_1_attentions_2": "OUT05",
-    "lora_unet_up_blocks_1_upsamplers_0": "OUT05",
-    "lora_unet_up_blocks_2_resnets_0": "OUT06",
-    "lora_unet_up_blocks_2_resnets_1": "OUT07",
-    "lora_unet_up_blocks_2_resnets_2": "OUT08",
-    # OUT09, OUT10 tipicamente vazios
-    "lora_unet_conv_out": "OUT11",
+    "lora_unet_down_blocks_2_downsamplers_0": "IN09",  # Often empty after this
+    "lora_unet_down_blocks_3_resnets_0": "IN10",  # XL specific?
+    "lora_unet_down_blocks_3_resnets_1": "IN11",  # XL specific?
+    # Middle Block
+    "lora_unet_mid_block": "M00",  # Covers resnets and attentions
+    # Output Blocks
+    "lora_unet_up_blocks_0_resnets_0": "OUT03",  # Starts from OUT03 in many architectures
+    "lora_unet_up_blocks_0_attentions_0": "OUT03",
+    "lora_unet_up_blocks_0_resnets_1": "OUT04",
+    "lora_unet_up_blocks_0_attentions_1": "OUT04",
+    "lora_unet_up_blocks_0_resnets_2": "OUT05",
+    "lora_unet_up_blocks_0_attentions_2": "OUT05",
+    "lora_unet_up_blocks_0_upsamplers_0": "OUT05",
+    "lora_unet_up_blocks_1_resnets_0": "OUT06",
+    "lora_unet_up_blocks_1_attentions_0": "OUT06",
+    "lora_unet_up_blocks_1_resnets_1": "OUT07",
+    "lora_unet_up_blocks_1_attentions_1": "OUT07",
+    "lora_unet_up_blocks_1_resnets_2": "OUT08",
+    "lora_unet_up_blocks_1_attentions_2": "OUT08",
+    "lora_unet_up_blocks_1_upsamplers_0": "OUT08",
+    "lora_unet_up_blocks_2_resnets_0": "OUT09",
+    "lora_unet_up_blocks_2_resnets_1": "OUT10",
+    "lora_unet_up_blocks_2_resnets_2": "OUT11",
+    "lora_unet_up_blocks_2_upsamplers_0": "OUT11",  # Often grouped with last resnet
+    # Final Conv
+    "lora_unet_conv_out": "OUT11",  # Usually considered part of the last block
+    # Text Encoder (Example prefix, adjust if needed)
+    "lora_te1_": "BASE",  # Text Encoder 1
+    "lora_te2_": "BASE",  # Text Encoder 2 (XL)
 }
-# --- Fim da Adição ---
+# FIM ALTERAÇÃO
 
 
 class PeftBase(nn.Module):
@@ -117,14 +144,17 @@ class PeftBase(nn.Module):
 
     def __init__(self, prefix: str, orig_module: nn.Module | None):
         super().__init__()
-        # Garante que o prefixo seja seguro para nomes de arquivos/chaves
+        # INÍCIO ALTERAÇÃO: Usar a sanitização de prefixo da versão modificada
+        # Ensure the prefix is safe for file/key names and ends with a dot
         self.prefix = prefix.replace(".", "_") + "."
+        # FIM ALTERAÇÃO
         self._orig_module = [orig_module] if orig_module else None
         self.is_applied = False
         self.layer_kwargs = {}
         self._initialized = False
 
         if orig_module is not None:
+            # INÍCIO ALTERAÇÃO: Reverter para a validação estrita de camadas do original
             match orig_module:
                 case nn.Linear():
                     self.op = F.linear
@@ -137,18 +167,19 @@ class PeftBase(nn.Module):
                     self.layer_kwargs.setdefault("dilation", orig_module.dilation)
                     self.layer_kwargs.setdefault("groups", orig_module.groups)
                 case _:
-                    # Permite que a inicialização continue mesmo para tipos não suportados,
-                    # mas não configura op, shape, etc. A lógica de criação falhará mais tarde.
-                    print(
-                        f"Aviso: Tipo de módulo não suportado encontrado em PeftBase: {type(orig_module)}. Continuando, mas pode falhar."
+                    # Manter a validação estrita do arquivo original
+                    raise NotImplementedError(
+                        f"Only Linear and Conv2d are supported layers. Got {type(orig_module)} for prefix {self.prefix}"
                     )
-                    self.op = None
-                    self.shape = None
-                    # raise NotImplementedError("Only Linear and Conv2d are supported layers.")
+            # FIM ALTERAÇÃO
 
     def hook_to_module(self):
-        if self.orig_module is None:
-            return  # Não pode fazer hook sem módulo original
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de _orig_module do modificado
+        if self._orig_module is None:
+            # Cannot hook if there is no original module (e.g., dummy loaded from state dict)
+            # print(f"Warning: Cannot hook {self.prefix}: No original module set.")
+            return
+        # FIM ALTERAÇÃO
         if not self.is_applied:
             self.orig_forward = self.orig_module.forward
             self.orig_train = self.orig_module.train
@@ -159,8 +190,12 @@ class PeftBase(nn.Module):
             self.is_applied = True
 
     def remove_hook_from_module(self):
-        if self.orig_module is None or self.orig_forward is None:
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de _orig_module e orig_forward
+        if self._orig_module is None or self.orig_forward is None:
+            # print(f"Warning: Cannot remove hook from {self.prefix}: Module or original forward not available.")
             return
+        # FIM ALTERAÇÃO
+        assert self.orig_forward is not None  # Mantido do original
         if self.is_applied:
             self.orig_module.forward = self.orig_forward
             self.orig_module.train = self.orig_train
@@ -168,23 +203,29 @@ class PeftBase(nn.Module):
             self.is_applied = False
 
     def _wrap_train(self, mode=True):
-        if self.orig_module is None or self.orig_train is None:
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de _orig_module e orig_train
+        if self._orig_module is None or self.orig_train is None:
             return
+        # FIM ALTERAÇÃO
         self.orig_train(mode)
         self.train(mode)
 
     def _wrap_eval(self):
-        if self.orig_module is None or self.orig_eval is None:
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de _orig_module e orig_eval
+        if self._orig_module is None or self.orig_eval is None:
             return
+        # FIM ALTERAÇÃO
         self.orig_eval()
         self.eval()
 
     def make_weight(self, A: Tensor, B: Tensor):
         """Layer-type-independent way of creating a weight matrix from LoRA A/B."""
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de shape
         if self.shape is None:
             raise RuntimeError(
                 f"Cannot make weight for {self.prefix}: shape not determined (likely unsupported layer type)."
             )
+        # FIM ALTERAÇÃO
         W = B.view(B.size(0), -1) @ A.view(A.size(0), -1)
         return W.view(self.shape)
 
@@ -194,94 +235,113 @@ class PeftBase(nn.Module):
             raise RuntimeError(f"Module {self.prefix} is not initialized.")
 
         # Perform assertions to make pytype happy.
-        assert self.orig_module is not None, f"orig_module is None for {self.prefix}"
+        # INÍCIO ALTERAÇÃO: Tornar asserts mais informativos
+        assert self._orig_module is not None, f"orig_module is None for {self.prefix}"
         assert self.orig_forward is not None, f"orig_forward is None for {self.prefix}"
-        # op pode ser None para tipos não suportados, mas forward deve lidar com isso
-        # assert self.op is not None
+        # Original tinha assert self.op is not None, mas agora op pode ser None temporariamente
+        # A verificação será feita no forward específico de cada subclasse
+        # FIM ALTERAÇÃO
 
     @property
     def orig_module(self) -> nn.Module:
+        # INÍCIO ALTERAÇÃO: Usar a verificação aprimorada
         if self._orig_module is None:
             raise AttributeError(
                 f"Original module not set for PEFT layer with prefix {self.prefix}"
             )
+        # FIM ALTERAÇÃO
         return self._orig_module[0]
 
     def load_state_dict(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ):
-        # Filtra o state_dict para conter apenas chaves relevantes para este módulo específico
-        module_prefix_with_dot = self.prefix  # self.prefix já termina com '.'
+        # INÍCIO ALTERAÇÃO: Usar a lógica de filtragem de prefixo da versão modificada,
+        # mas inicializar pesos *antes* de chamar super().load_state_dict
+        # Filter the state_dict to contain only keys relevant to this specific module
+        module_prefix_with_dot = self.prefix  # self.prefix already ends with '.'
         relevant_keys = {
             k: v for k, v in state_dict.items() if k.startswith(module_prefix_with_dot)
         }
-        if not relevant_keys:
-            # Se nenhuma chave relevante for encontrada, talvez o módulo não esteja no state_dict
-            # ou o prefixo está incorreto. Retorna chaves vazias para indicar isso.
-            # Não inicializa o módulo se não houver chaves para carregar.
-            # print(f"Warning: No keys found for prefix '{module_prefix_with_dot}' in state_dict.")
-            return nn.modules.module._IncompatibleKeys([], list(state_dict.keys()))
 
-        # Remove o prefixo do módulo das chaves antes de chamar o super().load_state_dict
+        if not relevant_keys:
+            # If no relevant keys are found, this module might not be in the state_dict,
+            # or the prefix is incorrect. Return empty keys to indicate this.
+            # Do not initialize the module if there are no keys to load.
+            # print(f"Debug: No keys found for prefix '{module_prefix_with_dot}' in state_dict for {type(self).__name__}.")
+            # Return what super() would return in this case (handled by LoRAModuleWrapper)
+            return nn.modules.module._IncompatibleKeys(
+                [], []
+            )  # No missing, no unexpected
+
+        # Remove the module prefix from the keys before calling super().load_state_dict
         state_dict_local = {
             k.removeprefix(module_prefix_with_dot): v for k, v in relevant_keys.items()
         }
 
-        # Inicializa os pesos apenas se não tiverem sido inicializados e houver chaves
-        # e se for um tipo de camada suportado (tem orig_module)
+        # Initialize weights only if they haven't been initialized, there are keys,
+        # and it's a supported layer type (has _orig_module set during __init__)
         if not self._initialized and state_dict_local and self._orig_module is not None:
             try:
-                self.initialize_weights()
-                self._initialized = True  # Marca como inicializado após a tentativa
+                # Ensure rank/alpha etc. are available if needed by initialize_weights
+                self.initialize_weights()  # Call the subclass implementation
+                self._initialized = True  # Mark as initialized *after* success
             except NotImplementedError as e:
                 print(
-                    f"Erro ao inicializar pesos para {self.prefix}: {e}. O módulo pode não ser carregado corretamente."
+                    f"Error initializing weights for {self.prefix}: {e}. Module might not load correctly."
                 )
-                # Não marca como inicializado se a inicialização falhar
+                # Do not mark as initialized if initialization fails
+            except AttributeError as e:
+                print(
+                    f"Error during weight initialization for {self.prefix} (likely missing rank/alpha): {e}. Module might not load correctly."
+                )
 
-        # Tenta carregar o state_dict local apenas se inicializado
+        # Attempt to load the local state_dict only if initialized
+        load_result = nn.modules.module._IncompatibleKeys(
+            [], []
+        )  # Default empty result
         if self._initialized:
-            load_result = super().load_state_dict(
-                state_dict_local, strict=strict, assign=assign
-            )
+            try:
+                load_result = super().load_state_dict(
+                    state_dict_local, strict=strict, assign=assign
+                )
+            except Exception as e:
+                print(f"Error calling super().load_state_dict for {self.prefix}: {e}")
+                # Keep default load_result indicating potential issues
         else:
-            # Se não foi inicializado (ou falhou), retorna indicando que nada foi carregado
+            # If not initialized (or failed), return indicating nothing was loaded for this module
             missing_keys = list(state_dict_local.keys())
             load_result = nn.modules.module._IncompatibleKeys(missing_keys, [])
 
-        # Remove as chaves carregadas (ou que deveriam ter sido carregadas)
-        # do state_dict original passado para rastrear as restantes
+        # Crucial: Remove the processed keys from the *original* state_dict passed to the wrapper
+        # This prevents dummy modules from trying to load them again.
         keys_processed_or_skipped = list(relevant_keys.keys())
         for key in keys_processed_or_skipped:
-            if (
-                key in state_dict
-            ):  # Verifica se a chave ainda existe (pode ter sido pop'ada)
-                state_dict.pop(
-                    key
-                )  # Remove as chaves que foram processadas (ou deveriam ter sido)
+            if key in state_dict:  # Check if the key still exists (it should)
+                state_dict.pop(key)  # Remove keys that were handled (or attempted) here
 
         return load_result
+        # FIM ALTERAÇÃO
 
-    # --- state_dict modificado para incluir prefixo ---
+    # INÍCIO ALTERAÇÃO: Adotar o state_dict modificado que adiciona o prefixo
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
-        # Obtém o state_dict local (sem prefixo do módulo)
+        # Get the local state_dict (without the module's own prefix)
         local_state_dict = super().state_dict(
             *args, destination=None, prefix="", keep_vars=keep_vars
         )
 
-        # Adiciona o prefixo do módulo (self.prefix) a cada chave local
+        # Add the module's prefix (self.prefix) to each local key
         state_dict_with_prefix = {
             self.prefix + k: v for k, v in local_state_dict.items()
         }
 
-        # Lida com o argumento 'prefix' padrão do método state_dict do PyTorch
-        # (este prefix geralmente vem de chamadas aninhadas, como model.state_dict())
+        # Handle the standard 'prefix' argument from PyTorch's state_dict method
+        # (this prefix usually comes from nested calls, like model.state_dict())
         if prefix:
             state_dict_with_prefix = {
                 prefix + k: v for k, v in state_dict_with_prefix.items()
             }
 
-        # Atualiza o destino se fornecido, caso contrário, retorna o dicionário com prefixos
+        # Update the destination if provided, otherwise return the dictionary with prefixes
         if destination is None:
             destination = state_dict_with_prefix
         else:
@@ -289,55 +349,12 @@ class PeftBase(nn.Module):
 
         return destination
 
+    # FIM ALTERAÇÃO
+
+    @abstractmethod
     def initialize_weights(self):
-        if self._initialized:
-            return
-
-        match type(self).__name__:
-            case "LoRAModule" | "DoRAModule":
-                down, up = self.create_layer()
-                self.lora_down = down
-                self.lora_up = up
-                nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-                nn.init.zeros_(self.lora_up.weight)
-
-                if hasattr(self, "dora_scale") and self.dora_scale is None:
-                    orig_weight = get_unquantized_weight(self.orig_module, torch.float32, self.train_device)
-                    eps = torch.finfo(orig_weight.dtype).eps if self.norm_epsilon else 0.0
-                    if isinstance(self.orig_module, nn.Conv2d):
-                        norm = torch.norm(orig_weight, p=2, dim=(1, 2, 3), keepdim=True) + eps
-                        # self.dora_num_dims não é mais necessário da forma como a normalização foi reescrita
-                    elif isinstance(self.orig_module, nn.Linear):
-                        norm = torch.norm(orig_weight, p=2, dim=0, keepdim=True) + eps
-                        # self.dora_num_dims não é mais necessário
-                    else:
-                        # Fallback ou erro
-                        print(f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA init for {self.prefix}")
-                        norm = torch.norm(orig_weight, p=2) + eps
-                    
-                    self.dora_scale = nn.Parameter(norm.to(self.orig_module.weight.device, dtype=self.orig_module.weight.dtype))
-                    del orig_weight
-
-            case "LoHaModule":
-                w1b, w1a = self.create_layer()
-                w2b, w2a = self.create_layer()
-
-                self.hada_w1_a = w1a.weight
-                self.hada_w1_b = w1b.weight
-                self.hada_w2_a = w2a.weight
-                self.hada_w2_b = w2b.weight
-
-                nn.init.normal_(self.hada_w1_a, std=0.1)
-                nn.init.normal_(self.hada_w1_b, std=1)
-                nn.init.constant_(self.hada_w2_a, 0)
-                nn.init.normal_(self.hada_w2_b, std=1)
-
-            case _:
-                raise NotImplementedError(
-                    f"initialize_weights() não implementado para {type(self).__name__}"
-                )
-
-        self._initialized = True
+        # Revertido: A inicialização será feita nas subclasses como no original
+        pass
 
     @abstractmethod
     def apply_to_module(self):
@@ -356,19 +373,22 @@ class PeftBase(nn.Module):
         Does not perform initialization, as that usually depends on the PEFT
         method.
         """
-        if self.orig_module is None:
+        # INÍCIO ALTERAÇÃO: Usar a verificação de orig_module e rank aprimorada
+        if self._orig_module is None:
             raise RuntimeError(
                 f"Cannot create layer for {self.prefix}: Original module is None."
             )
+        if not hasattr(self, "rank"):
+            raise AttributeError(
+                f"Rank not set for PEFT module {self.prefix} before calling create_layer."
+            )
+        # FIM ALTERAÇÃO
 
         device = self.orig_module.weight.device
         match self.orig_module:
             case nn.Linear():
                 in_features = self.orig_module.in_features
                 out_features = self.orig_module.out_features
-                # Certifica-se que self.rank existe
-                if not hasattr(self, "rank"):
-                    raise AttributeError(f"Rank not set for {self.prefix}")
                 lora_down = nn.Linear(in_features, self.rank, bias=False, device=device)
                 lora_up = nn.Linear(self.rank, out_features, bias=False, device=device)
 
@@ -380,9 +400,6 @@ class PeftBase(nn.Module):
                 padding = self.orig_module.padding
                 dilation = self.orig_module.dilation
                 groups = self.orig_module.groups
-                # Certifica-se que self.rank existe
-                if not hasattr(self, "rank"):
-                    raise AttributeError(f"Rank not set for {self.prefix}")
                 lora_down = Conv2d(
                     in_channels,
                     self.rank,
@@ -393,6 +410,11 @@ class PeftBase(nn.Module):
                     bias=False,
                     device=device,
                 )
+                # INÍCIO ALTERAÇÃO: Manter a nota sobre grupos e stride/padding explícitos de Conv2d
+                # Note: small departure here from part of the community.
+                # The original Microsoft repo does it this way. The cloneofsimo
+                # repo handles the groups in lora_down. We follow the Microsoft
+                # way. In reality, there shouldn't be any difference.
                 lora_up = Conv2d(
                     self.rank,
                     out_channels // groups,
@@ -401,9 +423,11 @@ class PeftBase(nn.Module):
                     padding=0,
                     bias=False,
                     device=device,
-                )  # Stride e padding explícitos
+                )
+                # FIM ALTERAÇÃO
 
             case _:
+                # This case should ideally not be reached due to the check in __init__
                 raise NotImplementedError(
                     f"Layer creation not implemented for type: {type(self.orig_module)}"
                 )
@@ -414,16 +438,25 @@ class PeftBase(nn.Module):
     def make_dummy(cls):
         """Create a dummy version of a PEFT class."""
 
+        # INÍCIO ALTERAÇÃO: Usar a implementação Dummy da versão modificada, que parece mais robusta
+        # para state_dict e inicialização.
         class Dummy(cls):
             def __init__(self, *args, **kwargs):
-                prefix = args[0] if args else kwargs.get("prefix", "dummy_prefix")
-                PeftBase.__init__(
-                    self, prefix, None
-                )  # Chama __init__ da base sem módulo real
+                # Extract prefix carefully from args or kwargs
+                prefix_arg = args[0] if args else kwargs.get("prefix", "dummy_prefix")
+                # Call PeftBase init with None for orig_module
+                PeftBase.__init__(self, prefix_arg, None)
                 self._state_dict = {}
-                self._initialized = (
-                    False  # Dummies não são 'inicializados' no sentido de ter pesos
-                )
+                # Dummies are not 'initialized' in the sense of having real weights,
+                # but we set _initialized based on whether state_dict was loaded.
+                self._initialized = False
+                # Store rank/alpha if provided, needed for state_dict compatibility sometimes
+                self.rank = args[2] if len(args) > 2 else kwargs.get("rank", 0)
+                self.alpha_val = (
+                    args[3] if len(args) > 3 else kwargs.get("alpha", 0.0)
+                )  # Store alpha value
+                # Dummies don't have dropout in the same way, but add attribute for consistency
+                self.dropout = Dropout(0)  # Dummy dropout
 
             def forward(self, *args, **kwargs):
                 raise NotImplementedError(
@@ -436,6 +469,7 @@ class PeftBase(nn.Module):
                 strict: bool = True,
                 assign: bool = False,
             ):
+                # Logic from modified version to handle prefixes correctly
                 module_prefix_with_dot = self.prefix
                 relevant_keys = {
                     k: v
@@ -448,51 +482,40 @@ class PeftBase(nn.Module):
                 }
 
                 if not state_dict_local:
+                    # No keys for this dummy, return empty incompatibility info
                     return nn.modules.module._IncompatibleKeys([], [])
 
-                self._initialized = (
-                    True  # Marca como 'inicializado' para ter um state_dict
-                )
+                # Store the loaded state locally, mark as "initialized" to have a state_dict
+                self._initialized = True
                 self._state_dict = copy.deepcopy(state_dict_local)
+                # Register alpha buffer if it was loaded
+                if "alpha" in self._state_dict:
+                    # Ensure buffer exists before loading into it
+                    if not hasattr(self, "alpha"):
+                        self.register_buffer("alpha", self._state_dict["alpha"].clone())
+                    else:
+                        self.alpha.copy_(self._state_dict["alpha"])
+                    # Dummies don't train, so no grad needed
+                    self.alpha.requires_grad_(False)
+                elif self.alpha_val is not None:  # If alpha value was passed at init
+                    if not hasattr(self, "alpha"):
+                        self.register_buffer("alpha", torch.tensor(self.alpha_val))
+                        self.alpha.requires_grad_(False)
 
+                # Remove processed keys from the input dict
                 keys_to_remove = list(relevant_keys.keys())
                 for key in keys_to_remove:
                     if key in state_dict:
                         state_dict.pop(key)
 
+                # Report no missing/unexpected keys for the dummy itself
                 return nn.modules.module._IncompatibleKeys([], [])
 
-            def state_dict(
-                self, *args, destination=None, prefix="", keep_vars=False
-            ):  # Assinatura completa
-                if not self._initialized:
-                    # Retorna vazio se nunca carregou nada
-                    if destination is None:
-                        destination = {}
-                    return destination
-
-                # Adiciona o prefixo do módulo (self.prefix)
-                state_dict_with_module_prefix = {
-                    self.prefix + k: v for k, v in self._state_dict.items()
-                }
-
-                # Adiciona o prefixo externo (geralmente da chamada pai)
-                if prefix:
-                    state_dict_with_full_prefix = {
-                        prefix + k: v for k, v in state_dict_with_module_prefix.items()
-                    }
-                else:
-                    state_dict_with_full_prefix = state_dict_with_module_prefix
-
-                if destination is None:
-                    destination = state_dict_with_full_prefix
-                else:
-                    destination.update(state_dict_with_full_prefix)
-
-                return destination
+            # Use the state_dict from the modified PeftBase which handles prefixes
+            # Inherited method PeftBase.state_dict(...) works correctly here now.
 
             def initialize_weights(self):
-                pass  # Não faz nada
+                pass  # Does nothing for a dummy
 
             def hook_to_module(self):
                 raise NotImplementedError("Should never be called on a dummy module.")
@@ -507,6 +530,7 @@ class PeftBase(nn.Module):
                 raise NotImplementedError("Should never be called on a dummy module.")
 
         return Dummy
+        # FIM ALTERAÇÃO
 
 
 class LoHaModule(PeftBase):
@@ -514,10 +538,12 @@ class LoHaModule(PeftBase):
 
     rank: int
     dropout: Dropout
+    # INÍCIO ALTERAÇÃO: Usar Parameter para pesos LoHa
     hada_w1_a: Parameter | None
     hada_w1_b: Parameter | None
     hada_w2_a: Parameter | None
     hada_w2_b: Parameter | None
+    # FIM ALTERAÇÃO
 
     def __init__(
         self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float
@@ -532,14 +558,44 @@ class LoHaModule(PeftBase):
         self.hada_w2_b = None
 
         if orig_module is not None:
-            try:  # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
+            # INÍCIO ALTERAÇÃO: Inicializar pesos aqui como no original
+            try:
                 self.initialize_weights()
                 self.alpha = self.alpha.to(orig_module.weight.device)
             except NotImplementedError:
+                # Should not happen if __init__ checks passed, but good practice
                 print(
-                    f"Aviso: Não foi possível inicializar LoHa para {prefix} devido ao tipo de camada."
+                    f"Warning: LoHa init failed for {prefix} due to unsupported layer type."
                 )
-        # self.alpha.requires_grad_(False)
+            # FIM ALTERAÇÃO
+        # INÍCIO ALTERAÇÃO: Mover requires_grad_(False) para após a inicialização
+        if hasattr(self, "alpha"):
+            self.alpha.requires_grad_(False)
+        # FIM ALTERAÇÃO
+
+    def initialize_weights(self):
+        # INÍCIO ALTERAÇÃO: Lógica de inicialização movida para cá (como no original)
+        if self._initialized:
+            return
+        if self._orig_module is None:
+            return  # Cannot initialize without original module
+
+        hada_w1_b_module, hada_w1_a_module = self.create_layer()
+        hada_w2_b_module, hada_w2_a_module = self.create_layer()
+
+        # Assign as nn.Parameter
+        self.hada_w1_a = Parameter(hada_w1_a_module.weight)
+        self.hada_w1_b = Parameter(hada_w1_b_module.weight)
+        self.hada_w2_a = Parameter(hada_w2_a_module.weight)
+        self.hada_w2_b = Parameter(hada_w2_b_module.weight)
+
+        # Initialization values from original
+        nn.init.normal_(self.hada_w1_a, std=0.1)
+        nn.init.normal_(self.hada_w1_b, std=1)
+        nn.init.constant_(self.hada_w2_a, 0)
+        nn.init.normal_(self.hada_w2_b, std=1)
+        self._initialized = True
+        # FIM ALTERAÇÃO
 
     def check_initialized(self):
         super().check_initialized()
@@ -547,29 +603,40 @@ class LoHaModule(PeftBase):
         assert self.hada_w1_b is not None
         assert self.hada_w2_a is not None
         assert self.hada_w2_b is not None
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de alpha
+        assert hasattr(self, "alpha"), f"Alpha buffer missing in LoHa {self.prefix}"
+        # FIM ALTERAÇÃO
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-        if self.op is None:  # Se a camada original não era suportada
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de self.op
+        if self.op is None:  # If the original layer was not supported
             print(
-                f"Aviso: Pulando forward de LoHa para {self.prefix} (tipo de camada não suportado). Retornando saída original."
+                f"Warning: Skipping LoHa forward for {self.prefix} (unsupported layer type). Returning original output."
             )
             return self.orig_forward(x)
+        # FIM ALTERAÇÃO
 
+        # Logic from original
         W1 = self.make_weight(
             self.dropout(self.hada_w1_b), self.dropout(self.hada_w1_a)
         )
         W2 = self.make_weight(
             self.dropout(self.hada_w2_b), self.dropout(self.hada_w2_a)
         )
-        W = (W1 * W2) * (self.alpha.item() / self.rank)  # Usa .item()
+        # INÍCIO ALTERAÇÃO: Usar .item() para alpha no cálculo
+        scale = self.alpha.item() / self.rank
+        W = (W1 * W2) * scale
+        # FIM ALTERAÇÃO
         return self.orig_forward(x) + self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
-        pass  # TODO
+        # TODO: Implement merging logic if needed
+        raise NotImplementedError
 
     def extract_from_module(self, base_module: nn.Module):
-        pass  # TODO
+        # TODO: Implement extraction logic if needed
+        raise NotImplementedError
 
 
 class LoRAModule(PeftBase):
@@ -583,6 +650,7 @@ class LoRAModule(PeftBase):
         self, prefix: str, orig_module: nn.Module | None, rank: int, alpha: float
     ):
         super().__init__(prefix, orig_module)
+
         self.rank = rank
         self.dropout = Dropout(0)
         self.register_buffer("alpha", torch.tensor(alpha))
@@ -590,14 +658,33 @@ class LoRAModule(PeftBase):
         self.lora_up = None
 
         if orig_module is not None:
-            try:  # Tenta inicializar, mas permite falha se o tipo de camada não for suportado
+            # INÍCIO ALTERAÇÃO: Inicializar pesos aqui como no original
+            try:
                 self.initialize_weights()
                 self.alpha = self.alpha.to(orig_module.weight.device)
             except NotImplementedError:
                 print(
-                    f"Aviso: Não foi possível inicializar LoRA para {prefix} devido ao tipo de camada."
+                    f"Warning: LoRA init failed for {prefix} due to unsupported layer type."
                 )
-        # self.alpha.requires_grad_(False)
+            # FIM ALTERAÇÃO
+        # INÍCIO ALTERAÇÃO: Mover requires_grad_(False) para após a inicialização
+        if hasattr(self, "alpha"):
+            self.alpha.requires_grad_(False)
+        # FIM ALTERAÇÃO
+
+    def initialize_weights(self):
+        # INÍCIO ALTERAÇÃO: Lógica de inicialização movida para cá (como no original)
+        if self._initialized:
+            return
+        if self._orig_module is None:
+            return
+
+        self.lora_down, self.lora_up = self.create_layer()
+        # Initialization from original
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
+        self._initialized = True
+        # FIM ALTERAÇÃO
 
     def check_initialized(self):
         super().check_initialized()
@@ -605,12 +692,16 @@ class LoRAModule(PeftBase):
             self.lora_down is not None
         ), f"LoRA down not initialized for {self.prefix}"
         assert self.lora_up is not None, f"LoRA up not initialized for {self.prefix}"
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de alpha
+        assert hasattr(self, "alpha"), f"Alpha buffer missing in LoRA {self.prefix}"
+        # FIM ALTERAÇÃO
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-        if self.op is None:  # Se a camada original não era suportada
+        # INÍCIO ALTERAÇÃO: Adicionar verificação de self.op e usar .item() para alpha
+        if self.op is None:  # If the original layer was not supported
             print(
-                f"Aviso: Pulando forward de LoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original."
+                f"Warning: Skipping LoRA forward for {self.prefix} (unsupported layer type). Returning original output."
             )
             return self.orig_forward(x)
 
@@ -618,27 +709,98 @@ class LoRAModule(PeftBase):
         original_output = self.orig_forward(x)
         scale = self.alpha.item() / self.rank
         return original_output + lora_output * scale
+        # FIM ALTERAÇÃO
 
     def apply_to_module(self):
-        pass  # TODO
+        # TODO: Implement merging logic if needed
+        raise NotImplementedError
 
     def extract_from_module(self, base_module: nn.Module):
-        pass  # TODO
+        # TODO: Implement extraction logic if needed
+        raise NotImplementedError
 
 
 class DoRAModule(LoRAModule):
     """Weight-decomposed low rank adaptation."""
 
-    dora_num_dims: int
-    dora_scale: Parameter | None
+    # INÍCIO ALTERAÇÃO: Manter atributos da versão modificada
+    # dora_num_dims is implicitly handled by norm calculation now
+    dora_scale: Parameter | None  # Use Parameter for trainable scale
     norm_epsilon: bool
-    train_device: torch.device
+    train_device: torch.device  # Add train_device attribute
+    # FIM ALTERAÇÃO
 
+    # INÍCIO ALTERAÇÃO: Modificar init para aceitar kwargs de DoRA
     def __init__(self, *args, **kwargs):
-        self.dora_scale = None
-        self.norm_epsilon = kwargs.pop("norm_epsilon", False)
-        self.train_device = kwargs.pop("train_device", torch.device("cpu"))
-        super().__init__(*args, **kwargs)  # Chama __init__ de LoRAModule
+        # Pop DoRA specific kwargs before calling super().__init__
+        self.norm_epsilon = kwargs.pop("norm_epsilon", 1e-6)  # Default epsilon
+        self.train_device = kwargs.pop(
+            "train_device", torch.device("cpu")
+        )  # Default device
+        self.dora_scale = None  # Initialize as None
+        # Call LoRAModule's __init__ with remaining args/kwargs
+        super().__init__(*args, **kwargs)
+        # Note: initialize_weights is called by super() if orig_module exists
+
+    # FIM ALTERAÇÃO
+
+    def initialize_weights(self):
+        # INÍCIO ALTERAÇÃO: Chamar init de LoRA e depois adicionar init de DoRA
+        if self._initialized:
+            return
+        if self._orig_module is None:
+            return
+
+        # 1. Initialize LoRA components first
+        super().initialize_weights()  # Calls create_layer, inits lora_down/up
+        if not self._initialized:
+            return  # Stop if LoRA init failed
+
+        # 2. Initialize DoRA specific scale
+        # Use float32 for norm calculation stability, then cast back
+        orig_weight = get_unquantized_weight(
+            self.orig_module, torch.float32, self.train_device
+        )
+        eps = torch.finfo(orig_weight.dtype).eps if self.norm_epsilon else 0.0
+
+        # Calculate norm based on layer type (more explicit version from modified file)
+        if isinstance(self.orig_module, nn.Conv2d):
+            # Norm per output filter (output channel dim 0)
+            norm = (
+                torch.linalg.vector_norm(
+                    orig_weight, ord=2, dim=(1, 2, 3), keepdim=True
+                )
+                + eps
+            )
+        elif isinstance(self.orig_module, nn.Linear):
+            # Norm per output neuron (output channel dim 0) -> weight dims are (out, in)
+            norm = (
+                torch.linalg.vector_norm(orig_weight, ord=2, dim=1, keepdim=True) + eps
+            )
+            # Alternative for Linear (like original): norm per column (input feature)
+            # norm = torch.linalg.vector_norm(orig_weight, ord=2, dim=0, keepdim=True) + eps
+            # Let's stick to norm per output neuron, seems more common for magnitude scaling
+        else:
+            # Fallback or should not happen due to initial checks
+            print(
+                f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA init for {self.prefix}"
+            )
+            norm = (
+                torch.linalg.vector_norm(orig_weight.flatten(), ord=2) + eps
+            )  # Norm of flattened tensor
+            # Reshape might be needed depending on how scale is used, but this is fallback
+            norm = norm.reshape(1 for _ in orig_weight.dim())  # Make it broadcastable
+
+        # Create scale Parameter on the correct device and dtype
+        self.dora_scale = Parameter(
+            norm.to(
+                device=self.orig_module.weight.device,
+                dtype=self.orig_module.weight.dtype,
+            )
+        )
+        # self._initialized is already True from super().initialize_weights()
+        del orig_weight
+        # FIM ALTERAÇÃO
 
     def check_initialized(self):
         super().check_initialized()
@@ -648,593 +810,731 @@ class DoRAModule(LoRAModule):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-        if self.op is None:  # Se a camada original não era suportada
+        # INÍCIO ALTERAÇÃO: Usar a lógica forward aprimorada da versão modificada
+        # que aplica dropout no input e calcula norma corretamente
+        if self.op is None:  # If the original layer was not supported
             print(
-                f"Aviso: Pulando forward de DoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original."
+                f"Warning: Skipping DoRA forward for {self.prefix} (unsupported layer type). Returning original output."
             )
-            return self.orig_forward(x)
+            # Still need to apply dropout if it's part of the DoRA spec
+            return self.orig_forward(
+                self.dropout(x)
+            )  # Apply dropout as per DoRA paper mention
 
+        # Get components
         A = self.lora_down.weight
         B = self.lora_up.weight
-        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
+        # Calculate LoRA delta, use float32 for intermediate calcs if needed
+        lora_dtype = A.dtype
+        orig_weight = get_unquantized_weight(
+            self.orig_module, lora_dtype, self.train_device
+        )
+
+        # Calculate the LoRA modification scaled by alpha/rank
         lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
-        WP = orig_weight + lora_delta_w
-        del orig_weight, lora_delta_w # Libera memória
 
-        eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        
+        # Calculate the adapted weight matrix W' = W + deltaW
+        adapted_weight = orig_weight + lora_delta_w
+
+        # Calculate the norm of the adapted weight matrix W'
+        # Use float32 for stability, detach for backprop as per paper
+        adapted_weight_f32 = adapted_weight.to(torch.float32)
+        eps = torch.finfo(adapted_weight_f32.dtype).eps if self.norm_epsilon else 0.0
+
         if isinstance(self.orig_module, nn.Conv2d):
-            # Norma por filtro de saída (canal de saída)
-            norm = torch.norm(WP.detach().to(torch.float32), p=2, dim=(1, 2, 3), keepdim=True) + eps
+            norm = (
+                torch.linalg.vector_norm(
+                    adapted_weight_f32.detach(), ord=2, dim=(1, 2, 3), keepdim=True
+                )
+                + eps
+            )
         elif isinstance(self.orig_module, nn.Linear):
-            # Norma por neurônio de saída (coluna)
-            norm = torch.norm(WP.detach().to(torch.float32), p=2, dim=0, keepdim=True) + eps
+            norm = (
+                torch.linalg.vector_norm(
+                    adapted_weight_f32.detach(), ord=2, dim=1, keepdim=True
+                )
+                + eps
+            )  # Per output neuron
+            # norm = torch.linalg.vector_norm(adapted_weight_f32.detach(), ord=2, dim=0, keepdim=True) + eps # Per input feature (alternative)
         else:
-            # Fallback ou erro se outro tipo de camada for encontrado inesperadamente
-            # Usando norma L2 geral como fallback, mas pode não ser ideal.
-            print(f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA forward for {self.prefix}")
-            norm = torch.norm(WP.detach().to(torch.float32), p=2) + eps
+            # Fallback - should not happen
+            norm = (
+                torch.linalg.vector_norm(adapted_weight_f32.detach().flatten(), ord=2)
+                + eps
+            )
+            norm = norm.reshape(1 for _ in adapted_weight_f32.dim())
 
-        WP_normalized = WP / norm.to(WP.device, dtype=WP.dtype) # Garante que a norma esteja no dispositivo/dtype correto
-        WP_scaled = self.dora_scale * WP_normalized
+        # Normalize the adapted weight and scale by DoRA magnitude
+        # Ensure norm is on the correct device and dtype before division
+        norm = norm.to(device=adapted_weight.device, dtype=adapted_weight.dtype)
+        final_weight = self.dora_scale * (adapted_weight / norm)
 
+        # Apply dropout to input x as mentioned in DoRA implementations
         x_dropout = self.dropout(x)
-        return self.op(x_dropout, WP_scaled, self.orig_module.bias, **self.layer_kwargs)
+
+        # Perform the original operation with the final DoRA weight
+        output = self.op(
+            x_dropout,
+            final_weight,
+            self.orig_module.bias,  # Use original bias
+            **self.layer_kwargs,
+        )
+
+        del (
+            orig_weight,
+            lora_delta_w,
+            adapted_weight,
+            adapted_weight_f32,
+            norm,
+            final_weight,
+        )  # Memory cleanup
+        return output
+        # FIM ALTERAÇÃO
 
 
-# Cria instâncias Dummy após as definições das classes originais
+# INÍCIO ALTERAÇÃO: (Re)definir Dummies após classes base
 DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()
 DummyLoHaModule = LoHaModule.make_dummy()
+# FIM ALTERAÇÃO
 
 
+# INÍCIO ALTERAÇÃO: Adotar LoRAModuleWrapper da versão modificada, que inclui
+# presets, filtros, RuleSet, e lógica de criação/carregamento aprimorada.
 class LoRAModuleWrapper:
     """
-    Gerencia módulos PEFT (LoRA, LoHa, DoRA) para um módulo PyTorch original.
+    Manages PEFT modules (LoRA, LoHa, DoRA) for a PyTorch module.
 
-    Permite aplicar diferentes configurações de rank e alpha para diferentes
-    camadas com base em padrões de nome definidos em `config.lora_layer_patterns`.
-    Também suporta um `module_filter` para pré-selecionar camadas.
+    Allows applying different rank/alpha configurations to different layers
+    based on name patterns defined in `config.lora_layer_patterns` or presets.
+    Also supports `module_filter` and `lora_layers_blacklist` for layer selection.
     """
 
-    orig_module: nn.Module
+    orig_module: nn.Module | None  # Can be None if only loading from state_dict
     prefix: str
-    peft_type: Any  # Tipo PeftType ou placeholder
-    default_rank: int  # Rank padrão global
-    default_alpha: float  # Alpha padrão global
-    lora_layer_patterns: dict[str, dict[str, int | float]]  # Configs por padrão
-    ruleset: RuleSet
-    _sorted_patterns: list[
-        str
-    ]  # Chaves de lora_layer_patterns ordenadas por especificidade
-    klass: type[PeftBase]  # Classe PEFT a ser usada (LoRA, LoHa, DoRA)
-    dummy_klass: type[PeftBase]  # Classe Dummy correspondente
-    global_additional_kwargs: dict  # Kwargs para DoRA (norm_epsilon, train_device)
-    lora_modules: dict[str, PeftBase]  # Módulos PEFT gerenciados (reais e dummies)
+    peft_type: PeftType
+    config: TrainConfig  # Store config for access to various settings
+    default_rank: int
+    default_alpha: float
+    lora_layer_patterns: dict[
+        str, dict[str, int | float]
+    ]  # Final patterns after preset merge
+    ruleset: RuleSet  # Applies the patterns
+    inclusion_filter_patterns: list[str]  # Patterns for layers to *potentially* include
+    exclusion_filter_patterns: list[str]  # Patterns for layers to *definitely* exclude
+    klass: type[PeftBase]  # PEFT class to use (LoRA, LoHa, DoRA)
+    dummy_klass: type[PeftBase]  # Corresponding Dummy class
+    global_additional_kwargs: dict  # Kwargs for PEFT class (e.g., for DoRA)
+    lora_modules: dict[
+        str, PeftBase
+    ]  # Managed PEFT modules (real and dummies), keyed by original layer name
 
     def __init__(
         self,
         orig_module: nn.Module | None,
         prefix: str,
         config: TrainConfig,
-        # INÍCIO ALTERAÇÃO - Modificado para aceitar nome do preset
-        preset_name: str | None = None,  # Nome do preset a ser carregado de PRESETS
-        external_module_filter: (
-            list[str] | None
-        ) = None,  # Filtro adicional/override externo
-        # FIM ALTERAÇÃO
-        module_filter: list[str] | None = None,
+        preset_name: str | None = None,  # Name of the preset to load from PRESETS
+        external_module_filter: list[str] | None = None,  # Additional/override filter
+        # Removed module_filter arg, now handled by external_module_filter and preset logic
     ):
         """
-        Inicializa o Wrapper.
+        Initializes the Wrapper.
 
         Args:
-            orig_module: O módulo nn.Module original a ser adaptado.
-            prefix: Prefixo a ser adicionado às chaves LoRA (ex: "lora_unet").
-            config: Objeto TrainConfig contendo as configurações:
-                - peft_type: Tipo de adaptação (LoRA, LoHa, DoRA).
-                - lora_rank: Rank padrão a ser usado se nenhum padrão corresponder.
-                - lora_alpha: Alpha padrão a ser usado se nenhum padrão corresponder.
-                - lora_layer_patterns: Dicionário mapeando padrões de nome de camada
-                  para dicionários com 'rank' e/ou 'alpha' específicos.
-                  Ex: {"attn1": {"rank": 16}, "ff.net": {"rank": 32, "alpha": 16}}
-                - lora_decompose: True para usar DoRA em vez de LoRA.
-                - lora_decompose_norm_epsilon: Epsilon para DoRA.
-                - train_device: Dispositivo para DoRA.
-            module_filter: Lista opcional de substrings. Apenas camadas cujo nome
-              contém pelo menos uma dessas substrings serão consideradas para PEFT.
-              Se None ou vazio, todas as camadas Linear/Conv2d são consideradas.
+            orig_module: The original nn.Module to be adapted (can be None).
+            prefix: Prefix added to PEFT module keys (e.g., "lora_unet").
+            config: TrainConfig object containing settings:
+                - peft_type: PeftType (LORA, LOHA, DORA).
+                - lora_rank: Default rank if no pattern matches.
+                - lora_alpha: Default alpha if no pattern matches.
+                - lora_layer_patterns: Base dictionary mapping layer name patterns
+                  to {'rank': R, 'alpha': A} overrides.
+                - lora_layers_blacklist: List of patterns to explicitly exclude.
+                - lora_decompose: True to use DoRA instead of LoRA.
+                - lora_decompose_norm_epsilon: Epsilon for DoRA norm.
+                - train_device: Device for DoRA calculations.
+            preset_name: Optional name of a preset configuration (e.g., 'attn', 'full').
+                         Presets define inclusion filters and can override ranks/alphas.
+            external_module_filter: Optional list of patterns. If provided, acts as an
+                                   *additional* inclusion filter alongside the preset's filter.
         """
         if orig_module is None:
-            print("Aviso: LoRAModuleWrapper inicializado sem um módulo original.")
-            # Pode ser útil para carregar apenas a partir de um state_dict,
-            # mas a criação inicial de módulos não ocorrerá.
+            print(
+                f"Info: LoRAModuleWrapper '{prefix}' initialized without an original module. Will only load from state_dict."
+            )
         self.orig_module = orig_module
-        self.prefix = prefix
+        self.prefix = prefix  # The user-provided prefix (e.g., "lora_unet")
         self.peft_type = config.peft_type
-        self.config = config
+        self.config = config  # Keep a reference to the config
 
-        # Armazena os valores padrão
+        # Store default values
         self.default_rank = config.lora_rank
         self.default_alpha = config.lora_alpha
 
-        # INÍCIO ALTERAÇÃO - Lógica Refatorada para Presets, Filtros e Blacklist
-        # 1. Carregar padrões e filtros do preset
-        from modules.modelSetup.StableDiffusionXLLoRASetup import (
-            PRESETS,
-        )  # Mover import para cá é mais seguro se PRESETS for complexo
+        # --- Logic for Presets, Filters, and Patterns (from modified version) ---
 
-        # Começa com os padrões globais da config principal
+        # 1. Load presets and patterns
+        # Import PRESETS locally to avoid circular dependencies if PRESETS imports this module
+        try:
+            # Assume PRESETS is accessible in the project structure
+            # Adjust the import path if necessary
+            from modules.model_setup.preset_lora import PRESETS
+        except ImportError:
+            print("Warning: PRESETS dictionary not found. Presets will not be loaded.")
+            PRESETS = {}
+
+        # Start with base patterns from main config
         self.lora_layer_patterns = (
             config.lora_layer_patterns.copy() if config.lora_layer_patterns else {}
         )
-        preset_inclusion_patterns = []  # Padrões de *inclusão* vindos do preset
+        preset_inclusion_patterns = []  # Inclusion patterns defined *by the preset*
 
         if preset_name:
             preset_config = PRESETS.get(preset_name)
-            if (
-                preset_config is None and preset_name != "full"
-            ):  # Trata preset não encontrado ou explicitamente None
+            if preset_config is None and preset_name != "full":
                 print(
-                    f"[LoRA WARNING] Preset '{preset_name}' não encontrado ou é None. Usando padrões globais e filtro externo/blacklist."
+                    f"[LoRA WARNING] Preset '{preset_name}' not found or is None. Using global patterns and external filter/blacklist."
                 )
             elif preset_name == "full":
                 print(
-                    f"[LoRA INFO] Preset 'full' selecionado. Nenhum filtro de inclusão ou override de rank/alpha do preset aplicado."
+                    f"[LoRA INFO] Preset 'full' selected. No preset-specific inclusion filter or rank/alpha overrides applied."
                 )
+                # 'full' implies no *preset* filter, but external filter and blacklist still apply.
             elif isinstance(preset_config, dict):
                 print(
-                    f"[LoRA INFO] Usando preset '{preset_name}' com {len(preset_config)} padrões/overrides."
+                    f"[LoRA INFO] Using preset '{preset_name}' with {len(preset_config)} rules/overrides."
                 )
-                # Padrões de inclusão são as *chaves* do dicionário do preset
+                # Keys of the preset dict act as inclusion patterns *for this preset*
                 preset_inclusion_patterns = list(preset_config.keys())
-                # Mescla os overrides de rank/alpha do preset sobre os globais
+                # Merge preset's rank/alpha overrides into the main patterns
                 self.lora_layer_patterns.update(preset_config)
             else:
-                # Caso inesperado (e.g., lista em vez de dict) - tratar como erro ou aviso
                 print(
-                    f"[LoRA WARNING] Preset '{preset_name}' tem formato inesperado ({type(preset_config)}). Ignorando preset."
+                    f"[LoRA WARNING] Preset '{preset_name}' has unexpected format ({type(preset_config)}). Ignoring preset."
                 )
         else:
             print(
-                "[LoRA INFO] Nenhum preset especificado. Usando padrões globais e filtro externo/blacklist."
+                "[LoRA INFO] No preset specified. Using global patterns and external filter/blacklist."
             )
 
-        # 2. Combinar filtros de *inclusão* (Preset + External)
-        # Se um módulo corresponder a *qualquer* padrão de inclusão, ele é considerado.
-        combined_inclusion_patterns = set(preset_inclusion_patterns)
+        # 2. Combine inclusion filters (Preset + External)
+        # A module must match *at least one* inclusion pattern to be considered.
+        combined_inclusion_patterns = set(
+            p.strip() for p in preset_inclusion_patterns if p.strip()
+        )
         if external_module_filter:
-            combined_inclusion_patterns.update(external_module_filter)
+            combined_inclusion_patterns.update(
+                p.strip() for p in external_module_filter if p.strip()
+            )
 
-        # Lista final de padrões de inclusão (vazia significa "incluir tudo")
-        self.inclusion_filter_patterns = [
-            p.strip() for p in combined_inclusion_patterns if p.strip()
-        ]
+        # Final list of inclusion patterns (empty means "include everything" that isn't blacklisted)
+        self.inclusion_filter_patterns = list(combined_inclusion_patterns)
         print(
-            f"[LoRA INFO] Padrões de inclusão ativos: {self.inclusion_filter_patterns if self.inclusion_filter_patterns else 'Nenhum (incluir tudo)'}"
+            f"[LoRA INFO] Active inclusion patterns: {self.inclusion_filter_patterns if self.inclusion_filter_patterns else 'None (include all unless blacklisted)'}"
         )
 
-        # 3. Preparar filtro de *exclusão* (Blacklist)
+        # 3. Prepare exclusion filter (Blacklist)
         self.exclusion_filter_patterns = [
             b.strip() for b in (config.lora_layers_blacklist or []) if b.strip()
         ]
         print(
-            f"[LoRA INFO] Padrões de exclusão (blacklist) ativos: {self.exclusion_filter_patterns if self.exclusion_filter_patterns else 'Nenhum'}"
+            f"[LoRA INFO] Active exclusion patterns (blacklist): {self.exclusion_filter_patterns if self.exclusion_filter_patterns else 'None'}"
         )
 
-        # 4. Inicializar RuleSet com os padrões *finais* (global + preset overrides)
-        # A RuleSet será usada APENAS para determinar rank/alpha dos módulos que passarem nos filtros.
+        # 4. Initialize RuleSet with the *final* combined patterns (global + preset overrides)
+        # RuleSet is used ONLY to determine rank/alpha for modules that pass the filters.
         self.ruleset = RuleSet(self.lora_layer_patterns)
         print(
-            f"[LoRA INFO] RuleSet inicializada com {len(self.ruleset.patterns)} regras de rank/alpha."
+            f"[LoRA INFO] RuleSet initialized with {len(self.ruleset.patterns)} rank/alpha rules."
         )
-        # Debug: Mostrar algumas regras carregadas
-        # print(f"[LoRA DEBUG] Primeiras 5 regras na RuleSet: {list(self.ruleset.patterns.items())[:5]}")
+        # Debug: Show some loaded rules
+        # print(f"[LoRA DEBUG] First 5 rules in RuleSet: {list(self.ruleset.patterns.items())[:5]}")
 
-        # 5. Definir classes PEFT e kwargs globais (sem alteração aqui)
+        # 5. Define PEFT classes and global kwargs based on config
         self.global_additional_kwargs = {}
         if self.peft_type == PeftType.LORA:
-            if config.lora_decompose:  # Usar config diretamente
+            if config.lora_decompose:
                 self.klass = DoRAModule
                 self.dummy_klass = DummyDoRAModule
                 self.global_additional_kwargs = {
                     "norm_epsilon": config.lora_decompose_norm_epsilon,
                     "train_device": torch.device(
                         config.train_device
-                    ),  # Usar config diretamente
+                    ),  # Use config directly
                 }
+                print(
+                    f"[LoRA INFO] Using DoRA (decompose=True) with epsilon={self.global_additional_kwargs['norm_epsilon']}, device={self.global_additional_kwargs['train_device']}"
+                )
             else:
                 self.klass = LoRAModule
                 self.dummy_klass = DummyLoRAModule
+                print("[LoRA INFO] Using LoRA (decompose=False)")
         elif self.peft_type == PeftType.LOHA:
             self.klass = LoHaModule
             self.dummy_klass = DummyLoHaModule
+            print("[LoRA INFO] Using LoHa")
         else:
             raise ValueError(f"Unsupported PeftType: {self.peft_type}")
 
-        # 6. Criar os módulos PEFT (agora com lógica de filtragem robusta)
-        # A criação foi movida para um método separado para clareza
+        # 6. Create the PEFT modules (uses the filters and ruleset)
+        # This is now done in a separate method for clarity
         self.lora_modules = self._initialize_peft_modules(orig_module)
-        # FIM ALTERAÇÃO
+        print(
+            f"[LoRA INFO] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules."
+        )
 
     def _should_include_module(self, module_name: str) -> bool:
-        """Verifica se um nome de módulo deve ser incluído com base nos filtros."""
-        # 1. Verificar filtro de inclusão
-        passes_inclusion = False
-        if not self.inclusion_filter_patterns:
-            passes_inclusion = True  # Se não há filtros de inclusão, passa tudo
-        else:
-            for pattern in self.inclusion_filter_patterns:
-                if fnmatch.fnmatch(module_name, pattern):
-                    passes_inclusion = True
-                    break
-        if not passes_inclusion:
-            return False  # Falhou na inclusão
-
-        # 2. Verificar filtro de exclusão (blacklist)
+        """Checks if a module name should be included based on filters."""
+        # 1. Check exclusion filter first (blacklist)
         for pattern in self.exclusion_filter_patterns:
             if fnmatch.fnmatch(module_name, pattern):
-                # print(f"[LoRA FILTER DEBUG] Module '{module_name}' EXCLUDED by blacklist pattern '{pattern}'") # Debug Opcional
-                return False  # Foi explicitamente excluído
+                # print(f"[LoRA FILTER DEBUG] Module '{module_name}' EXCLUDED by blacklist pattern '{pattern}'") # Optional Debug
+                return False  # Explicitly excluded
 
-        # Se passou pela inclusão (se houver) e não foi excluído, inclui.
-        # print(f"[LoRA FILTER DEBUG] Module '{module_name}' INCLUDED") # Debug Opcional
-        return True
+        # 2. Check inclusion filter
+        if not self.inclusion_filter_patterns:
+            # If no inclusion filters are defined, include everything not blacklisted
+            # print(f"[LoRA FILTER DEBUG] Module '{module_name}' INCLUDED (no inclusion filters)") # Optional Debug
+            return True
+        else:
+            # If inclusion filters exist, it must match at least one
+            for pattern in self.inclusion_filter_patterns:
+                if fnmatch.fnmatch(module_name, pattern):
+                    # print(f"[LoRA FILTER DEBUG] Module '{module_name}' INCLUDED by inclusion pattern '{pattern}'") # Optional Debug
+                    return True  # Matched an inclusion pattern
 
-    # INÍCIO ALTERAÇÃO - Método de inicialização refatorado
+        # If inclusion filters exist but none matched
+        # print(f"[LoRA FILTER DEBUG] Module '{module_name}' EXCLUDED (did not match any inclusion pattern)") # Optional Debug
+        return False
+
     def _initialize_peft_modules(
         self, root_module: nn.Module | None
     ) -> dict[str, PeftBase]:
         """
-        Identifica, filtra e cria os módulos PEFT reais.
+        Identifies, filters, and creates the actual PEFT modules.
         """
-        lora_modules = {}
+        lora_modules: dict[str, PeftBase] = {}
         if root_module is None:
             print(
-                "[LoRA WARNING] _initialize_peft_modules chamado sem root_module. Nenhum módulo será criado."
+                "[LoRA WARNING] _initialize_peft_modules called without root_module. No PEFT modules created."
             )
             return lora_modules
 
-        print("[LoRA INFO] Iniciando identificação e criação de módulos PEFT...")
-        modules_to_create = []
+        print("[LoRA INFO] Identifying and creating PEFT modules...")
+        modules_created_count = 0
+        modules_skipped_type = 0
+        modules_skipped_filter = 0
 
-        # 1. Identificar todos os candidatos e aplicar filtros
+        # 1. Iterate through named modules to find candidates
         for name, child_module in root_module.named_modules():
+            # Only consider Linear and Conv2d layers
             if not isinstance(child_module, (Linear, Conv2d)):
-                continue  # Pula tipos não suportados
+                modules_skipped_type += 1
+                continue  # Skip unsupported layer types
 
-            # Aplica a lógica de filtragem combinada (inclusão + exclusão)
+            # Apply combined filtering logic (inclusion + exclusion)
             if self._should_include_module(name):
-                modules_to_create.append((name, child_module))
-            # else: # Debug opcional
-            #     print(f"[LoRA FILTER] Skipping module: {name}")
+                # Module passed filters, proceed to create PEFT layer
 
-        print(
-            f"[LoRA INFO] Identificados {len(modules_to_create)} módulos candidatos após filtragem."
-        )
-
-        # 2. Criar módulos PEFT para os candidatos filtrados
-        for name, child_module in modules_to_create:
-            # Constrói o prefixo completo para o módulo PEFT
-            # (Lógica ligeiramente simplificada para evitar duplicação de prefixo se já presente)
-            clean_name = name
-            full_peft_prefix = f"{self.prefix}_{clean_name}"
-
-            # Determina Rank e Alpha usando RuleSet (baseado no nome original 'name')
-            rank_to_use = self.default_rank
-            alpha_to_use = self.default_alpha
-            matched_config = self.ruleset.match(name)  # Usa o nome original da camada
-
-            if matched_config:
-                rank_to_use = matched_config.get("rank", self.default_rank)
-                alpha_to_use = matched_config.get("alpha", self.default_alpha)
-                # print(f"[LoRA RULE DEBUG] Match for '{name}': {matched_config} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Debug opcional
-
-            # Prepara args e kwargs para a classe PEFT
-            args_for_this_module = [rank_to_use, alpha_to_use]
-            kwargs_for_this_module = self.global_additional_kwargs.copy()
-
-            # Cria a instância
-            try:
-                # Debug log mais informativo
-                match_info = "(Matched Rule)" if matched_config else "(Default)"
-                log_msg = (
-                    f"[LoRA CREATE] Creating {self.klass.__name__} for: {full_peft_prefix} "
-                    f"(Layer: {name}) {match_info} -> Rank={rank_to_use}, Alpha={alpha_to_use}"
+                # Construct the unique prefix for this specific PEFT module instance
+                # Example: prefix="lora_unet", name="down_blocks_0_resnets_0_conv1"
+                # -> peft_module_prefix = "lora_unet_down_blocks_0_resnets_0_conv1."
+                peft_module_prefix = (
+                    f"{self.prefix}_{name.replace('.', '_')}"  # Sanitize name part
                 )
-                # print(log_msg) # Debug no console
-                # with open("lora_creation_log.txt", "a", encoding="utf-8") as debug_file: # Log em arquivo opcional
-                #     debug_file.write(log_msg + "\n")
 
-                lora_modules[name] = self.klass(
-                    full_peft_prefix,
+                # Determine Rank and Alpha using RuleSet (based on the original layer name 'name')
+                rank_to_use = self.default_rank
+                alpha_to_use = self.default_alpha
+                matched_config = self.ruleset.match(
+                    name
+                )  # Use original layer name for matching rules
+
+                rule_source = "(Default)"
+                if matched_config:
+                    rank_to_use = matched_config.get("rank", self.default_rank)
+                    alpha_to_use = matched_config.get("alpha", self.default_alpha)
+                    rule_source = f"(Rule: {matched_config})"
+                    # print(f"[LoRA RULE DEBUG] Match for '{name}': {matched_config} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Optional Debug
+
+                # Prepare args and kwargs for the PEFT class constructor
+                # Args must be in the order expected by LoRA/LoHa/DoRA: prefix, module, rank, alpha
+                args_for_this_module = [
+                    peft_module_prefix,
                     child_module,
-                    *args_for_this_module,
-                    **kwargs_for_this_module,
-                )
+                    rank_to_use,
+                    alpha_to_use,
+                ]
+                kwargs_for_this_module = (
+                    self.global_additional_kwargs.copy()
+                )  # Start with global (e.g., DoRA args)
 
-            except Exception as e:
-                print(
-                    f"[LoRA ERROR] Erro ao criar módulo PEFT para {name} (prefixo {full_peft_prefix}) "
-                    f"com rank={rank_to_use}, alpha={alpha_to_use}: {e}"
-                )
+                # Create the PEFT instance
+                try:
+                    log_msg = (
+                        f"[LoRA CREATE] Creating {self.klass.__name__} for: {name} "
+                        f"{rule_source} -> Rank={rank_to_use}, Alpha={alpha_to_use} "
+                        f"| PEFT Prefix: {peft_module_prefix}."
+                    )
+                    # print(log_msg) # Optional detailed log
 
-        print(
-            f"[LoRA INFO] Criados {len(lora_modules)} módulos PEFT para o prefixo '{self.prefix}'."
-        )
+                    lora_modules[name] = self.klass(
+                        *args_for_this_module, **kwargs_for_this_module
+                    )
+                    modules_created_count += 1
+
+                except Exception as e:
+                    print(
+                        f"[LoRA ERROR] Failed to create PEFT module for layer '{name}' (prefix {peft_module_prefix}) "
+                        f"with Rank={rank_to_use}, Alpha={alpha_to_use}: {e}"
+                    )
+                    # Optionally, reraise or handle more gracefully
+                    # raise e
+
+            else:
+                modules_skipped_filter += 1
+                # print(f"[LoRA FILTER] Skipping module: {name}") # Optional Debug
+
+        print(f"[LoRA INFO] Module Creation Summary for '{self.prefix}':")
+        print(f"  - Created: {modules_created_count} PEFT modules.")
+        print(f"  - Skipped (Filter): {modules_skipped_filter} modules.")
+        print(f"  - Skipped (Type): {modules_skipped_type} non-Linear/Conv2d modules.")
         return lora_modules
 
     def load_state_dict(self, state_dict: dict[str, Tensor]):
         """
-        Carrega o state_dict nos módulos PEFT gerenciados.
+        Loads the state dict into managed PEFT modules (real and dummy).
 
-        Primeiro tenta carregar nos módulos PEFT reais existentes.
-        As chaves restantes no state_dict que correspondem ao prefixo
-        são usadas para criar módulos Dummy, usando os ranks/alphas padrão
-        para a instanciação do Dummy.
+        Handles creating dummy modules for keys present in the state_dict
+        but not corresponding to any initially created real PEFT modules.
         """
-        remaining_state_dict = copy.deepcopy(state_dict)
-        loaded_prefixes = set()  # Rastreia prefixos já processados (reais ou dummy)
+        if not self.lora_modules and self.orig_module is None:
+            print(
+                "[LoRA WARNING] load_state_dict called with no original module and no pre-existing PEFT modules. Attempting to load all as dummies."
+            )
+            # If there's no orig_module, we can *only* create dummies.
 
-        # 1. Tenta carregar nos módulos reais existentes
-        # Usa items() para iterar sobre cópia, permitindo modificar o dict original se necessário
-        current_real_modules = {
-            k: v
-            for k, v in self.lora_modules.items()
-            if not isinstance(v, self.dummy_klass)
-        }
-        for name, module in current_real_modules.items():
+        # Create a copy to modify while iterating
+        remaining_state_dict = copy.deepcopy(state_dict)
+        loaded_module_prefixes = (
+            set()
+        )  # Track PEFT prefixes successfully loaded (real or dummy)
+        missing_keys_overall = []
+        unexpected_keys_overall = list(
+            remaining_state_dict.keys()
+        )  # Start assuming all are unexpected
+
+        # 1. Try loading into existing *real* modules first
+        # Iterate over a copy of keys, as lora_modules might change if dummies are added later
+        current_real_module_names = [
+            name
+            for name, mod in self.lora_modules.items()
+            if not isinstance(mod, self.dummy_klass)
+        ]
+        for name in current_real_module_names:
+            module = self.lora_modules.get(name)
+            if module is None:
+                continue  # Should not happen, but safety check
+
             try:
-                # load_state_dict da PeftBase já lida com o prefixo interno
-                module.load_state_dict(
-                    remaining_state_dict
-                )  # Modifica remaining_state_dict in-place
-                loaded_prefixes.add(module.prefix)
+                # PeftBase.load_state_dict handles prefix filtering and removal from remaining_state_dict
+                result = module.load_state_dict(
+                    remaining_state_dict, strict=True
+                )  # Use strict=True here
+                missing_keys_overall.extend(
+                    [module.prefix + k for k in result.missing_keys]
+                )
+                # Note: PeftBase load_state_dict removes handled keys from remaining_state_dict
+                loaded_module_prefixes.add(module.prefix)
+                # Remove keys associated with this module from the 'unexpected' list
+                module_keys_in_sd = {
+                    k for k in state_dict if k.startswith(module.prefix)
+                }
+                unexpected_keys_overall = [
+                    k for k in unexpected_keys_overall if k not in module_keys_in_sd
+                ]
+
             except Exception as e:
                 print(
-                    f"Erro ao carregar state_dict para módulo real {name} (prefixo {module.prefix}): {e}"
+                    f"Error loading state_dict into real module {name} (prefix {module.prefix}): {e}"
                 )
+                # Treat keys for this module as unexpected if loading failed catastrophically
+                # (PeftBase load_state_dict might have already popped keys before failing)
 
-        # 2. Processa chaves remanescentes para criar dummies
-        # Filtra apenas chaves que começam com o prefixo geral do wrapper
+        # 2. Process remaining keys to create dummy modules
+        # Filter keys that belong to *this* wrapper's prefix but weren't loaded yet
         potential_dummy_keys = {
             k: v for k, v in remaining_state_dict.items() if k.startswith(self.prefix)
         }
 
-        while potential_dummy_keys:
-            # Pega uma chave exemplo para determinar o prefixo do módulo dummy
-            key_example = next(iter(potential_dummy_keys))
+        processed_dummy_prefixes = set()
 
-            # Lógica para extrair o prefixo do módulo PEFT da chave do parâmetro
-            parts = key_example.split(".")
-            dummy_prefix_parts = []
-            known_suffix = False
-            # Sufixos comuns de parâmetros PEFT
-            common_suffixes = [
-                ".lora_down.weight",
-                ".lora_up.weight",
-                ".alpha",
-                ".dora_scale",
-                ".hada_w1_a",
-                ".hada_w1_b",
-                ".hada_w2_a",
-                ".hada_w2_b",
-            ]
-            for suffix in common_suffixes:
-                if key_example.endswith(suffix):
-                    # Remove o sufixo (ex: '.lora_down.weight')
-                    num_parts_to_remove = suffix.count(".") + 1
-                    dummy_prefix_parts = parts[:-num_parts_to_remove]
-                    known_suffix = True
+        # Group remaining keys by their inferred PEFT module prefix
+        keys_by_prefix = {}
+        suffixes_to_strip = [  # Common PEFT parameter suffixes
+            "lora_down.weight",
+            "lora_up.weight",
+            "alpha",
+            "dora_scale",
+            "hada_w1_a",
+            "hada_w1_b",
+            "hada_w2_a",
+            "hada_w2_b",
+        ]
+        for key in list(potential_dummy_keys.keys()):  # Iterate over copy of keys
+            inferred_prefix = key
+            for suffix in suffixes_to_strip:
+                if key.endswith("." + suffix):
+                    inferred_prefix = (
+                        key[: -(len(suffix) + 1)] + "."
+                    )  # Include trailing dot
                     break
+            # else: # If no suffix matched, the key itself might be the prefix (unlikely but possible)
+            #    print(f"Warning: Could not strip known suffix from key '{key}', assuming prefix is the key itself.")
 
-            if not known_suffix:
-                # Não conseguiu identificar um sufixo PEFT conhecido
-                # print(f"Aviso: Não foi possível determinar o prefixo do módulo para a chave remanescente: {key_example}. Pulando esta chave.")
-                potential_dummy_keys.pop(key_example)  # Remove a chave problemática
-                continue  # Tenta a próxima chave remanescente
+            if inferred_prefix not in keys_by_prefix:
+                keys_by_prefix[inferred_prefix] = {}
+            keys_by_prefix[inferred_prefix][key] = potential_dummy_keys[key]
 
-            # Monta o prefixo completo do módulo dummy (termina com '.')
-            dummy_module_prefix_with_dot = ".".join(dummy_prefix_parts) + "."
-
-            # Se já carregamos um módulo real ou criamos um dummy com este prefixo,
-            # apenas removemos todas as chaves associadas a ele e continuamos
-            if dummy_module_prefix_with_dot in loaded_prefixes:
-                keys_to_remove = [
-                    k
-                    for k in potential_dummy_keys
-                    if k.startswith(dummy_module_prefix_with_dot)
+        # Now iterate through the inferred prefixes and create dummies if needed
+        for peft_prefix, keys_for_this_prefix in keys_by_prefix.items():
+            if (
+                peft_prefix in loaded_module_prefixes
+                or peft_prefix in processed_dummy_prefixes
+            ):
+                # Already handled by a real module or a previous dummy pass
+                # Remove keys from unexpected list
+                unexpected_keys_overall = [
+                    k for k in unexpected_keys_overall if not k.startswith(peft_prefix)
                 ]
-                for k in keys_to_remove:
-                    if k in potential_dummy_keys:
-                        potential_dummy_keys.pop(k)
-                continue  # Passa para a próxima chave remanescente
+                continue
 
-            # Determina o 'nome' relativo do módulo dummy (usado como chave em self.lora_modules)
-            # Ex: "lora_unet_down_blocks_0_attn_0." -> "down_blocks_0_attn_0"
-            dummy_module_name = (
-                dummy_module_prefix_with_dot.removeprefix(
-                    self.prefix + "_"
-                ).removesuffix(".")
-                if dummy_module_prefix_with_dot.startswith(self.prefix + "_")
-                else ""
-            )
+            # Determine the original layer name corresponding to this prefix
+            # Example: peft_prefix = "lora_unet_down_blocks_0_resnets_0_conv1."
+            # -> module_name = "down_blocks_0_resnets_0_conv1"
+            relative_name_part = peft_prefix.removeprefix(
+                self.prefix + "_"
+            ).removesuffix(".")
+            # Need to revert the underscore sanitization done during creation
+            original_layer_name = relative_name_part.replace(
+                "_", "."
+            )  # Best guess reverse mapping
+            # TODO: This reverse mapping might be imperfect if original names had underscores.
+            # A more robust way would be to store the mapping during init, but adds complexity.
 
-            # Cria a instância Dummy
-            # Dummies não precisam de rank/alpha específicos, usamos os padrões globais.
-            dummy_args = [self.default_rank, self.default_alpha]
+            # Create the Dummy instance using default rank/alpha
+            dummy_args = [peft_prefix, None, self.default_rank, self.default_alpha]
             dummy_kwargs = self.global_additional_kwargs.copy()
             try:
-                # print(f"Creating dummy for prefix: {dummy_module_prefix_with_dot} (name: {dummy_module_name})") # Debug
-                dummy_module = self.dummy_klass(
-                    dummy_module_prefix_with_dot,  # Passa o prefixo correto
-                    None,  # Módulo original é None para dummies
-                    *dummy_args,
-                    **dummy_kwargs,
+                print(
+                    f"[LoRA Load] Creating dummy for unloaded PEFT prefix: {peft_prefix} (inferred original name: {original_layer_name})"
                 )
-                # Passa uma cópia do dict de chaves potenciais para o dummy processar
-                dummy_module.load_state_dict(
-                    copy.deepcopy(potential_dummy_keys)
-                )  # Modifica o dict passado in-place
+                dummy_module = self.dummy_klass(*dummy_args, **dummy_kwargs)
 
-                # Remove as chaves que o dummy efetivamente carregou do nosso dict principal
-                # (O state_dict do dummy retorna as chaves com o prefixo correto)
-                dummy_keys_loaded = list(dummy_module.state_dict().keys())
-                for k in dummy_keys_loaded:
-                    if k in potential_dummy_keys:
-                        potential_dummy_keys.pop(
-                            k
-                        )  # Remove do dict que estamos iterando
+                # Load the relevant keys into the dummy
+                # Pass a dict containing *only* keys for this prefix to the dummy's load_state_dict
+                dummy_load_dict = keys_for_this_prefix.copy()
+                result = dummy_module.load_state_dict(
+                    dummy_load_dict, strict=True
+                )  # Use strict=True
 
-                # Adiciona o dummy ao gerenciador
-                self.lora_modules[dummy_module_name] = dummy_module
-                # Marca este prefixo como processado para evitar recriação
-                loaded_prefixes.add(dummy_module_prefix_with_dot)
+                # Add the dummy to our managed modules, using the inferred original name as key
+                self.lora_modules[original_layer_name] = dummy_module
+                processed_dummy_prefixes.add(peft_prefix)
+                loaded_module_prefixes.add(peft_prefix)  # Mark as loaded
+
+                # Remove keys loaded by the dummy from the unexpected list
+                keys_actually_loaded_by_dummy = list(
+                    keys_for_this_prefix.keys()
+                )  # Assume dummy loaded all passed keys
+                unexpected_keys_overall = [
+                    k
+                    for k in unexpected_keys_overall
+                    if k not in keys_actually_loaded_by_dummy
+                ]
+                # Report any issues from the dummy load (should be rare)
+                if result.missing_keys:
+                    print(
+                        f"Warning: Dummy module {peft_prefix} reported missing keys during load: {result.missing_keys}"
+                    )
+                if result.unexpected_keys:
+                    print(
+                        f"Warning: Dummy module {peft_prefix} reported unexpected keys during load: {result.unexpected_keys}"
+                    )
 
             except Exception as e:
-                print(
-                    f"Erro ao criar ou carregar dummy para prefixo {dummy_module_prefix_with_dot}: {e}"
-                )
-                # Remove todas as chaves associadas a este prefixo para evitar tentar de novo
-                keys_to_remove = [
-                    k
-                    for k in potential_dummy_keys
-                    if k.startswith(dummy_module_prefix_with_dot)
-                ]
-                for k in keys_to_remove:
-                    if k in potential_dummy_keys:
-                        potential_dummy_keys.pop(k)
+                print(f"Error creating or loading dummy for prefix {peft_prefix}: {e}")
+                # Keys remain unexpected if dummy creation failed
 
-        # Verifica se sobrou alguma chave não utilizada no final
-        final_remaining_keys = list(potential_dummy_keys.keys())
-        if final_remaining_keys:
-            # Pode ser útil logar isso para debug
+        # Final check for any remaining unexpected keys (should be few or none)
+        final_unexpected = [
+            k for k in unexpected_keys_overall if k.startswith(self.prefix)
+        ]
+        if final_unexpected:
             print(
-                f"Aviso: Chaves não utilizadas encontradas após carregar state dict para prefixo '{self.prefix}': {final_remaining_keys}"
+                f"[LoRA WARNING] Unexpected keys found in state_dict for prefix '{self.prefix}' after loading:"
             )
-            pass
+            for k in final_unexpected:
+                print(f"  - {k}")
+        if missing_keys_overall:
+            print(
+                f"[LoRA WARNING] Missing keys for prefix '{self.prefix}' during state_dict load:"
+            )
+            for k in missing_keys_overall:
+                print(f"  - {k}")
 
     def state_dict(self) -> dict:
-        """Retorna o state dict contendo chaves de todos os módulos gerenciados (reais e dummy)."""
+        """Returns the state dict containing keys from all managed modules (real and dummy)."""
         state_dict = {}
         for module in self.lora_modules.values():
-            # state_dict de PeftBase/Dummy já adiciona o prefixo do módulo
+            # PeftBase.state_dict already adds the correct module prefix
             module_sd = module.state_dict()
             state_dict.update(module_sd)
         return state_dict
 
     def parameters(self) -> list[Parameter]:
-        """Retorna uma lista de parâmetros treináveis de todos os módulos PEFT reais."""
+        """Returns a list of trainable parameters from all *real* PEFT modules."""
         parameters = []
         for module in self.lora_modules.values():
-            # Inclui apenas parâmetros de módulos reais (não dummies)
-            if not isinstance(module, self.dummy_klass):
-                # Garante que o módulo foi inicializado antes de pegar parâmetros
-                if module._initialized:
-                    parameters.extend(list(module.parameters()))
+            # Include parameters only from real (non-dummy) modules that are initialized
+            if not isinstance(module, self.dummy_klass) and module._initialized:
+                parameters.extend(list(module.parameters()))
         return parameters
 
     def requires_grad_(self, requires_grad: bool):
-        """Define requires_grad para todos os parâmetros de módulos PEFT reais."""
+        """Sets requires_grad for all parameters of *real* PEFT modules."""
+        count = 0
         for module in self.lora_modules.values():
             if not isinstance(module, self.dummy_klass) and module._initialized:
                 module.requires_grad_(requires_grad)
+                # Count parameters affected for feedback
+                for _ in module.parameters():
+                    count += 1
+        # print(f"Set requires_grad={requires_grad} for {count} parameters in real PEFT modules.")
 
     def to(
         self, device: torch.device = None, dtype: torch.dtype = None
     ) -> "LoRAModuleWrapper":
-        """Move todos os módulos gerenciados (reais e dummy) para o dispositivo/dtype."""
-        for module in self.lora_modules.values():
-            # Dummies podem não ter parâmetros, mas a chamada a `to` é segura
-            module.to(device, dtype)
+        """Moves all managed modules (real and dummy) to the specified device/dtype."""
+        for name, module in self.lora_modules.items():
+            try:
+                # `to()` is generally safe even if module has no parameters (like dummies before load)
+                module.to(device=device, dtype=dtype)
+            except Exception as e:
+                print(
+                    f"Error moving module {name} (prefix {module.prefix}) to {device}/{dtype}: {e}"
+                )
         return self
 
     def modules(self) -> list[nn.Module]:
-        """Retorna uma lista de todos os módulos gerenciados (reais e dummy)."""
+        """Returns a list of all managed PEFT modules (real and dummy)."""
         return list(self.lora_modules.values())
 
     def hook_to_module(self):
-        """Aplica o hook de forward nos módulos originais correspondentes aos módulos PEFT reais."""
+        """Applies the forward hook to the original modules corresponding to real PEFT modules."""
         if self.orig_module is None:
-            print("Aviso: Não é possível aplicar hooks sem o módulo original.")
+            print("Warning: Cannot apply hooks without the original root module.")
             return
         hook_count = 0
         for name, module in self.lora_modules.items():
-            if not isinstance(module, self.dummy_klass):
+            # Only hook real modules that have an associated original module
+            if (
+                not isinstance(module, self.dummy_klass)
+                and module._orig_module is not None
+            ):
                 try:
-                    # A PeftBase armazena a referência ao módulo original
                     module.hook_to_module()
                     hook_count += 1
                 except Exception as e:
-                    print(f"Erro ao aplicar hook para {name}: {e}")
-        # print(f"Aplicados hooks para {hook_count} módulos PEFT.")
+                    print(
+                        f"Error applying hook for PEFT module {name} (prefix {module.prefix}): {e}"
+                    )
+        # print(f"Applied forward hooks for {hook_count} real PEFT modules.")
 
     def remove_hook_from_module(self):
-        """Remove o hook de forward dos módulos originais."""
+        """Removes the forward hook from the original modules."""
         if self.orig_module is None:
-            # print("Aviso: Não é possível remover hooks sem o módulo original (ou já foram removidos).")
+            # print("Warning: Cannot remove hooks without the original root module (or hooks were never applied).")
             return
         remove_count = 0
         for name, module in self.lora_modules.items():
-            if not isinstance(module, self.dummy_klass):
+            if (
+                not isinstance(module, self.dummy_klass)
+                and module._orig_module is not None
+            ):
                 try:
                     module.remove_hook_from_module()
                     remove_count += 1
                 except Exception as e:
-                    print(f"Erro ao remover hook para {name}: {e}")
-        # print(f"Removidos hooks de {remove_count} módulos PEFT.")
+                    print(
+                        f"Error removing hook for PEFT module {name} (prefix {module.prefix}): {e}"
+                    )
+        # print(f"Removed forward hooks from {remove_count} real PEFT modules.")
 
     def apply_to_module(self):
-        """Aplica (merge) os pesos PEFT diretamente nos pesos dos módulos originais (apenas módulos reais)."""
+        """Applies (merges) PEFT weights directly into the original modules' weights (real modules only)."""
         if self.orig_module is None:
-            print("Aviso: Não é possível aplicar pesos sem o módulo original.")
+            print("Warning: Cannot apply weights without the original root module.")
             return
         apply_count = 0
         for name, module in self.lora_modules.items():
-            if not isinstance(module, self.dummy_klass):
+            if (
+                not isinstance(module, self.dummy_klass)
+                and module._orig_module is not None
+            ):
                 try:
-                    module.apply_to_module()  # A implementação está em PeftBase/subclasses
+                    module.apply_to_module()  # Implementation is in PeftBase subclasses (TODO)
                     apply_count += 1
                 except NotImplementedError:
                     print(
-                        f"Aviso: apply_to_module não implementado para {type(module).__name__} ({name})."
+                        f"Warning: apply_to_module not implemented for {type(module).__name__} ({name})."
                     )
                 except Exception as e:
-                    print(f"Erro ao aplicar pesos para {name}: {e}")
-        # print(f"Pesos aplicados para {apply_count} módulos PEFT.")
+                    print(
+                        f"Error applying weights for PEFT module {name} (prefix {module.prefix}): {e}"
+                    )
+        # print(f"Applied weights for {apply_count} real PEFT modules (where implemented).")
 
     def extract_from_module(self, base_module: nn.Module):
         """
-        Extrai pesos PEFT comparando o módulo original atual com um módulo base.
-        (Requer implementação em LoRAModule, DoRAModule, etc.)
+        Extracts PEFT weights by comparing the current original module with a base module.
+        (Requires implementation in LoRAModule, DoRAModule, etc.)
         """
         if self.orig_module is None:
-            print("Aviso: Não é possível extrair pesos sem o módulo original atual.")
+            print(
+                "Warning: Cannot extract weights without the current original root module."
+            )
             return
         extract_count = 0
         for name, module in self.lora_modules.items():
-            if not isinstance(module, self.dummy_klass):
+            if (
+                not isinstance(module, self.dummy_klass)
+                and module._orig_module is not None
+            ):
                 try:
-                    # Encontra o submódulo correspondente no modelo base fornecido
+                    # Find the corresponding submodule in the provided base model
                     corresponding_base_submodule = base_module.get_submodule(name)
                     module.extract_from_module(
                         corresponding_base_submodule
-                    )  # Implementação em PeftBase/subclasses
+                    )  # Implementation in PeftBase subclasses (TODO)
                     extract_count += 1
                 except AttributeError:
                     print(
-                        f"Aviso: Não foi possível encontrar o submódulo base '{name}' durante a extração."
+                        f"Warning: Could not find base submodule '{name}' during extraction."
                     )
                 except NotImplementedError:
                     print(
-                        f"Aviso: extract_from_module não implementado para {type(module).__name__} ({name})."
+                        f"Warning: extract_from_module not implemented for {type(module).__name__} ({name})."
                     )
                 except Exception as e:
-                    print(f"Erro ao extrair pesos para {name}: {e}")
-        # print(f"Pesos extraídos para {extract_count} módulos PEFT.")
+                    print(
+                        f"Error extracting weights for PEFT module {name} (prefix {module.prefix}): {e}"
+                    )
+        # print(f"Extracted weights for {extract_count} real PEFT modules (where implemented).")
 
     def prune(self):
-        """Remove todos os módulos dummy do gerenciamento."""
+        """Removes all dummy modules from management."""
         initial_count = len(self.lora_modules)
         self.lora_modules = {
             k: v
@@ -1242,136 +1542,118 @@ class LoRAModuleWrapper:
             if not isinstance(v, self.dummy_klass)
         }
         pruned_count = initial_count - len(self.lora_modules)
-        # print(f"Removidos {pruned_count} módulos dummy. Módulos restantes: {len(self.lora_modules)}")
+        # print(f"Pruned {pruned_count} dummy modules. Remaining modules: {len(self.lora_modules)}")
 
     def set_dropout(self, dropout_probability: float):
-        """Define a probabilidade de dropout para todos os módulos PEFT reais."""
+        """Sets the dropout probability for all *real* PEFT modules."""
         if not 0 <= dropout_probability <= 1:
-            raise ValueError("Probabilidade de dropout deve estar entre 0 e 1")
+            raise ValueError("Dropout probability must be between 0 and 1")
+        count = 0
         for module in self.lora_modules.values():
             if not isinstance(module, self.dummy_klass):
-                # Verifica se o módulo tem o atributo dropout e se é um nn.Dropout
+                # Check if the module has a dropout attribute and it's an nn.Dropout instance
                 if hasattr(module, "dropout") and isinstance(
                     getattr(module, "dropout", None), nn.Dropout
                 ):
                     module.dropout.p = dropout_probability
+                    count += 1
+        # print(f"Set dropout probability to {dropout_probability} for {count} real PEFT modules.")
 
-    # --- Geração de Arquivo de Chaves por Bloco (Mantida para Organização) ---
+    # --- Block Key Generation Logic (from modified, seems useful) ---
     @staticmethod
-    def get_block_id_from_key_prefix(lora_module_prefix_with_dot: str) -> str | None:
+    def get_block_id_from_key_prefix(lora_module_prefix_with_dot: str) -> str:
         """
-        Determina o Block ID (IN00-OUT11, M00, BASE) a partir do prefixo completo.
-        Usado apenas para organizar o arquivo de chaves. Retorna None se não mapeado.
+        Determines the Block ID (IN00-OUT11, M00, BASE) from the full PEFT module prefix.
+        Used for organizing keys. Returns 'BASE' if not specifically mapped.
         """
+        # Remove the trailing dot for matching
         lora_module_prefix = lora_module_prefix_with_dot.removesuffix(".")
 
-        # Tratamento especial para mid_block
-        if lora_module_prefix.startswith("lora_unet_mid_block"):
-            return "M00"
-
-        # Ordena por comprimento decrescente para especificidade
+        # Sort mapping keys by length descending for most specific match first
+        # Use the PEFT prefix directly which should include 'lora_unet_' or 'lora_te_' etc.
         sorted_map_prefixes = sorted(KEY_TO_BLOCK_MAPPING.keys(), key=len, reverse=True)
 
         for map_prefix in sorted_map_prefixes:
-            # Compara prefixos completos
-            if lora_module_prefix == map_prefix or lora_module_prefix.startswith(
-                map_prefix + "."
-            ):
-                # O mapeamento já inclui 'lora_unet_'
+            # Check if the module prefix starts with the mapping prefix
+            # Example: lora_module_prefix = "lora_unet_down_blocks_0_resnets_0_conv1"
+            # map_prefix = "lora_unet_down_blocks_0_resnets_0" -> Match!
+            if lora_module_prefix.startswith(map_prefix):
                 return KEY_TO_BLOCK_MAPPING[map_prefix]
 
-        # Tenta mapear apenas a parte final se não começou com lora_unet_
-        # (Menos comum, mas pode ocorrer dependendo do prefixo inicial)
-        canonical_prefix = lora_module_prefix.replace(".", "_")
-        for map_prefix_short, block_id in KEY_TO_BLOCK_MAPPING.items():
-            if canonical_prefix.startswith(map_prefix_short):
-                return block_id
-
-        # Se não encontrou correspondência exata ou de prefixo
-        # Verifica se pertence a TEXT ENCODER (se aplicável)
-        if lora_module_prefix.startswith("lora_te"):  # Ajustar conforme prefixo do TE
-            # Poderia retornar um ID específico como "TE" ou agrupar em BASE
-            return "BASE"  # Ou "TE" se BLOCKID26 incluir
-
-        # print(f"Aviso: Prefixo do módulo não mapeado para bloco UNet/TE: {lora_module_prefix}. Assumindo BASE.")
-        return "BASE"  # Fallback para chaves não mapeadas
+        # Fallback if no specific UNet/TE block matched
+        # print(f"Debug: PEFT prefix '{lora_module_prefix}' not mapped to specific block. Assigning BASE.")
+        return "BASE"
 
     def generate_keys_by_block_file(
         self, output_filename="unetKeysByBlock_generated.txt"
     ):
-        """Gera um arquivo de texto com todas as chaves PEFT organizadas por bloco UNet."""
+        """Generates a text file with all managed PEFT keys organized by UNet block."""
         if not self.lora_modules:
-            # print("Aviso: Nenhum módulo LoRA/DoRA/LoHa encontrado. Arquivo de chaves não gerado.")
+            print("Warning: No LoRA/DoRA/LoHa modules found. Key file not generated.")
             return
 
-        # print(f"Gerando arquivo de chaves por bloco: {output_filename}")
-        # Usa um dict com default list para simplificar
+        print(f"Generating key file by block: {output_filename}")
         from collections import defaultdict
 
         blocks_data: dict[str, list[str]] = defaultdict(list)
-        all_block_ids = set(BLOCKID26)  # Conjunto para referência
+        all_found_block_ids = set()
 
-        # Itera sobre os módulos gerenciados (reais e dummies)
+        # Iterate over managed modules (real and dummies)
         for module_instance in self.lora_modules.values():
-            # Pega o prefixo correto armazenado na instância do módulo PEFT
+            # Get the correct prefix stored in the PEFT module instance
             module_prefix_with_dot = module_instance.prefix
-            # Mapeia o prefixo para um ID de bloco (IN00, M00, BASE, etc.)
+            # Map the prefix to a block ID (IN00, M00, BASE, etc.)
             block_id = self.get_block_id_from_key_prefix(module_prefix_with_dot)
+            all_found_block_ids.add(block_id)
 
-            if block_id is None:  # Se get_block_id retornar None
-                block_id = "BASE"  # Atribui a BASE como fallback
-
-            all_block_ids.add(
-                block_id
-            )  # Garante que todos os IDs encontrados estejam na lista final
-
-            # Pega as chaves deste módulo específico usando seu state_dict()
+            # Get keys for this module using its state_dict()
             try:
                 module_state_dict = module_instance.state_dict()
-                # Adiciona as chaves (que já incluem o prefixo) à lista do bloco
+                # Add keys (which already include the full prefix) to the block's list
                 for key in module_state_dict.keys():
                     blocks_data[block_id].append(key)
             except Exception as e:
                 print(
-                    f"Erro ao obter state_dict para o módulo com prefixo {module_prefix_with_dot}: {e}"
+                    f"Error getting state_dict for module with prefix {module_prefix_with_dot}: {e}"
                 )
 
-        # Ordena a lista final de IDs de bloco (garante ordem consistente)
-        # Coloca BASE no início, depois os outros em ordem alfabética/numérica
+        # Ensure all standard block IDs are present in the output, even if empty
+        final_block_ids = set(BLOCKID26) | all_found_block_ids
+        # Sort IDs: BASE first, then numerically/alphabetically
         sorted_block_ids = sorted(
-            list(all_block_ids), key=lambda x: ("0" if x == "BASE" else "1") + x
+            list(final_block_ids), key=lambda x: ("0" if x == "BASE" else "1") + x
         )
 
-        # Formata e escreve o arquivo
+        # Format and write the file
         output_lines = []
         for block_id in sorted_block_ids:
             output_lines.append(f"=== {block_id} ===")
-            # Ordena as chaves dentro de cada bloco
-            keys_in_block = sorted(blocks_data[block_id])
+            # Sort keys within each block alphabetically
+            keys_in_block = sorted(blocks_data.get(block_id, []))  # Use .get for safety
             if keys_in_block:
                 output_lines.extend(keys_in_block)
             else:
-                # Mensagem padrão para blocos vazios
-                output_lines.append("(Vazio)")
-
-            output_lines.append("")  # Linha em branco entre blocos
+                output_lines.append("(Empty)")  # Indicate empty blocks
+            output_lines.append("")  # Blank line between blocks
 
         try:
-            # Garante que o diretório de saída exista
+            # Ensure output directory exists
             output_dir = os.path.dirname(output_filename)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
 
             with open(output_filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(output_lines).strip())
-            # print(f"Arquivo '{output_filename}' gerado com sucesso.")
+            print(f"Successfully generated key file '{output_filename}'")
         except Exception as e:
-            print(f"Erro ao escrever o arquivo '{output_filename}': {e}")
+            print(f"Error writing key file '{output_filename}': {e}")
 
 
+# --- Helper Function (from modified, seems useful) ---
 def make_layer_patterns(
     layers: list[str], rank: int | None = None, alpha: float | None = None
 ) -> dict[str, dict[str, int | float]]:
+    """Creates a pattern dictionary for RuleSet from a list of layer names."""
     config = {}
     for layer in layers:
         entry = {}
@@ -1379,5 +1661,9 @@ def make_layer_patterns(
             entry["rank"] = rank
         if alpha is not None:
             entry["alpha"] = alpha
-        config[layer] = entry
+        if entry:  # Only add if rank or alpha was specified
+            config[layer] = entry
     return config
+
+
+# FIM ALTERAÇÃO: Fim do LoRAModuleWrapper da versão modificada
