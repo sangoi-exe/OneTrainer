@@ -302,24 +302,20 @@ class PeftBase(nn.Module):
                 nn.init.zeros_(self.lora_up.weight)
 
                 if hasattr(self, "dora_scale") and self.dora_scale is None:
-                    orig_weight = get_unquantized_weight(
-                        self.orig_module, torch.float, self.train_device
-                    )
-                    self.dora_num_dims = orig_weight.dim() - 1
-                    norm = (
-                        torch.norm(
-                            orig_weight.transpose(1, 0).reshape(
-                                orig_weight.shape[1], -1
-                            ),
-                            dim=1,
-                            keepdim=True,
-                        )
-                        .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
-                        .transpose(1, 0)
-                    )
-                    self.dora_scale = nn.Parameter(
-                        norm.to(self.orig_module.weight.device)
-                    )
+                    orig_weight = get_unquantized_weight(self.orig_module, torch.float32, self.train_device)
+                    eps = torch.finfo(orig_weight.dtype).eps if self.norm_epsilon else 0.0
+                    if isinstance(self.orig_module, nn.Conv2d):
+                        norm = torch.norm(orig_weight, p=2, dim=(1, 2, 3), keepdim=True) + eps
+                        # self.dora_num_dims não é mais necessário da forma como a normalização foi reescrita
+                    elif isinstance(self.orig_module, nn.Linear):
+                        norm = torch.norm(orig_weight, p=2, dim=0, keepdim=True) + eps
+                        # self.dora_num_dims não é mais necessário
+                    else:
+                        # Fallback ou erro
+                        print(f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA init for {self.prefix}")
+                        norm = torch.norm(orig_weight, p=2) + eps
+                    
+                    self.dora_scale = nn.Parameter(norm.to(self.orig_module.weight.device, dtype=self.orig_module.weight.dtype))
                     del orig_weight
 
             case "LoHaModule":
@@ -636,11 +632,12 @@ class DoRAModule(LoRAModule):
     dora_num_dims: int
     dora_scale: Parameter | None
     norm_epsilon: bool
+    train_device: torch.device
 
     def __init__(self, *args, **kwargs):
         self.dora_scale = None
         self.norm_epsilon = kwargs.pop("norm_epsilon", False)
-        self.train_device = kwargs.pop("train_device")
+        self.train_device = kwargs.pop("train_device", torch.device("cpu"))
         super().__init__(*args, **kwargs)  # Chama __init__ de LoRAModule
 
     def check_initialized(self):
@@ -659,25 +656,28 @@ class DoRAModule(LoRAModule):
 
         A = self.lora_down.weight
         B = self.lora_up.weight
-        orig_weight = get_unquantized_weight(
-            self.orig_module, A.dtype, self.train_device
-        )
+        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
         lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
         WP = orig_weight + lora_delta_w
-        del orig_weight, lora_delta_w
+        del orig_weight, lora_delta_w # Libera memória
 
         eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        norm = (
-            WP.detach()
-            .transpose(0, 1)
-            .reshape(WP.shape[1], -1)
-            .norm(dim=1, keepdim=True)
-            .reshape(WP.shape[1], *[1] * self.dora_num_dims)
-            .transpose(0, 1)
-            + eps
-        )
-        WP_normalized = WP / norm
+        
+        if isinstance(self.orig_module, nn.Conv2d):
+            # Norma por filtro de saída (canal de saída)
+            norm = torch.norm(WP.detach().to(torch.float32), p=2, dim=(1, 2, 3), keepdim=True) + eps
+        elif isinstance(self.orig_module, nn.Linear):
+            # Norma por neurônio de saída (coluna)
+            norm = torch.norm(WP.detach().to(torch.float32), p=2, dim=0, keepdim=True) + eps
+        else:
+            # Fallback ou erro se outro tipo de camada for encontrado inesperadamente
+            # Usando norma L2 geral como fallback, mas pode não ser ideal.
+            print(f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA forward for {self.prefix}")
+            norm = torch.norm(WP.detach().to(torch.float32), p=2) + eps
+
+        WP_normalized = WP / norm.to(WP.device, dtype=WP.dtype) # Garante que a norma esteja no dispositivo/dtype correto
         WP_scaled = self.dora_scale * WP_normalized
+
         x_dropout = self.dropout(x)
         return self.op(x_dropout, WP_scaled, self.orig_module.bias, **self.layer_kwargs)
 
