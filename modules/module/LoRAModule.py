@@ -1084,28 +1084,40 @@ class LoRAModuleWrapper:
             f"[LoRA INFO] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules."
         )
 
-    def _should_include_module(self, module_name: str) -> bool:
-        """Checks if a module name should be included based on filters."""
-        # 1. Check exclusion filter first (blacklist)
+    def _should_include_module(
+        self, original_module_name: str, potential_peft_prefix_with_dot: str
+    ) -> bool:
+        """
+        Checks if a module should be included based on its original name and potential PEFT prefix,
+        considering exclusion and inclusion filters.
+        """
+        # 1. Check exclusion filter (blacklist) against both names
         for pattern in self.exclusion_filter_patterns:
-            if fnmatch.fnmatch(module_name, pattern):
-                # print(f"[LoRA FILTER DEBUG] Module '{module_name}' EXCLUDED by blacklist pattern '{pattern}'") # Optional Debug
+            # Check if pattern matches original name OR potential PEFT prefix (without trailing dot for fnmatch flexibility)
+            peft_prefix_no_dot = potential_peft_prefix_with_dot.removesuffix(".")
+            if fnmatch.fnmatch(original_module_name, pattern) or fnmatch.fnmatch(
+                peft_prefix_no_dot, pattern
+            ):
+                # print(f"[LoRA FILTER DEBUG] Module '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') EXCLUDED by blacklist pattern '{pattern}'") # Optional Debug
                 return False  # Explicitly excluded
 
-        # 2. Check inclusion filter
+        # 2. Check inclusion filter against both names (usually matching original name is sufficient, but check both for flexibility)
         if not self.inclusion_filter_patterns:
             # If no inclusion filters are defined, include everything not blacklisted
-            # print(f"[LoRA FILTER DEBUG] Module '{module_name}' INCLUDED (no inclusion filters)") # Optional Debug
+            # print(f"[LoRA FILTER DEBUG] Module '{original_module_name}' INCLUDED (no inclusion filters & not blacklisted)") # Optional Debug
             return True
         else:
-            # If inclusion filters exist, it must match at least one
+            # If inclusion filters exist, it must match at least one (checking both names)
+            peft_prefix_no_dot = potential_peft_prefix_with_dot.removesuffix(".")
             for pattern in self.inclusion_filter_patterns:
-                if fnmatch.fnmatch(module_name, pattern):
-                    # print(f"[LoRA FILTER DEBUG] Module '{module_name}' INCLUDED by inclusion pattern '{pattern}'") # Optional Debug
+                if fnmatch.fnmatch(original_module_name, pattern) or fnmatch.fnmatch(
+                    peft_prefix_no_dot, pattern
+                ):
+                    # print(f"[LoRA FILTER DEBUG] Module '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') INCLUDED by inclusion pattern '{pattern}'") # Optional Debug
                     return True  # Matched an inclusion pattern
 
-        # If inclusion filters exist but none matched
-        # print(f"[LoRA FILTER DEBUG] Module '{module_name}' EXCLUDED (did not match any inclusion pattern)") # Optional Debug
+        # If inclusion filters exist but none matched either name
+        # print(f"[LoRA FILTER DEBUG] Module '{original_module_name}' (PEFT: '{potential_peft_prefix_with_dot}') EXCLUDED (did not match any inclusion pattern)") # Optional Debug
         return False
 
     def _initialize_peft_modules(
