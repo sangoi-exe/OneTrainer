@@ -25,7 +25,11 @@ PRESETS = {
     },
     "full": {},  # Um valor especial para indicar "nenhum filtro específico do preset, usar padrões globais"
     # Ou poderia ser um dict vazio {} dependendo da lógica desejada no Wrapper
-    "rosto_dims": {},
+    "rosto_dims": {
+        "*attn1*": {"rank": 32, "alpha": 32},
+        "*ff*": {"rank": 16, "alpha": 16},
+        "*resnets*": {"rank": 4, "alpha": 4},
+    },
 }
 
 
