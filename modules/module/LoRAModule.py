@@ -1145,50 +1145,57 @@ class LoRAModuleWrapper:
                 modules_skipped_type += 1
                 continue  # Skip unsupported layer types
 
+            # Calculate potential PEFT prefix before calling _should_include_module
+            # Ensure the name part is sanitized like in PeftBase.__init__ and key generation
+            sanitized_name_part = name.replace(".", "_")
+            potential_peft_prefix_with_dot = f"{self.prefix}_{sanitized_name_part}."
+
             # Apply combined filtering logic (inclusion + exclusion)
-            if self._should_include_module(name):
+            # INÍCIO ALTERAÇÃO: Corrigir a chamada para _should_include_module
+            # Passar explicitamente ambos os argumentos: name e potential_peft_prefix_with_dot
+            if self._should_include_module(name, potential_peft_prefix_with_dot):
+                # FIM ALTERAÇÃO
                 # Module passed filters, proceed to create PEFT layer
 
-                # Construct the unique prefix for this specific PEFT module instance
-                # Example: prefix="lora_unet", name="down_blocks_0_resnets_0_conv1"
-                # -> peft_module_prefix = "lora_unet_down_blocks_0_resnets_0_conv1."
-                peft_module_prefix = (
-                    f"{self.prefix}_{name.replace('.', '_')}"  # Sanitize name part
-                )
+                # Use the already calculated potential_peft_prefix for the actual module instance
+                peft_module_prefix = potential_peft_prefix_with_dot.removesuffix(
+                    "."
+                )  # Remove dot for constructor arg
 
-                # Determine Rank and Alpha using RuleSet (based on the original layer name 'name')
+                # Determine Rank and Alpha using RuleSet
+                # Match RuleSet against both names for flexibility
                 rank_to_use = self.default_rank
                 alpha_to_use = self.default_alpha
-                matched_config = self.ruleset.match(
-                    name
-                )  # Use original layer name for matching rules
+                matched_config = self.ruleset.match(name)  # Try original name first
+                if matched_config is None:
+                    # If original name didn't match, try the potential PEFT prefix (without dot)
+                    matched_config = self.ruleset.match(
+                        potential_peft_prefix_with_dot.removesuffix(".")
+                    )
 
                 rule_source = "(Default)"
                 if matched_config:
                     rank_to_use = matched_config.get("rank", self.default_rank)
                     alpha_to_use = matched_config.get("alpha", self.default_alpha)
                     rule_source = f"(Rule: {matched_config})"
-                    # print(f"[LoRA RULE DEBUG] Match for '{name}': {matched_config} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Optional Debug
+                    # print(f"[LoRA RULE DEBUG] Match for '{name}'/'{potential_peft_prefix_with_dot.removesuffix('.')}': {matched_config} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Optional Debug
 
                 # Prepare args and kwargs for the PEFT class constructor
-                # Args must be in the order expected by LoRA/LoHa/DoRA: prefix, module, rank, alpha
                 args_for_this_module = [
                     peft_module_prefix,
                     child_module,
                     rank_to_use,
                     alpha_to_use,
                 ]
-                kwargs_for_this_module = (
-                    self.global_additional_kwargs.copy()
-                )  # Start with global (e.g., DoRA args)
+                kwargs_for_this_module = self.global_additional_kwargs.copy()
 
                 # Create the PEFT instance
                 try:
                     log_msg = (
                         f"[LoRA CREATE] Creating {self.klass.__name__} for: {name} "
                         f"{rule_source} -> Rank={rank_to_use}, Alpha={alpha_to_use} "
-                        f"| PEFT Prefix: {peft_module_prefix}."
-                    )
+                        f"| PEFT Prefix: {potential_peft_prefix_with_dot}"
+                    )  # Log with dot
                     # print(log_msg) # Optional detailed log
 
                     lora_modules[name] = self.klass(
@@ -1201,12 +1208,10 @@ class LoRAModuleWrapper:
                         f"[LoRA ERROR] Failed to create PEFT module for layer '{name}' (prefix {peft_module_prefix}) "
                         f"with Rank={rank_to_use}, Alpha={alpha_to_use}: {e}"
                     )
-                    # Optionally, reraise or handle more gracefully
-                    # raise e
 
             else:
                 modules_skipped_filter += 1
-                # print(f"[LoRA FILTER] Skipping module: {name}") # Optional Debug
+                # print(f"[LoRA FILTER] Skipping module (failed filter): {name}") # Optional Debug
 
         print(f"[LoRA INFO] Module Creation Summary for '{self.prefix}':")
         print(f"  - Created: {modules_created_count} PEFT modules.")
