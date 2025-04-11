@@ -2,7 +2,10 @@ from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import (
+    NamedParameterGroup,
+    NamedParameterGroupCollection,
+)
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.torch_util import state_dict_has_prefix
 from modules.util.TrainProgress import TrainProgress
@@ -69,12 +72,18 @@ class StableDiffusionXLLoRASetup(
         if config.train_any_embedding() or config.train_any_output_embedding():
             if config.text_encoder.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_1"
+                    model.all_text_encoder_1_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_1",
                 )
 
             if config.text_encoder_2.train_embedding:
                 self._add_embedding_param_groups(
-                    model.all_text_encoder_2_embeddings(), parameter_group_collection, config.embedding_learning_rate, "embeddings_2"
+                    model.all_text_encoder_2_embeddings(),
+                    parameter_group_collection,
+                    config.embedding_learning_rate,
+                    "embeddings_2",
                 )
 
         if config.unet.train:
@@ -100,17 +109,27 @@ class StableDiffusionXLLoRASetup(
         model.vae.requires_grad_(False)
 
         if model.text_encoder_1_lora is not None:
-            train_text_encoder_1 = config.text_encoder.train and not self.stop_text_encoder_training_elapsed(config, model.train_progress)
+            train_text_encoder_1 = (
+                config.text_encoder.train
+                and not self.stop_text_encoder_training_elapsed(
+                    config, model.train_progress
+                )
+            )
             model.text_encoder_1_lora.requires_grad_(train_text_encoder_1)
 
         if model.text_encoder_2_lora is not None:
-            train_text_encoder_2 = config.text_encoder_2.train and not self.stop_text_encoder_2_training_elapsed(
-                config, model.train_progress
+            train_text_encoder_2 = (
+                config.text_encoder_2.train
+                and not self.stop_text_encoder_2_training_elapsed(
+                    config, model.train_progress
+                )
             )
             model.text_encoder_2_lora.requires_grad_(train_text_encoder_2)
 
         if model.unet_lora is not None:
-            train_unet = config.unet.train and not self.stop_unet_training_elapsed(config, model.train_progress)
+            train_unet = config.unet.train and not self.stop_unet_training_elapsed(
+                config, model.train_progress
+            )
             model.unet_lora.requires_grad_(train_unet)
 
     def setup_model(
@@ -118,32 +137,33 @@ class StableDiffusionXLLoRASetup(
         model: StableDiffusionXLModel,
         config: TrainConfig,
     ):
-        create_te1 = config.text_encoder.train or state_dict_has_prefix(model.lora_state_dict, "lora_te1")
-        create_te2 = config.text_encoder_2.train or state_dict_has_prefix(model.lora_state_dict, "lora_te2")
+        create_te1 = config.text_encoder.train or state_dict_has_prefix(
+            model.lora_state_dict, "lora_te1"
+        )
+        create_te2 = config.text_encoder_2.train or state_dict_has_prefix(
+            model.lora_state_dict, "lora_te2"
+        )
 
-        model.text_encoder_1_lora = LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config) if create_te1 else None
+        model.text_encoder_1_lora = (
+            LoRAModuleWrapper(model.text_encoder_1, "lora_te1", config)
+            if create_te1
+            else None
+        )
 
-        model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
+        model.text_encoder_2_lora = (
+            LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config)
+            if create_te2
+            else None
+        )
 
-        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layer_preset)
-
-        # lora_dict_keys = list(model.unet_lora.lora_modules.keys())
-
-        # print(config.lora_layers_blacklist)
-        # for key in lora_dict_keys:
-        #     #print(f"🔍 Verificando chave: {repr(key)}")
-        #     if any(blacklisted in key for blacklisted in config.lora_layers_blacklist):
-        #         #print(f"[LoRA REMOVIDO] Chave: {key} APAGA!")
-        #         del model.unet_lora.lora_modules[key]
-
-        # output_filename = "remaining_lora_keys.txt"
-        # try:
-        #     with open(output_filename, 'w', encoding='utf-8') as f:
-        #         # Junta todas as chaves restantes com '\n' entre elas e escreve tudo de uma vez
-        #         f.write('\n'.join(model.unet_lora.lora_modules.keys()))
-        #     print(f"Chaves restantes salvas em '{output_filename}'")
-        # except Exception as e:
-        #     print(f"Erro ao salvar arquivo '{output_filename}': {e}")
+        # A filtragem agora é tratada internamente pelo Wrapper usando config.lora_layers_blacklist e o preset.
+        model.unet_lora = LoRAModuleWrapper(
+            model.unet,
+            "lora_unet",
+            config,
+            preset_name=config.lora_layer_preset,  # Passa o nome do preset da config
+            # Não é necessário passar external_module_filter a menos que haja um filtro adicional específico aqui
+        )
 
         if model.lora_state_dict:
             if create_te1:
@@ -182,7 +202,9 @@ class StableDiffusionXLLoRASetup(
         self._setup_embedding_wrapper(model, config)
         self.__setup_requires_grad(model, config)
 
-        init_model_parameters(model, self.create_parameters(model, config), self.train_device)
+        init_model_parameters(
+            model, self.create_parameters(model, config), self.train_device
+        )
 
     def setup_train_device(
         self,
@@ -190,11 +212,19 @@ class StableDiffusionXLLoRASetup(
         config: TrainConfig,
     ):
         vae_on_train_device = not config.latent_caching
-        text_encoder_1_on_train_device = config.train_text_encoder_or_embedding() or not config.latent_caching
-        text_encoder_2_on_train_device = config.train_text_encoder_2_or_embedding() or not config.latent_caching
+        text_encoder_1_on_train_device = (
+            config.train_text_encoder_or_embedding() or not config.latent_caching
+        )
+        text_encoder_2_on_train_device = (
+            config.train_text_encoder_2_or_embedding() or not config.latent_caching
+        )
 
-        model.text_encoder_1_to(self.train_device if text_encoder_1_on_train_device else self.temp_device)
-        model.text_encoder_2_to(self.train_device if text_encoder_2_on_train_device else self.temp_device)
+        model.text_encoder_1_to(
+            self.train_device if text_encoder_1_on_train_device else self.temp_device
+        )
+        model.text_encoder_2_to(
+            self.train_device if text_encoder_2_on_train_device else self.temp_device
+        )
         model.vae_to(self.train_device if vae_on_train_device else self.temp_device)
         model.unet_to(self.train_device)
 
@@ -215,7 +245,12 @@ class StableDiffusionXLLoRASetup(
         else:
             model.unet.eval()
 
-    def after_optimizer_step(self, model: StableDiffusionXLModel, config: TrainConfig, train_progress: TrainProgress):
+    def after_optimizer_step(
+        self,
+        model: StableDiffusionXLModel,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+    ):
         if config.preserve_embedding_norm:
             self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())
             self._normalize_output_embeddings(model.all_text_encoder_2_embeddings())
