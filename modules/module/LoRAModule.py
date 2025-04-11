@@ -1120,12 +1120,71 @@ class LoRAModuleWrapper:
         # print(f"[LoRA FILTER DEBUG] Module '{original_module_name}' (PEFT: '{potential_peft_prefix_with_dot}') EXCLUDED (did not match any inclusion pattern)") # Optional Debug
         return False
 
+    def _should_include_module(
+        self, original_module_name: str, potential_peft_prefix_with_dot: str
+    ) -> bool:
+        """Checks if a module should be included based on its original name and potential PEFT prefix,
+        considering exclusion and inclusion filters."""
+        peft_prefix_no_dot = potential_peft_prefix_with_dot.removesuffix(
+            "."
+        )  # Remove o ponto final para comparação
+
+        # 1. Check Exclusions (Blacklist)
+        for (
+            pattern
+        ) in self.exclusion_filter_patterns:  # Itera sobre os padrões da blacklist
+            # INÍCIO ALTERAÇÃO - Adiciona wildcards para 'contains' matching
+            contains_pattern = f"*{pattern}*"
+            # FIM ALTERAÇÃO
+            # Compara o padrão 'contains' com o nome original E com o prefixo PEFT gerado
+            match_orig = fnmatch.fnmatch(
+                original_module_name, contains_pattern
+            )  # Usa contains_pattern
+            match_peft = fnmatch.fnmatch(
+                peft_prefix_no_dot, contains_pattern
+            )  # Usa contains_pattern
+
+            if match_orig or match_peft:
+                # Se qualquer um dos nomes contiver o padrão da blacklist, exclui
+                # print(f"[LoRA DEBUG] Excluding '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') due to blacklist pattern: '{pattern}'") # Mantenha comentado ou remova
+                return False
+
+        # 2. Check Inclusions (Whitelist/Presets/Filters) - Only if not excluded above
+        if not self.inclusion_filter_patterns:
+            # Se não há filtros de inclusão definidos, inclui tudo que não foi barrado pela blacklist
+            # print(f"[LoRA DEBUG] Including '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') - No inclusion filters defined.") # Mantenha comentado ou remova
+            return True
+        else:
+            # Se há filtros de inclusão, o módulo precisa corresponder a pelo menos um deles
+            matched_inclusion = False
+            for pattern in self.inclusion_filter_patterns:
+                # INÍCIO ALTERAÇÃO - Adiciona wildcards para 'contains' matching (consistência)
+                contains_pattern = f"*{pattern}*"
+                # FIM ALTERAÇÃO
+                # Compara o padrão 'contains' com o nome original E com o prefixo PEFT gerado
+                match_orig = fnmatch.fnmatch(
+                    original_module_name, contains_pattern
+                )  # Usa contains_pattern
+                match_peft = fnmatch.fnmatch(
+                    peft_prefix_no_dot, contains_pattern
+                )  # Usa contains_pattern
+
+                if match_orig or match_peft:
+                    # Se qualquer um dos nomes contiver um padrão de inclusão, inclui
+                    # print(f"[LoRA DEBUG] Including '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') due to inclusion pattern: '{pattern}'") # Mantenha comentado ou remova
+                    matched_inclusion = True
+                    break  # Sai do loop de inclusão assim que encontrar uma correspondência
+            if matched_inclusion:
+                return True
+            else:
+                # Se chegou aqui, é porque há filtros de inclusão, mas nenhum correspondeu
+                # print(f"[LoRA DEBUG] Excluding '{original_module_name}' (PEFT: '{peft_prefix_no_dot}') - No inclusion pattern matched.") # Mantenha comentado ou remova
+                return False
+
     def _initialize_peft_modules(
         self, root_module: nn.Module | None
     ) -> dict[str, PeftBase]:
-        """
-        Identifies, filters, and creates the actual PEFT modules.
-        """
+        """Identifies, filters, and creates the actual PEFT modules."""
         lora_modules: dict[str, PeftBase] = {}
         if root_module is None:
             print(
@@ -1138,49 +1197,41 @@ class LoRAModuleWrapper:
         modules_skipped_type = 0
         modules_skipped_filter = 0
 
-        # 1. Iterate through named modules to find candidates
         for name, child_module in root_module.named_modules():
-            # Only consider Linear and Conv2d layers
             if not isinstance(child_module, (Linear, Conv2d)):
                 modules_skipped_type += 1
                 continue  # Skip unsupported layer types
 
-            # Calculate potential PEFT prefix before calling _should_include_module
-            # Ensure the name part is sanitized like in PeftBase.__init__ and key generation
             sanitized_name_part = name.replace(".", "_")
             potential_peft_prefix_with_dot = f"{self.prefix}_{sanitized_name_part}."
 
-            # Apply combined filtering logic (inclusion + exclusion)
-            # INÍCIO ALTERAÇÃO: Corrigir a chamada para _should_include_module
-            # Passar explicitamente ambos os argumentos: name e potential_peft_prefix_with_dot
-            if self._should_include_module(name, potential_peft_prefix_with_dot):
-                # FIM ALTERAÇÃO
-                # Module passed filters, proceed to create PEFT layer
+            # <<< CHAMADA AO MÉTODO _should_include_module MODIFICADO >>>
+            should_include = self._should_include_module(
+                name, potential_peft_prefix_with_dot
+            )
 
-                # Use the already calculated potential_peft_prefix for the actual module instance
+            if should_include:
+
                 peft_module_prefix = potential_peft_prefix_with_dot.removesuffix(
                     "."
                 )  # Remove dot for constructor arg
 
-                # Determine Rank and Alpha using RuleSet
-                # Match RuleSet against both names for flexibility
                 rank_to_use = self.default_rank
                 alpha_to_use = self.default_alpha
-                matched_config = self.ruleset.match(name)  # Try original name first
-                if matched_config is None:
-                    # If original name didn't match, try the potential PEFT prefix (without dot)
-                    matched_config = self.ruleset.match(
-                        potential_peft_prefix_with_dot.removesuffix(".")
-                    )
+                matched_config_orig = self.ruleset.match(name)
+                matched_config_peft = (
+                    self.ruleset.match(peft_module_prefix)
+                    if not matched_config_orig
+                    else None
+                )
+                matched_config = matched_config_orig or matched_config_peft
 
                 rule_source = "(Default)"
                 if matched_config:
                     rank_to_use = matched_config.get("rank", self.default_rank)
                     alpha_to_use = matched_config.get("alpha", self.default_alpha)
-                    rule_source = f"(Rule: {matched_config})"
-                    # print(f"[LoRA RULE DEBUG] Match for '{name}'/'{potential_peft_prefix_with_dot.removesuffix('.')}': {matched_config} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Optional Debug
+                    rule_source = f"(Rule: {matched_config} - Matched {'Orig Name' if matched_config_orig else 'PEFT Prefix'})"
 
-                # Prepare args and kwargs for the PEFT class constructor
                 args_for_this_module = [
                     peft_module_prefix,
                     child_module,
@@ -1189,14 +1240,13 @@ class LoRAModuleWrapper:
                 ]
                 kwargs_for_this_module = self.global_additional_kwargs.copy()
 
-                # Create the PEFT instance
                 try:
                     log_msg = (
-                        f"[LoRA CREATE] Creating {self.klass.__name__} for: {name} "
+                        f"[LoRA CREATE] Creating {self.klass.__name__} for: '{name}' "
                         f"{rule_source} -> Rank={rank_to_use}, Alpha={alpha_to_use} "
-                        f"| PEFT Prefix: {potential_peft_prefix_with_dot}"
-                    )  # Log with dot
-                    # print(log_msg) # Optional detailed log
+                        f"| PEFT Prefix: {peft_module_prefix}"
+                    )
+                    # print(log_msg) # Mantenha comentado ou remova
 
                     lora_modules[name] = self.klass(
                         *args_for_this_module, **kwargs_for_this_module
@@ -1211,7 +1261,6 @@ class LoRAModuleWrapper:
 
             else:
                 modules_skipped_filter += 1
-                # print(f"[LoRA FILTER] Skipping module (failed filter): {name}") # Optional Debug
 
         print(f"[LoRA INFO] Module Creation Summary for '{self.prefix}':")
         print(f"  - Created: {modules_created_count} PEFT modules.")
