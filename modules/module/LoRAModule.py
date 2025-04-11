@@ -19,18 +19,18 @@ class RuleSet:
     def __init__(self, pattern_dict: dict[str, dict[str, int | float]]):
         self.patterns = pattern_dict or {}
         self._sorted_patterns = sorted(self.patterns.keys(), key=len, reverse=True)
-        print(f"[RuleSet DEBUG] Initialized with patterns: {self.patterns}")
-        print(f"[RuleSet DEBUG] Sorted patterns for matching: {self._sorted_patterns}")
+        # print(f"[RuleSet DEBUG] Initialized with patterns: {self.patterns}")
+        # print(f"[RuleSet DEBUG] Sorted patterns for matching: {self._sorted_patterns}")
 
     def match(self, name: str) -> dict[str, int | float] | None:
         """Encontra o primeiro padrão (do mais específico para o mais geral) que corresponde ao nome e retorna sua configuração."""
         for pattern in self._sorted_patterns:
             # Usar fnmatch diretamente é mais simples para padrões glob
             if fnmatch.fnmatch(name, pattern):
-                print(f"[RuleSet DEBUG] Match FOUND for '{name}' with pattern '{pattern}'") # Debug Match
+                # print(f"[RuleSet DEBUG] Match FOUND for '{name}' with pattern '{pattern}'") # Debug Match
                 # Retorna o dicionário de configuração associado ao padrão encontrado
                 return self.patterns[pattern]
-        print(f"[RuleSet DEBUG] No match found for '{name}'") # Debug No Match (Opcional, pode poluir)
+        # print(f"[RuleSet DEBUG] No match found for '{name}'") # Debug No Match (Opcional, pode poluir)
         return None # Retorna None se nenhum padrão corresponder
 
 
@@ -642,6 +642,7 @@ class LoRAModuleWrapper:
         self.orig_module = orig_module
         self.prefix = prefix
         self.peft_type = config.peft_type
+        self.config = config
 
         # Armazena os valores padrão
         self.default_rank = config.lora_rank
@@ -728,13 +729,26 @@ class LoRAModuleWrapper:
         else:
             raise ValueError(f"Unsupported PeftType: {self.peft_type}")
 
+        # --- Antes de chamar self.__create_modules ---
+        if orig_module:
+            # Gera todos os nomes de módulos suportados
+            all_supported = {
+                name for name, m in orig_module.named_modules()
+                if isinstance(m, (Linear, Conv2d))
+            }
+
+            # Remove os nomes que batem com a blacklist
+            blacklist = config.lora_layers_blacklist or []
+            filtered_supported = [
+                name for name in all_supported
+                if not any(blk in name for blk in blacklist)
+            ]
+
+            # Substitui o filtro interno pelo novo
+            self.module_filter = filtered_supported
+
         # Cria os módulos PEFT reais com base nas configurações e filtros
         self.lora_modules = self.__create_modules(orig_module)
-
-        # Gera o arquivo de chaves por bloco (para organização, opcional)
-        # A determinação de rank/alpha NÃO depende mais dos blocos, mas
-        # o arquivo pode ser útil para ver quais chaves pertencem a quais partes da UNet.
-        # self.generate_keys_by_block_file(f"{self.prefix}_keys_by_block.txt")
 
     def __create_modules(self, root_module: nn.Module | None) -> dict[str, PeftBase]:
         """
@@ -781,14 +795,14 @@ class LoRAModuleWrapper:
             # Normaliza o nome (robusto caso haja '.' em vez de '_')
             # normalized_name = name.replace(".", "_") # REMOVER ESTA LINHA
             # print(f"[LoRA DEBUG] normalized_name: {normalized_name}") # REMOVER OU AJUSTAR PARA 'name'
-            print(f"[LoRA DEBUG] Matching name: {name}") # Adicionado para clareza
+            # print(f"[LoRA DEBUG] Matching name: {name}") # Adicionado para clareza
 
             # Chama o match ajustado, que retorna o dict de config ou None
             # Passa 'name' original em vez de 'normalized_name'
             matched_config = self.ruleset.match(name)
             # FIM ALTERAÇÃO
             # O print abaixo mostrará o dict retornado ou None
-            print(f"[LoRA DEBUG] matched_config from ruleset: {matched_config}")
+            # print(f"[LoRA DEBUG] matched_config from ruleset: {matched_config}")
 
             # Se um padrão foi encontrado, usa os valores do dict retornado            
             if matched_config:
@@ -801,14 +815,17 @@ class LoRAModuleWrapper:
             args_for_this_module = [rank_to_use, alpha_to_use]
             kwargs_for_this_module = self.global_additional_kwargs.copy()
 
-            try:
-                # INÍCIO ALTERAÇÃO - Corrigir string de log match_info
+            try:                
                 # Debug opcional:
                 # match_info = f"(Pattern: {matched_pattern})" if matched_pattern else "(Default)" # Linha Original com Bug
-                match_info = "(Matched Preset Rule)" if matched_config else "(Default)" # Correção: Verifica se matched_config foi encontrado
+                
+                match_info = "(Matched Preset Rule)" if matched_config else "(Default)" # Correção: Verifica se matched_config foi encontrado                
+                with open("lora_debug_log.txt", "a", encoding="utf-8") as debug_file:
+                    debug_file.write(f"[LoRA DEBUG] Creating {self.klass.__name__} for: {full_peft_prefix} (Layer: {name}) {match_info} -> Rank={rank_to_use}, Alpha={alpha_to_use}\n")
+
                 # FIM ALTERAÇÃO
-                print(f"[LoRA DEBUG] Creating {self.klass.__name__} for: {full_peft_prefix} (Layer: {name}) {match_info} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Reativado print
                 lora_modules[name] = self.klass(full_peft_prefix, child_module, *args_for_this_module, **kwargs_for_this_module)
+
             except Exception as e:
                 print(
                     f"Erro ao criar módulo PEFT para {name} (prefixo {full_peft_prefix}) com rank={rank_to_use}, alpha={alpha_to_use}: {e}"

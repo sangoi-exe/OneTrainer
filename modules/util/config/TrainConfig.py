@@ -695,7 +695,7 @@ class TrainConfig(BaseConfig):
             config_dict.pop('secrets',None)
         return config_dict
 
-    def to_pack_dict(self, secrets: bool) -> dict:
+    def to_pack_dict(self, secrets: bool = False) -> dict:
         config = TrainConfig.default_values().from_dict(self.to_dict())
 
         if config.concepts is None:

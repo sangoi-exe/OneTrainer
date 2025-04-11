@@ -20,13 +20,9 @@ PRESETS = {
         "*attn1*": {},
         "*attn2*": {},
     },
-    "full": [],  # Um valor especial para indicar "nenhum filtro específico do preset, usar padrões globais"
+    "full": {},  # Um valor especial para indicar "nenhum filtro específico do preset, usar padrões globais"
     # Ou poderia ser um dict vazio {} dependendo da lógica desejada no Wrapper
-    "rosto_dims": {
-        "*attn1*": {"rank": 32, "alpha": 32},
-        "*ff*": {"rank": 16, "alpha": 16},
-        "*resnets*": {"rank": 4, "alpha": 4},
-    },
+    "rosto_dims": {},
 }
 
 
@@ -131,23 +127,23 @@ class StableDiffusionXLLoRASetup(
 
         model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layer_preset)
 
-        lora_dict_keys = list(model.unet_lora.lora_modules.keys())
-        
-        #print(config.lora_layers_blacklist)
-        for key in lora_dict_keys:
-            #print(f"🔍 Verificando chave: {repr(key)}")
-            if any(blacklisted in key for blacklisted in config.lora_layers_blacklist):
-                #print(f"[LoRA REMOVIDO] Chave: {key} APAGA!")
-                del model.unet_lora.lora_modules[key]
+        # lora_dict_keys = list(model.unet_lora.lora_modules.keys())
 
-        output_filename = "remaining_lora_keys.txt"
-        try:
-            with open(output_filename, 'w', encoding='utf-8') as f:
-                # Junta todas as chaves restantes com '\n' entre elas e escreve tudo de uma vez
-                f.write('\n'.join(model.unet_lora.lora_modules.keys()))
-            print(f"Chaves restantes salvas em '{output_filename}'")
-        except Exception as e:
-            print(f"Erro ao salvar arquivo '{output_filename}': {e}")
+        # print(config.lora_layers_blacklist)
+        # for key in lora_dict_keys:
+        #     #print(f"🔍 Verificando chave: {repr(key)}")
+        #     if any(blacklisted in key for blacklisted in config.lora_layers_blacklist):
+        #         #print(f"[LoRA REMOVIDO] Chave: {key} APAGA!")
+        #         del model.unet_lora.lora_modules[key]
+
+        # output_filename = "remaining_lora_keys.txt"
+        # try:
+        #     with open(output_filename, 'w', encoding='utf-8') as f:
+        #         # Junta todas as chaves restantes com '\n' entre elas e escreve tudo de uma vez
+        #         f.write('\n'.join(model.unet_lora.lora_modules.keys()))
+        #     print(f"Chaves restantes salvas em '{output_filename}'")
+        # except Exception as e:
+        #     print(f"Erro ao salvar arquivo '{output_filename}': {e}")
 
         if model.lora_state_dict:
             if create_te1:
