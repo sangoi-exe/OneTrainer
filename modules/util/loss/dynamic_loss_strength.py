@@ -165,6 +165,8 @@ class DynamicLossStrength:
         self.use_ema: bool = use_ema
         self.ema_decay: float = ema_decay
         self.outlier_threshold: float = outlier_threshold
+        self.progress = None
+        self.last_logged_delta_epoch = 0
 
         # Initialize scheduling parameters
         self.schedule_params: Dict[str, Dict[str, float]] = (
@@ -297,6 +299,29 @@ class DynamicLossStrength:
 
         # Retorna na ordem desejada
         return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]
+
+    def maybe_log_deltas(self, tensorboard, delta_regularizer, progress):
+        if not hasattr(self, "progress") or not self.progress:
+            return
+
+        if progress.epoch_step != 0:
+            return
+
+        if not hasattr(self, "last_logged_delta_epoch"):
+            self.last_logged_delta_epoch = -1
+
+        if progress.epoch == self.last_logged_delta_epoch:
+            return
+
+        self.last_logged_delta_epoch = self.progress.epoch
+
+        current_norm, reference_norm = delta_regularizer.get_delta_norms()
+        if current_norm is not None:
+            tensorboard.add_scalar("delta/current_norm", current_norm, self.progress.global_step)
+        if reference_norm is not None:
+            tensorboard.add_scalar("delta/reference_norm", reference_norm, self.progress.global_step)
+
+        print(f"[DeltaPattern] Epoch {progress.epoch} | Current Δ: {current_norm:.4f} | Ref Δ: {reference_norm:.4f}")
 
 
 class DeltaPatternRegularizer:

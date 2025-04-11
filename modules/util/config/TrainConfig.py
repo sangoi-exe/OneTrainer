@@ -389,7 +389,8 @@ class TrainConfig(BaseConfig):
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
-    lora_layer_patterns: str
+    lora_layer_patterns: dict[str, dict[str, int | float]] 
+    lora_layers_blacklist: list[str]
     bundle_additional_embeddings: bool
 
     # optimizer
@@ -918,8 +919,9 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_norm_epsilon", True, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
-        data.append(("lora_layer_preset", None, str, True))
-        data.append(("lora_layer_patterns", "", str, True))
+        data.append(("lora_layer_preset", None, str, False))
+        data.append(("lora_layer_patterns", {}, dict[str, dict[str, int | float]] , False))
+        data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 
         # optimizer

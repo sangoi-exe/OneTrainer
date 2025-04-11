@@ -33,6 +33,7 @@ class LoraTab:
         self.prior_selected = None
         self.scroll_frame = None
         self.options_frame = None
+        self.custom_lora_layers = ""
 
         self.refresh_ui()
 
@@ -139,15 +140,19 @@ class LoraTab:
         components.label(master, 6, 0, "Layer Preset",
                          tooltip="Select a preset defining which layers to train, or select 'Custom' to define your own")
         self.layer_selector = components.options(
-            master, 6, 1, self.presets_list, self.ui_state, "lora_layer_preset",
-            command=self.__preset_set_layer_choice
-        )
-
+                    master, 6, 1, self.presets_list, self.ui_state, "lora_layer_preset",
+                    command=self.__preset_set_layer_choice
+                )
+        # INÍCIO ALTERAÇÃO - Associar Entry a 'lora_layers' e tooltip ajustado
         self.layer_entry = components.entry(
-            master, 6, 2, self.ui_state, "lora_layers",
-            tooltip=f"Comma-separated list of diffusion layers to apply the {name} to"
+            master, 6, 2, self.ui_state, "lora_layers", # Alterado de lora_layer_patterns para lora_layers
+            tooltip=f"Custom comma-separated list of layer name patterns (glob syntax like '*.attn*') to apply {name} to. Only used when 'custom' preset is selected."
         )
-        self.prior_custom = self.train_config.lora_layers or ""
+        # FIM ALTERAÇÃO
+        # INÍCIO ALTERAÇÃO - Armazenar o valor custom de lora_layers, não lora_layer_patterns
+        # self.prior_custom = self.train_config.lora_layers or "" # Linha original (referência)
+        self.custom_lora_layers = self.train_config.lora_layers or "" # Usar nova variável
+        # FIM ALTERAÇÃO
         self.layer_entry.grid(row=6, column=2, columnspan=3, sticky="ew")
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits
@@ -160,12 +165,24 @@ class LoraTab:
         if not selected:
             selected = self.presets_list[0]
 
+        # INÍCIO ALTERAÇÃO - Lógica ajustada para habilitar/desabilitar 'lora_layers'
+        current_ui_value = self.layer_entry.get() # Valor atual na UI (que está ligado a lora_layers)
+
         if selected == "custom":
+            # Se mudando para custom, restaurar o valor custom salvo ou o valor atual se já era custom
+            if self.prior_selected != "custom":
+                self.layer_entry.cget('textvariable').set(self.custom_lora_layers)
             self.layer_entry.configure(state="normal")
-            self.layer_entry.cget('textvariable').set(self.prior_custom)
         else:
+            # Se mudando de custom para um preset, salvar o valor custom
             if self.prior_selected == "custom":
-                self.prior_custom = self.layer_entry.get()
+                self.custom_lora_layers = current_ui_value
+
+            # Quando um preset é selecionado, desabilitar e limpar o campo lora_layers
+            # O preset + lora_layer_patterns (dict) + blacklist controlarão as camadas
             self.layer_entry.configure(state="readonly")
-            self.layer_entry.cget('textvariable').set(",".join(self.presets[selected]))
+            self.layer_entry.cget('textvariable').set("") # Limpa o campo, preset controla
+            # Alternativa: Mostrar nome do preset
+            # self.layer_entry.cget('textvariable').set(f"Preset: {selected}")
+        # FIM ALTERAÇÃO
         self.prior_selected = selected

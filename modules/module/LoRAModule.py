@@ -19,12 +19,19 @@ class RuleSet:
     def __init__(self, pattern_dict: dict[str, dict[str, int | float]]):
         self.patterns = pattern_dict or {}
         self._sorted_patterns = sorted(self.patterns.keys(), key=len, reverse=True)
+        print(f"[RuleSet DEBUG] Initialized with patterns: {self.patterns}")
+        print(f"[RuleSet DEBUG] Sorted patterns for matching: {self._sorted_patterns}")
 
     def match(self, name: str) -> dict[str, int | float] | None:
+        """Encontra o primeiro padrão (do mais específico para o mais geral) que corresponde ao nome e retorna sua configuração."""
         for pattern in self._sorted_patterns:
+            # Usar fnmatch diretamente é mais simples para padrões glob
             if fnmatch.fnmatch(name, pattern):
+                print(f"[RuleSet DEBUG] Match FOUND for '{name}' with pattern '{pattern}'") # Debug Match
+                # Retorna o dicionário de configuração associado ao padrão encontrado
                 return self.patterns[pattern]
-        return None
+        print(f"[RuleSet DEBUG] No match found for '{name}'") # Debug No Match (Opcional, pode poluir)
+        return None # Retorna None se nenhum padrão corresponder
 
 
 # --- Adicionado: Definição de blocos e mapeamento ---
@@ -645,33 +652,36 @@ class LoRAModuleWrapper:
         self.lora_layer_patterns = config.lora_layer_patterns.copy() if config.lora_layer_patterns else {}
         preset_module_filter = [] # Filtro derivado apenas do preset
         
-        if preset_name and preset_name != "full":
+        if preset_name:
           # Importa PRESETS aqui ou garante que esteja acessível no escopo
-          from .presets import PRESETS # Ajuste o caminho da importação conforme necessário
+          from modules.modelSetup.StableDiffusionXLLoRASetup import PRESETS
 
-          preset_config = PRESETS.get(preset_name)
+        if preset_name not in PRESETS:
+            print(f"[LoRA WARNING] Preset '{preset_name}' não encontrado. Valores defaults serão usados.")
+        else:
+            print(f"[LoRA INFO] Usando preset '{preset_name}' com {len(PRESETS[preset_name]) if PRESETS[preset_name] else 0} filtros.")
 
-          if isinstance(preset_config, dict):
-              # Nova estrutura: {"pattern": {"rank": r, "alpha": a}, ...}
-              preset_module_filter = list(preset_config.keys())
-              # Mescla/sobrescreve os padrões globais com os do preset
-              self.lora_layer_patterns.update(preset_config)
-              print(f"LoRA Wrapper: Usando preset '{preset_name}' com {len(preset_module_filter)} padrões e overrides específicos.")
-          elif isinstance(preset_config, list):
-              # Estrutura antiga (apenas filtros): ["pattern1", "pattern2", ...]
-              # Mantém compatibilidade: usa a lista como filtro, sem overrides do preset.
-              preset_module_filter = preset_config
-              # Mantém os lora_layer_patterns globais da config
-              print(f"LoRA Wrapper: Usando preset '{preset_name}' (formato antigo) com {len(preset_module_filter)} filtros. Usando overrides globais.")
-          elif preset_config is None and preset_name in PRESETS:
-              # Preset definido como None (ex: "full") -> sem filtro/overrides do preset
-              print(f"LoRA Wrapper: Preset '{preset_name}' encontrado como None. Usando filtros externos e overrides globais.")
-          else:
-              print(f"Aviso: Preset '{preset_name}' não encontrado ou inválido em PRESETS. Usando filtros externos e overrides globais.")
+
+        preset_config = PRESETS.get(preset_name)
+
+        if isinstance(preset_config, dict):
+            preset_module_filter = list(preset_config.keys())
+            self.lora_layer_patterns.update(preset_config)
+            print(f"LoRA Wrapper: Usando preset '{preset_name}' com {len(preset_module_filter)} padrões e overrides específicos.")
+
+        elif isinstance(preset_config, list):
+            preset_module_filter = preset_config
+            print(f"LoRA Wrapper: Usando preset '{preset_name}' (formato antigo) com {len(preset_module_filter)} filtros. Usando overrides globais.")
+
+        elif preset_config is None and preset_name in PRESETS:
+            print(f"LoRA Wrapper: Preset '{preset_name}' encontrado como None. Usando filtros externos e overrides globais.")
+
         elif preset_name == "full":
             print(f"LoRA Wrapper: Preset 'full' selecionado. Usando filtros externos e overrides globais.")
+
         else:
-            print("LoRA Wrapper: Nenhum preset especificado. Usando filtros externos e overrides globais.")
+            print(f"Aviso: Preset '{preset_name}' não encontrado ou inválido em PRESETS. Usando filtros externos e overrides globais.")
+
 
         # Combina filtros: Uma camada só será criada se passar em AMBOS os filtros
         # (Se external_module_filter for None/vazio, ele permite tudo)
@@ -685,12 +695,15 @@ class LoRAModuleWrapper:
 
         # Filtro final considera ambos:
         effective_filter = set(preset_module_filter)
+        print(f"[Wrapper DEBUG] Initial lora_layer_patterns from config: {self.lora_layer_patterns}")
         if external_module_filter:
              effective_filter.update(external_module_filter) # Ou use interseção se a lógica for E em vez de OU
-
+        print(f"[Wrapper DEBUG] Patterns after preset merge: {self.lora_layer_patterns}")
         # Se effective_filter estiver vazio, significa que NENHUM filtro foi aplicado (incluir tudo)
         self.module_filter = list(effective_filter) if effective_filter else [] # Lista vazia significa "sem filtro"
-        self.ruleset = RuleSet(config.lora_layer_patterns)
+        print(f"[Wrapper DEBUG] Effective module_filter: {self.module_filter}")
+        # *** CORREÇÃO: Inicializar RuleSet com os padrões ATUALIZADOS (pós-preset) ***
+        self.ruleset = RuleSet(self.lora_layer_patterns) # Usar self.lora_layer_patterns aqui
 
         # Armazena o filtro de módulo
         self.module_filter = [x.strip() for x in module_filter if x.strip()] if module_filter is not None else []
@@ -721,7 +734,7 @@ class LoRAModuleWrapper:
         # Gera o arquivo de chaves por bloco (para organização, opcional)
         # A determinação de rank/alpha NÃO depende mais dos blocos, mas
         # o arquivo pode ser útil para ver quais chaves pertencem a quais partes da UNet.
-        self.generate_keys_by_block_file(f"{self.prefix}_keys_by_block.txt")
+        # self.generate_keys_by_block_file(f"{self.prefix}_keys_by_block.txt")
 
     def __create_modules(self, root_module: nn.Module | None) -> dict[str, PeftBase]:
         """
@@ -759,34 +772,42 @@ class LoRAModuleWrapper:
             clean_name = name.removeprefix(self.prefix + "_") if name.startswith(self.prefix + "_") else name
             full_peft_prefix = f"{self.prefix}_{clean_name}" if clean_name else self.prefix
 
-            # INÍCIO ALTERAÇÃO - Usa self.ruleset diretamente
             # 2. Determina Rank e Alpha para esta camada específica usando RuleSet
             rank_to_use = self.default_rank
             alpha_to_use = self.default_alpha
             matched_pattern = None # Para debug
 
-            # Itera sobre os padrões ORDENADOS (do mais específico/longo para o mais geral)
+            # INÍCIO ALTERAÇÃO - Remover normalização e usar 'name' original
+            # Normaliza o nome (robusto caso haja '.' em vez de '_')
+            # normalized_name = name.replace(".", "_") # REMOVER ESTA LINHA
+            # print(f"[LoRA DEBUG] normalized_name: {normalized_name}") # REMOVER OU AJUSTAR PARA 'name'
+            print(f"[LoRA DEBUG] Matching name: {name}") # Adicionado para clareza
+
+            # Chama o match ajustado, que retorna o dict de config ou None
+            # Passa 'name' original em vez de 'normalized_name'
             matched_config = self.ruleset.match(name)
+            # FIM ALTERAÇÃO
+            # O print abaixo mostrará o dict retornado ou None
+            print(f"[LoRA DEBUG] matched_config from ruleset: {matched_config}")
+
+            # Se um padrão foi encontrado, usa os valores do dict retornado            
             if matched_config:
-                # matched_config é o dict {"rank": r, "alpha": a} ou {}
                 rank_to_use = matched_config.get("rank", self.default_rank)
                 alpha_to_use = matched_config.get("alpha", self.default_alpha)
-                # Encontra qual padrão deu match (opcional, para debug)
-                # for pattern in self.ruleset._sorted_patterns:
-                #     if fnmatch.fnmatch(name, pattern):
-                #         matched_pattern = pattern
-                #         break
-
-            # FIM ALTERAÇÃO
+                # A lógica para encontrar 'matched_pattern' para debug pode ser adicionada
+                # novamente dentro de RuleSet.match se necessário, mas não é essencial aqui.
 
             # 3. Cria a instância do módulo PEFT (sem alterações na lógica de criação)
             args_for_this_module = [rank_to_use, alpha_to_use]
             kwargs_for_this_module = self.global_additional_kwargs.copy()
 
             try:
+                # INÍCIO ALTERAÇÃO - Corrigir string de log match_info
                 # Debug opcional:
-                # match_info = f"(Pattern: {matched_pattern})" if matched_pattern else "(Default)"
-                # print(f"Creating {self.klass.__name__} for: {full_peft_prefix} (Layer: {name}) {match_info} -> Rank={rank_to_use}, Alpha={alpha_to_use}")
+                # match_info = f"(Pattern: {matched_pattern})" if matched_pattern else "(Default)" # Linha Original com Bug
+                match_info = "(Matched Preset Rule)" if matched_config else "(Default)" # Correção: Verifica se matched_config foi encontrado
+                # FIM ALTERAÇÃO
+                print(f"[LoRA DEBUG] Creating {self.klass.__name__} for: {full_peft_prefix} (Layer: {name}) {match_info} -> Rank={rank_to_use}, Alpha={alpha_to_use}") # Reativado print
                 lora_modules[name] = self.klass(full_peft_prefix, child_module, *args_for_this_module, **kwargs_for_this_module)
             except Exception as e:
                 print(
@@ -914,7 +935,7 @@ class LoRAModuleWrapper:
         final_remaining_keys = list(potential_dummy_keys.keys())
         if final_remaining_keys:
             # Pode ser útil logar isso para debug
-            # print(f"Aviso: Chaves não utilizadas encontradas após carregar state dict para prefixo '{self.prefix}': {final_remaining_keys}")
+            print(f"Aviso: Chaves não utilizadas encontradas após carregar state dict para prefixo '{self.prefix}': {final_remaining_keys}")
             pass
 
     def state_dict(self) -> dict:

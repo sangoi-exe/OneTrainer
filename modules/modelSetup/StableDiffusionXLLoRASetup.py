@@ -10,31 +10,23 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 
 PRESETS = {
-    "attn-mlp": ["attentions"],
-    "attn-only": ["attn"],
-    "full": [],
-    "rosto": [
-        # ===== MIDBLOCK =====
-        "mid_block.attentions.*.transformer_blocks.*.attn1.*",
-        "mid_block.attentions.*.transformer_blocks.*.attn2.*",
-        "mid_block.attentions.*.transformer_blocks.*.ff.*",
-        "mid_block.resnets.*",
-        # ===== IN04 e IN05 =====
-        "down_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
-        "down_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
-        "down_blocks.1.attentions.*.transformer_blocks.*.ff.*",
-        "down_blocks.1.resnets.*",
-        # ===== IN07 e IN08 =====
-        "down_blocks.2.attentions.*.transformer_blocks.*.attn1.*",
-        "down_blocks.2.attentions.*.transformer_blocks.*.attn2.*",
-        "down_blocks.2.attentions.*.transformer_blocks.*.ff.*",
-        "down_blocks.2.resnets.*",
-        # ===== OUT03 a OUT05 =====
-        "up_blocks.1.attentions.*.transformer_blocks.*.attn1.*",
-        "up_blocks.1.attentions.*.transformer_blocks.*.attn2.*",
-        "up_blocks.1.attentions.*.transformer_blocks.*.ff.*",
-        "up_blocks.1.resnets.*",
-    ],
+    "attn-mlp": {
+        # Usa rank/alpha padrão para todos os matches
+        "*attentions*": {},
+        "*transformer_blocks*ff*": {},  # Exemplo: Padrão mais específico para FF
+    },
+    "attn-only": {
+        # Usa rank/alpha padrão apenas para attn1 e attn2
+        "*attn1*": {},
+        "*attn2*": {},
+    },
+    "full": [],  # Um valor especial para indicar "nenhum filtro específico do preset, usar padrões globais"
+    # Ou poderia ser um dict vazio {} dependendo da lógica desejada no Wrapper
+    "rosto_dims": {
+        "*attn1*": {"rank": 32, "alpha": 32},
+        "*ff*": {"rank": 16, "alpha": 16},
+        "*resnets*": {"rank": 4, "alpha": 4},
+    },
 }
 
 
@@ -137,7 +129,25 @@ class StableDiffusionXLLoRASetup(
 
         model.text_encoder_2_lora = LoRAModuleWrapper(model.text_encoder_2, "lora_te2", config) if create_te2 else None
 
-        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layers.split(","))
+        model.unet_lora = LoRAModuleWrapper(model.unet, "lora_unet", config, config.lora_layer_preset)
+
+        lora_dict_keys = list(model.unet_lora.lora_modules.keys())
+        
+        #print(config.lora_layers_blacklist)
+        for key in lora_dict_keys:
+            #print(f"🔍 Verificando chave: {repr(key)}")
+            if any(blacklisted in key for blacklisted in config.lora_layers_blacklist):
+                #print(f"[LoRA REMOVIDO] Chave: {key} APAGA!")
+                del model.unet_lora.lora_modules[key]
+
+        output_filename = "remaining_lora_keys.txt"
+        try:
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                # Junta todas as chaves restantes com '\n' entre elas e escreve tudo de uma vez
+                f.write('\n'.join(model.unet_lora.lora_modules.keys()))
+            print(f"Chaves restantes salvas em '{output_filename}'")
+        except Exception as e:
+            print(f"Erro ao salvar arquivo '{output_filename}': {e}")
 
         if model.lora_state_dict:
             if create_te1:
@@ -163,7 +173,7 @@ class StableDiffusionXLLoRASetup(
 
         model.unet_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
         model.unet_lora.hook_to_module()
-        
+
         model.parameter_groups = self.create_parameters(model, config)
 
         if config.rescale_noise_scheduler_to_zero_terminal_snr:

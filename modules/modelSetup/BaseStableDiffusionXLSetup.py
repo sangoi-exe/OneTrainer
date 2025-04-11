@@ -387,6 +387,7 @@ class BaseStableDiffusionXLSetup(
 		return self._diffusion_losses(
 			batch=batch,
 			data=data,
+			model=model,
 			config=config,
 			progress=progress,
 			tensorboard=tensorboard,

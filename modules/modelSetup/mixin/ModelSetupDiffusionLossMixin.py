@@ -142,6 +142,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
           mse_z, mae_z, log_cosh_z, config, progress
         )
+
+        self.dynamic_loss_strengthing.maybe_log_deltas(self.tensorboard, self.delta_pattern, self.progress)
+       
         losses = (
           mse_loss * mse_weight * config.mse_strength
           + mae_loss * mae_weight * config.mae_strength
