@@ -35,7 +35,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.utils.hooks import RemovableHandle
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub

@@ -1,8 +1,8 @@
 import json
 import traceback
+from typing import Deque
 from torch.nn import Parameter
 
-# FIM ALTERAÇÃO
 import os
 import time
 import warnings
@@ -11,19 +11,13 @@ from torch import Tensor
 from collections import deque
 from safetensors.torch import load_file
 
-# INÍCIO ALTERAÇÃO: Ajustar imports e tipos
 from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
 
 from modules.util.NamedParameterGroup import NamedParameterGroup
 
-# Usar TYPE_CHECKING para evitar importação circular se NamedParameterGroupCollection estiver em outro módulo
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-# FIM ALTERAÇÃO
 
-###############################################################################
-# NOVO: Variável global para controlar o modo (scalar vs. batch)
-###############################################################################
 BATCH_MODE = True
 """
 Se BATCH_MODE for False, comporta-se como no código original (usa .item()).
@@ -49,9 +43,9 @@ class LossTracker:
         self.use_mad: bool = use_mad
 
         # As filas continuarão existindo, mas podem armazenar floats ou Tensores
-        self.mse_losses: deque = deque(maxlen=window_size)
-        self.mae_losses: deque = deque(maxlen=window_size)
-        self.log_cosh_losses: deque = deque(maxlen=window_size)
+        self.mse_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
+        self.mae_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
+        self.log_cosh_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
         """
@@ -78,7 +72,7 @@ class LossTracker:
 
     def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
         try:
-            arr = torch.cat([x.view(-1) for x in values_list], dim=0)
+            arr = torch.cat([x.view(-1) if isinstance(x, Tensor) else torch.tensor([x]) for x in values_list], dim=0)
             if not self.use_mad:
                 mean_val = arr.mean()
                 std_val = arr.std(unbiased=False)
@@ -143,7 +137,7 @@ class DynamicLossStrength:
         use_ema: bool = False,
         ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
-        schedule_params: Dict[str, Dict[str, float]] = None,
+        schedule_params: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> None:
         """
         Initializes the DynamicLossStrength.
@@ -503,7 +497,7 @@ class DeltaPatternRegularizer:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
         return self.current_total_delta_norm, self.reference_delta_norm
 
-     def log_group_deltas(self, epoch: int):
+    def log_group_deltas(self, epoch: int):
         """
         Salva norma L2 do delta para cada grupo (NamedParameterGroup) no epoch atual.
         Usa self.initial_weights_run1 como base. Parâmetros vêm de self.param_collection (NamedParameterGroupCollection).
@@ -530,6 +524,7 @@ class DeltaPatternRegularizer:
 
             group_delta_norm = group_norm_sq ** 0.5 if param_count > 0 else 0.0
             self.delta_log_by_module[epoch_key][group.display_name] = group_delta_norm
+
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
 
