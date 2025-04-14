@@ -139,6 +139,9 @@ from diffusers import (
     UniPCMultistepScheduler,
 )
 
+def logFun(msg: str, path: str = "lrSchedulerUtil_debug.txt"):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{msg}\n")
 
 def create_model_loader(
         model_type: ModelType,
@@ -831,28 +834,26 @@ def create_optimizer(
 
         # PRODIGY Optimizer
         case Optimizer.PRODIGY:
-            # Usar ProdigyOptimizer para evitar conflito com Enum
-            optimizer = ProdigyOptimizer(
+            import prodigyopt
+            optimizer = prodigyopt.Prodigy(
                 params=parameters,
-                lr=config.learning_rate, # Prodigy recomenda LR=1.0, mas usamos o config LR como multiplicador
+                lr=config.learning_rate,
                 betas=(optimizer_config.beta1 if optimizer_config.beta1 is not None else 0.9,
                        optimizer_config.beta2 if optimizer_config.beta2 is not None else 0.999),
-                beta3=optimizer_config.beta3, # Pode ser None
+                beta3=optimizer_config.beta3 if optimizer_config.beta3 is not None else None,
                 eps=optimizer_config.eps if optimizer_config.eps is not None else 1e-8,
-                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0.0,
+                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0,
                 decouple=optimizer_config.decouple if optimizer_config.decouple is not None else True,
                 use_bias_correction=optimizer_config.use_bias_correction if optimizer_config.use_bias_correction is not None else False,
                 safeguard_warmup=optimizer_config.safeguard_warmup if optimizer_config.safeguard_warmup is not None else False,
                 d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-6,
                 d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 1.0,
                 growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else float('inf'),
-                fsdp_in_use=optimizer_config.fsdp_in_use if optimizer_config.fsdp_in_use is not None else False, # Pode precisar de auto-detecção melhorada
+                fsdp_in_use=optimizer_config.fsdp_in_use if optimizer_config.fsdp_in_use is not None else False,
                 slice_p=optimizer_config.slice_p if optimizer_config.slice_p is not None else 1,
             )
-            # Aplicar patch para adicionar métodos e rounding estocástico
-            # Determinar se rounding deve ser ativo (ex: se dtype for bf16)
-            use_stochastic_rounding = config.optimizer.stochastic_rounding and config.train_dtype == config.train_dtype.BFLOAT_16
-            patch_prodigy(optimizer, use_stochastic_rounding)
+            if optimizer_config.stochastic_rounding:
+                patch_prodigy(optimizer, optimizer_config.stochastic_rounding)
 
         # ADAFactor Optimizer
         case Optimizer.ADAFACTOR:
@@ -981,10 +982,11 @@ def create_optimizer(
 
     if state_dict is not None and optimizer is not None:
         if 'param_group_mapping' not in state_dict:
-            # Old method of loading the optimizer state. This only works if the param groups did not change.
-            for i, params in enumerate(parameters):
-                state_dict['param_groups'][i]['lr'] = params['lr']
-                state_dict['param_groups'][i]['initial_lr'] = params['initial_lr']
+            # # Old method of loading the optimizer state. This only works if the param groups did not change.
+            # for i, params in enumerate(parameters):
+            #     state_dict['param_groups'][i]['lr'] = params['lr']
+            #     state_dict['param_groups'][i]['initial_lr'] = params['initial_lr']
+            pass
         else:
             # New method of loading the optimizer state. Each group is mapped by a unique name.
             old_state = state_dict['state']
@@ -1004,27 +1006,44 @@ def create_optimizer(
                         old_group_optimizer_mapping[old_group_mapping.index(unique_group_name)]):
                     # the group state was saved in state_dict
                     old_group_index = old_group_mapping.index(unique_group_name)
-                    new_group = new_param_groups[new_group_index]
-                    old_group = old_param_groups[old_group_index]
+                    new_group = new_param_groups[new_group_index] # Usado apenas para obter a estrutura/índices se necessário
+                    old_group = old_param_groups[old_group_index] # Este contém os dados do backup, incluindo LR correto
+
+                    # Mapeia os índices dos parâmetros para o novo estado
                     for i, old_state_index in enumerate(old_group['params']):
                         if old_state_index in old_state:
                             state[state_index] = old_state[old_state_index]
+                        # Atualiza os índices de parâmetros no grupo antigo para corresponderem ao novo 'state'
                         old_group['params'][i] = state_index
                         state_index += 1
+
+                    # Adiciona o grupo do backup (com LRs corretos) à lista de grupos a serem carregados
                     param_groups.append(old_group)
 
-                    old_group['lr'] = new_group['lr']
-                    old_group['initial_lr'] = new_group['initial_lr']
+                    # // INÍCIO ALTERAÇÃO - Remover a sobrescrita de LR
+                    # Remover as linhas abaixo para preservar os LRs do backup
+                    # old_group['lr'] = new_group['lr']
+                    # old_group['initial_lr'] = new_group['initial_lr']
+                    # // FIM ALTERAÇÃO
                 else:
                     # the group state was not saved, initialize with an empty group state
                     new_group = new_param_groups[new_group_index]
+                    # Prepara os índices dos parâmetros para o novo estado
                     new_group['params'][:] = range(state_index, state_index + len(new_group['params']))
                     state_index += len(new_group['params'])
+                    # Adiciona o novo grupo (da config atual) pois não havia no backup
                     param_groups.append(new_group)
 
+            # Prepara o state_dict final para ser carregado
             state_dict['state'] = state
             state_dict['param_groups'] = param_groups
+            # Remover mapeamentos antigos que não são parte do state_dict padrão do PyTorch
+            state_dict.pop('param_group_mapping', None)
+            state_dict.pop('param_group_optimizer_mapping', None)
 
+        # Carrega o state_dict preparado no otimizador.
+        # A implementação padrão do load_state_dict do PyTorch deve usar os LRs
+        # presentes nos param_groups dentro do state_dict fornecido.
         optimizer.load_state_dict(state_dict)
 
     return optimizer
@@ -1068,6 +1087,7 @@ def create_lr_scheduler(
         gradient_accumulation_steps: int,
         global_step: int = 0,
 ) -> LRScheduler:
+
     steps_per_epoch = approximate_epoch_length
     total_steps = int(steps_per_epoch * num_epochs / gradient_accumulation_steps)
 
@@ -1080,9 +1100,12 @@ def create_lr_scheduler(
 
     scheduler_steps = total_steps - warmup_steps
 
+    #logFun(f"[Scheduler Steps]: {scheduler_steps}")
+
     # Force schedule-free algorithms to constant schedule.
     if config.optimizer.optimizer.is_schedule_free:
         learning_rate_scheduler = LearningRateScheduler.CONSTANT
+        print(f"[DEBUG] Optimizer: {config.optimizer.optimizer} | Schedule-Free: {config.optimizer.optimizer.is_schedule_free}")
 
     match learning_rate_scheduler:
         case LearningRateScheduler.CONSTANT:

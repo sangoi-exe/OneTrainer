@@ -1,6 +1,34 @@
 import math
 from collections.abc import Callable
 
+from collections import OrderedDict
+import os
+
+# def #logFun(msg: str, path: str = "lrSchedulerUtil_debug2.txt"):
+#     try:
+#         # Carrega todas as linhas existentes, removendo duplicadas (mantém ordem)
+#         if os.path.exists(path):
+#             with open(path, "r", encoding="utf-8") as f:
+#                 lines = f.readlines()
+#         else:
+#             lines = []
+
+#         existing = OrderedDict()
+#         for line in lines:
+#             stripped = line.rstrip()
+#             existing[stripped] = None  # Mantém a última ocorrência
+
+#         # Atualiza com a nova mensagem
+#         existing[msg] = None
+
+#         # Regrava tudo
+#         with open(path, "w", encoding="utf-8") as f:
+#             for key in existing:
+#                 f.write(f"{key}\n")
+#     except Exception as e:
+#         print(f"[#logFun] Erro ao escrever no log: {e}")
+
+
 
 def lr_lambda_warmup(warmup_steps: int, lr_lambda: Callable[[int], float]):
     def warmup(current_step: int):
@@ -30,16 +58,25 @@ def lr_lambda_linear(
 
     return lr_lambda
 
-
 def lr_lambda_cosine(
     scheduler_steps: int,
     min_factor: float = 1.0,
 ):
+    #logFun(f"[DEBUG LAMBDA COSINE] scheduler steps {scheduler_steps}")
+    #logFun(f"[DEBUG LAMBDA COSINE] min factor {min_factor}")
     def lr_lambda(current_step: int):
-        progress = float(current_step) / float(scheduler_steps)
+        progress = float(current_step) / max(1.0, float(scheduler_steps - 1))
+        #logFun(f"[DEBUG LAMBDA COSINE] progress1 {progress}")
+        #logFun(f"[DEBUG LAMBDA COSINE] current_step {current_step}")
+        #logFun(f"[DEBUG LAMBDA COSINE] scheduler_steps {scheduler_steps}")
+        progress = min(1.0, max(0.0, progress))
+        #logFun(f"[DEBUG LAMBDA COSINE] progress2 {progress}")
         cos_val = 0.5 * (1.0 + math.cos(progress * math.pi))
+        #logFun(f"[DEBUG LAMBDA COSINE] cos val {cos_val}")
         factor = max(0.0, cos_val)
+        #logFun(f"[DEBUG LAMBDA COSINE] factor = max(0.0, cos_val) {factor}")
         factor = apply_min_factor(factor, min_factor)
+        #logFun(f"[DEBUG LAMBDA COSINE] factor = apply_min_factor(factor, min_factor) {factor}")
         return factor
 
     return lr_lambda
@@ -98,4 +135,6 @@ def lr_lambda_rex(
 
 
 def apply_min_factor(value: float, min_factor: float) -> float:
+    #logFun(f"[DEBUG LAMBDA COSINE] value {value}")
+    #logFun(f"[DEBUG LAMBDA COSINE] min_factor {min_factor}")
     return min_factor + (1.0 - min_factor) * value

@@ -18,12 +18,17 @@ debug*.py
 /training_concepts
 /training_presets
 /training_samples
+/training_deltas
 /training_user_settings
 /external
 /update.var
 config.json
 secrets.json
-snapshotLegacy.py
+extLayers.py
+extPt.py
+fixLora.py
+fixPt.py
+limpaLayer.py
 *.txt
 
 # environments

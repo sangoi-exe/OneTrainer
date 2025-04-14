@@ -1,12 +1,24 @@
-from inspect import Parameter
+import traceback
+from torch.nn import Parameter
+
+# FIM ALTERAÇÃO
 import os
 import time
 import warnings
 import torch
 from torch import Tensor
 from collections import deque
-from typing import Iterable, Tuple, List, Dict, Union, Optional
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+from safetensors.torch import load_file
+
+# INÍCIO ALTERAÇÃO: Ajustar imports e tipos
+from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
+
+from modules.util.NamedParameterGroup import NamedParameterGroup
+
+# Usar TYPE_CHECKING para evitar importação circular se NamedParameterGroupCollection estiver em outro módulo
+if TYPE_CHECKING:
+    from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+# FIM ALTERAÇÃO
 
 ###############################################################################
 # NOVO: Variável global para controlar o modo (scalar vs. batch)
@@ -63,9 +75,7 @@ class LossTracker:
             self.mae_losses.append(mae_loss.detach())
             self.log_cosh_losses.append(log_cosh_loss.detach())
 
-    def compute_stats(
-        self, values_list: List[Union[float, Tensor]]
-    ) -> Tuple[float, float]:
+    def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
         """
         Computes statistics for a list of loss values.
 
@@ -100,9 +110,7 @@ class LossTracker:
             mad_val = abs_dev.median()
             return median_val.item(), max(mad_val.item(), 1e-8)
 
-    def compute_z_scores(
-        self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
-    ) -> Tuple[float, float, float]:
+    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> Tuple[float, float, float]:
         """
         Computes z-scores for the given loss values.
 
@@ -169,9 +177,7 @@ class DynamicLossStrength:
         self.last_logged_delta_epoch = 0
 
         # Initialize scheduling parameters
-        self.schedule_params: Dict[str, Dict[str, float]] = (
-            self._initialize_schedule_params(schedule_params)
-        )
+        self.schedule_params: Dict[str, Dict[str, float]] = self._initialize_schedule_params(schedule_params)
 
         # EMA state
         self.ema_weights: Dict[str, float] = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
@@ -259,17 +265,13 @@ class DynamicLossStrength:
             else:
                 alpha = 1.0 - self.ema_decay
                 for loss in self.ema_weights:
-                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[
-                        loss
-                    ] + alpha * base_weights[loss]
+                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
 
             # Normaliza as weights do EMA
             sum_ema = sum(self.ema_weights.values())
             if sum_ema < 1e-8:
                 sum_ema = 1.0
-            normalized_ema_weights = {
-                loss: w / sum_ema for loss, w in self.ema_weights.items()
-            }
+            normalized_ema_weights = {loss: w / sum_ema for loss, w in self.ema_weights.items()}
             base_weights = normalized_ema_weights
 
         # 5) Scheduler
@@ -281,14 +283,10 @@ class DynamicLossStrength:
 
         scheduled_factors = {}
         for loss, params in self.schedule_params.items():
-            scheduled_factors[loss] = (
-                params["start"] * (1 - frac) + params["end"] * frac
-            )
+            scheduled_factors[loss] = params["start"] * (1 - frac) + params["end"] * frac
 
         # Multiplica cada base weight pelo fator do scheduler
-        weighted_weights = {
-            loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights
-        }
+        weighted_weights = {loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights}
 
         # Normaliza
         sum_weighted = sum(weighted_weights.values())
@@ -325,219 +323,307 @@ class DynamicLossStrength:
 
 
 class DeltaPatternRegularizer:
-    # INÍCIO ALTERAÇÃO: Recebe a coleção de parâmetros
-    def __init__(self, param_collection: NamedParameterGroupCollection):
-      self.param_collection: NamedParameterGroupCollection = param_collection
-      # FIM ALTERAÇÃO
-      self.initial_weights_run1: Dict[str, torch.Tensor] = {} # Pesos no início da Run 1 (para salvar)
-      self.initial_weights_run2: Dict[str, torch.Tensor] = {} # Pesos no início da Run 2 (para calcular penalidade)
-      self.reference_deltas: Dict[str, torch.Tensor] = {}   # Deltas carregados da Run 1
-      self.current_total_delta_norm: Optional[float] = None # Cache da norma do delta atual
-      self.reference_delta_norm: Optional[float] = None # Cache da norma do delta de referência
+    def __init__(self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection"):
+        if param_collection is None:
+            raise ValueError("param_collection não pode ser None para DeltaPatternRegularizer.")
+        self.model = model
+        self.param_collection: "NamedParameterGroupCollection" = param_collection
+        self.initial_weights_run1: Dict[str, torch.Tensor] = {}  # Pesos no início da Run 1 (para salvar) - Em CPU
+        self.initial_weights_run2: Dict[str, torch.Tensor] = (
+            {}
+        )  # Pesos no início da Run 2 (para calcular penalidade) - Em CPU
+        self.reference_deltas: Dict[str, torch.Tensor] = {}  # Deltas carregados da Run 1 - Em CPU
+        self.current_total_delta_norm: Optional[float] = None  # Cache da norma L2 do delta atual
+        self.reference_delta_norm: Optional[float] = None  # Cache da norma L2 do delta de referência
 
-    # INÍCIO ALTERAÇÃO: Adaptado para iterar sobre a coleção
-    def _iterate_params(self) -> Iterable[Tuple[str, Parameter]]:
-      """Helper para iterar sobre todos os parâmetros com uma chave única."""
-      for group in self.param_collection._NamedParameterGroupCollection__groups: # Acessa a lista privada
-        if not group.parameters: # Pula grupos vazios
-          continue
-        group_device = group.parameters[0].device # Pega o device do primeiro parâmetro do grupo
-        for i, param in enumerate(group.parameters):
-          if param.requires_grad:
-            key = f"{group.unique_name}_{i}"
-            yield key, param, group_device # Retorna chave, param e device
+    def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
+        """
+        Itera diretamente sobre o state_dict do unet_lora e retorna todos os pesos reais com nome completo.
+        NÃO depende de .named_parameters() para evitar perder buffers como alpha/dora_scale.
+        """
+        for name, tensor in self.model.unet_lora.state_dict().items():
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            yield name, tensor, tensor.device
 
     def capture_weights(self):
-      """Captura os pesos iniciais (usado no início da Run 1)."""
-      self.initial_weights_run1 = {} # Limpa antes de capturar
-      for key, param, _ in self._iterate_params():
-          self.initial_weights_run1[key] = param.detach().clone().cpu() # Armazena em CPU
-
-      print(f"[DeltaPattern] Captured initial weights (Run 1) for {len(self.initial_weights_run1)} parameters across {len(self.param_collection._NamedParameterGroupCollection__groups)} groups.")
-    # FIM ALTERAÇÃO
-
-    # INÍCIO ALTERAÇÃO: Adaptado para iterar sobre a coleção
-    def capture_initial_weights_run2(self):
-      """Captura os pesos iniciais da Run 2 (usado para cálculo da penalidade)."""
-      self.initial_weights_run2 = {} # Limpa antes de capturar
-      for key, param, _ in self._iterate_params():
-          self.initial_weights_run2[key] = param.detach().clone().cpu() # Armazena em CPU
-
-      print(f"[DeltaPattern] Captured initial weights (Run 2) for {len(self.initial_weights_run2)} parameters across {len(self.param_collection._NamedParameterGroupCollection__groups)} groups.")
-    # FIM ALTERAÇÃO
-
-    # INÍCIO ALTERAÇÃO: Renomeado e ajustado para carregar
-    def load_reference_pattern(self, pattern_path: str):
-      """Carrega o padrão de delta de referência de um arquivo."""
-      if not os.path.exists(pattern_path):
-        warnings.warn(f"Reference delta pattern file not found: {pattern_path}", UserWarning)
-        self.reference_deltas = {}
-        return
-
-      try:
-        loaded_data = torch.load(pattern_path, map_location='cpu')
-        if isinstance(loaded_data, dict):
-          # Validação simples: verifica se as chaves parecem corretas
-          if all(isinstance(k, str) and '_' in k for k in loaded_data.keys()):
-            self.reference_deltas = loaded_data
-            print(f"[DeltaPattern] Loaded reference delta pattern with {len(self.reference_deltas)} parameter deltas.")
-            self.reference_delta_norm = self._calculate_total_norm(self.reference_deltas)
-            print(f"[DeltaPattern] Reference delta total norm: {self.reference_delta_norm:.4f}")
-          else:
-            warnings.warn(f"Loaded delta pattern file has unexpected key format: {pattern_path}", UserWarning)
-            self.reference_deltas = {}
-        else:
-          warnings.warn(f"Loaded delta pattern file is not a dictionary: {pattern_path}", UserWarning)
-          self.reference_deltas = {}
-      except Exception as e:
-        warnings.warn(f"Failed to load reference delta pattern from {pattern_path}: {e}", UserWarning)
-        self.reference_deltas = {}
-  
-    def _calculate_total_norm(self, weight_dict: Dict[str, Tensor]) -> float:
-      """Calcula a norma L2 total sobre todos os tensores no dicionário."""
-      if not weight_dict:
-        return 0.0
-      total_norm_sq = 0.0
-      for name, tensor in weight_dict.items():
-        total_norm_sq += torch.norm(tensor.to('cpu', dtype=torch.float32))**2
-      return torch.sqrt(total_norm_sq).item()
-
-	  # INÍCIO ALTERAÇÃO: Adaptado para iterar sobre a coleção
-    def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
-      """Calcula a penalidade MSE entre o delta total atual e o delta de referência."""
-      if not self.reference_deltas or not self.initial_weights_run2:
-        # Tenta obter um device de qualquer parâmetro; se não houver, usa CPU
+        """Captura os pesos iniciais (usado no início da Run 1) e armazena em CPU."""
+        self.initial_weights_run1 = {}  # Limpa antes de capturar
+        count = 0
         try:
-          device = next(self._iterate_params())[2]
-        except StopIteration:
-          device = 'cpu'
-        return torch.tensor(0.0, device=device)
+            for key, param, _ in self._iterate_params():
+                self.initial_weights_run1[key] = param.detach().clone().cpu()  # Armazena em CPU
+                count += 1
+        except Exception as e:
+            print(f"[DeltaPattern] Erro durante capture_weights: {e}")
+            traceback.print_exc()
+            raise  # Re-levanta a exceção para indicar falha
 
-      total_penalty = torch.tensor(0.0, dtype=torch.float32) # Acumula em CPU
-      current_deltas_for_norm = {} # Para calcular a norma atual
-      num_params_matched = 0
-      processed_keys = set() # Para evitar contar o mesmo parâmetro duas vezes se estiver em múltiplos grupos (improvável, mas seguro)
-
-      for key, current_param, device in self._iterate_params():
-        if key in processed_keys:
-          continue
-
-        if key in self.reference_deltas and key in self.initial_weights_run2:
-          # Pega pesos iniciais e de referência (já estão em CPU)
-          initial_weight_cpu = self.initial_weights_run2[key]
-          ref_delta_cpu = self.reference_deltas[key]
-
-          # Calcula o delta acumulado atual (current_param está no device original)
-          current_delta = current_param.detach() - initial_weight_cpu.to(device)
-
-          # Calcula a loss MSE (movendo ref_delta para o device correto)
-          penalty_term = torch.nn.functional.mse_loss(
-            current_delta.to(torch.float32),
-            ref_delta_cpu.to(device, dtype=torch.float32)
-          )
-          # Acumula a penalidade (movendo para CPU para evitar múltiplas transferências GPU->CPU)
-          total_penalty += penalty_term.cpu()
-
-          current_deltas_for_norm[key] = current_delta.cpu() # Guarda delta atual em CPU para cálculo da norma
-          num_params_matched += 1
-          processed_keys.add(key)
-
-
-      if num_params_matched > 0:
-        self.current_total_delta_norm = self._calculate_total_norm(current_deltas_for_norm)
-        # Média da penalidade pelos parâmetros comparados
-        average_penalty = total_penalty / num_params_matched
-      else:
-        self.current_total_delta_norm = 0.0
-        if not self.reference_deltas:
-          warnings.warn("[DeltaPattern] Cannot compute penalty: Reference delta pattern not loaded.", UserWarning)
-        elif not self.initial_weights_run2:
-          warnings.warn("[DeltaPattern] Cannot compute penalty: Initial weights for Run 2 not captured.", UserWarning)
+        if count == 0:
+            warnings.warn("[DeltaPattern] capture_weights não encontrou parâmetros treináveis.", UserWarning)
         else:
-          warnings.warn("[DeltaPattern] No matching parameters found between current model and reference delta pattern.", UserWarning)
-        average_penalty = torch.tensor(0.0) # Retorna 0 em CPU
+            print(f"[DeltaPattern] Capturou pesos iniciais (Run 1) para {count} parâmetros treináveis.")
+            # Opcional: Calcular e logar norma inicial aqui se desejado
+            # initial_norm = self._calculate_total_norm(self.initial_weights_run1)
+            # print(f"[DeltaPattern] Norma L2 total dos pesos iniciais (Run 1): {initial_norm:.4f}")
 
-      # Retorna a penalidade média ponderada, movida para o device do primeiro parâmetro (se existir)
-      try:
-        target_device = next(self._iterate_params())[2]
-      except StopIteration:
-        target_device = 'cpu' # Fallback para CPU
+    def capture_initial_weights_run2(self):
+        """Captura os pesos iniciais da Run 2 (usado para cálculo da penalidade) e armazena em CPU."""
+        self.initial_weights_run2 = {}  # Limpa antes de capturar
+        count = 0
+        try:
+            for key, param, _ in self._iterate_params():
+                self.initial_weights_run2[key] = param.detach().clone().cpu()  # Armazena em CPU
+                count += 1
+        except Exception as e:
+            print(f"[DeltaPattern] Erro durante capture_initial_weights_run2: {e}")
+            traceback.print_exc()
+            raise
 
-      return (lambda_weight * average_penalty).to(target_device)
-    # FIM ALTERAÇÃO
+        if count == 0:
+            warnings.warn(
+                "[DeltaPattern] capture_initial_weights_run2 não encontrou parâmetros treináveis.", UserWarning
+            )
+        else:
+            print(f"[DeltaPattern] Capturou pesos iniciais (Run 2) para {count} parâmetros treináveis.")
+            # Opcional: Calcular e logar norma inicial aqui se desejado
+            # initial_norm_run2 = self._calculate_total_norm(self.initial_weights_run2)
+            # print(f"[DeltaPattern] Norma L2 total dos pesos iniciais (Run 2): {initial_norm_run2:.4f}")
+
+    def load_reference_pattern(self, pattern_path: str):
+        """Carrega o padrão de delta de referência de um arquivo para a CPU."""
+        self.reference_deltas = {}  # Reseta antes de carregar
+        self.reference_delta_norm = None
+        if not os.path.exists(pattern_path):
+            warnings.warn(f"Arquivo de padrão de delta de referência não encontrado: {pattern_path}", UserWarning)
+            return
+
+        try:
+            # Garante que carregue na CPU
+            loaded_data = load_file(pattern_path)
+            if isinstance(loaded_data, dict):
+                # Validação simples: verifica se as chaves parecem ser strings e valores são tensores
+                if all(isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in loaded_data.items()):
+                    self.reference_deltas = loaded_data
+                    print(
+                        f"[DeltaPattern] Padrão de delta de referência carregado com {len(self.reference_deltas)} deltas de parâmetros."
+                    )
+                    # Calcula a norma L2 total dos deltas carregados (já estão em CPU)
+                    self.reference_delta_norm = self._calculate_total_norm(self.reference_deltas)
+                    print(f"[DeltaPattern] Norma L2 total do delta de referência: {self.reference_delta_norm:.4f}")
+                else:
+                    warnings.warn(
+                        f"Arquivo de padrão de delta carregado tem formato de chave/valor inesperado: {pattern_path}",
+                        UserWarning,
+                    )
+                    self.reference_deltas = {}  # Limpa se o formato estiver incorreto
+            else:
+                warnings.warn(f"Arquivo de padrão de delta carregado não é um dicionário: {pattern_path}", UserWarning)
+        except Exception as e:
+            warnings.warn(f"Falha ao carregar padrão de delta de referência de {pattern_path}: {e}", UserWarning)
+            self.reference_deltas = {}  # Limpa em caso de erro
+
+    def _calculate_total_norm(self, weight_dict: Dict[str, Tensor]) -> float:
+        """Calcula a norma L2 total sobre todos os tensores no dicionário (assume que estão em CPU)."""
+        if not weight_dict:
+            return 0.0
+        total_norm_sq = torch.tensor(0.0, dtype=torch.float64)  # Usa float64 para precisão na soma
+        for tensor in weight_dict.values():
+            # Garante que o tensor está em CPU e calcula a norma quadrada
+            total_norm_sq += torch.norm(tensor.to("cpu", dtype=torch.float32), p=2).pow(2).double()
+        return torch.sqrt(total_norm_sq).item()
+
+    def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
+        """
+        Calcula a penalidade MSE entre o delta acumulado atual (current - initial_run2)
+        e o delta de referência (carregado da Run 1).
+        Retorna um tensor escalar no device do primeiro parâmetro do modelo.
+        """
+        # Tenta obter o device do primeiro parâmetro para o tensor de retorno (ou usa CPU como fallback)
+        try:
+            _, _, target_device = next(self._iterate_params())
+        except StopIteration:
+            target_device = torch.device("cpu")
+            warnings.warn(
+                "[DeltaPattern] Não foi possível determinar o device do modelo para retornar a penalidade. Usando CPU.",
+                UserWarning,
+            )
+
+        # Verifica se temos tudo necessário
+        if not self.reference_deltas or not self.initial_weights_run2:
+            if not self.reference_deltas:
+                # Log apenas uma vez ou periodicamente para não poluir
+                pass  # print("[DeltaPattern] Aviso: Padrão de delta de referência não carregado. Penalidade será 0.")
+            if not self.initial_weights_run2:
+                # Log apenas uma vez ou periodicamente
+                pass  # print("[DeltaPattern] Aviso: Pesos iniciais da Run 2 não capturados. Penalidade será 0.")
+            self.current_total_delta_norm = 0.0  # Reseta norma atual se não puder calcular
+            return torch.tensor(0.0, device=target_device)
+
+        total_penalty_cpu = torch.tensor(0.0, dtype=torch.float32, device="cpu")  # Acumula MSE em CPU
+        current_deltas_for_norm = {}  # Guarda deltas atuais (em CPU) para cálculo da norma L2
+        num_params_matched = 0
+
+        try:
+            for key, current_param, device in self._iterate_params():
+                # Verifica se temos info inicial e de referência para este parâmetro
+                if key in self.reference_deltas and key in self.initial_weights_run2:
+                    # Pega pesos iniciais da Run 2 e delta de referência (ambos já em CPU)
+                    initial_weight_run2_cpu = self.initial_weights_run2[key]
+                    ref_delta_cpu = self.reference_deltas[key]
+
+                    # Calcula o delta acumulado *atual* no device original do parâmetro
+                    # current_param já está no device correto
+                    current_delta = current_param.detach() - initial_weight_run2_cpu.to(device)
+
+                    # Calcula a loss MSE entre delta atual e delta de referência
+                    # Move ref_delta_cpu para o device correto para o cálculo
+                    penalty_term = torch.nn.functional.mse_loss(
+                        current_delta.to(torch.float32),  # Garante float32
+                        ref_delta_cpu.to(device, dtype=torch.float32),  # Garante float32 e device
+                    )
+
+                    # Acumula a penalidade em CPU para evitar múltiplas transferências GPU->CPU
+                    total_penalty_cpu += penalty_term.cpu()
+
+                    # Guarda delta atual em CPU para cálculo da norma L2 total depois
+                    current_deltas_for_norm[key] = current_delta.cpu()
+                    num_params_matched += 1
+
+        except Exception as e:
+            print(f"[DeltaPattern] Erro durante compute_penalty ao iterar parâmetros: {e}")
+            traceback.print_exc()
+            self.current_total_delta_norm = None  # Invalida norma cacheada
+            return torch.tensor(0.0, device=target_device)  # Retorna 0 em caso de erro
+
+        if num_params_matched > 0:
+            # Calcula a norma L2 total do delta *atual* usando os deltas em CPU
+            self.current_total_delta_norm = self._calculate_total_norm(current_deltas_for_norm)
+            # Calcula a penalidade média pelos parâmetros comparados
+            average_penalty_cpu = total_penalty_cpu / num_params_matched
+        else:
+            self.current_total_delta_norm = 0.0
+            # Avisa se não houve correspondência, mas tínhamos os dados
+            if self.reference_deltas and self.initial_weights_run2:
+                warnings.warn(
+                    "[DeltaPattern] Nenhum parâmetro correspondente encontrado entre o modelo atual, pesos iniciais da Run 2 e padrão de delta de referência.",
+                    UserWarning,
+                )
+            average_penalty_cpu = torch.tensor(0.0, device="cpu")
+
+        # Retorna a penalidade média ponderada, movida para o device alvo
+        final_penalty = (lambda_weight * average_penalty_cpu).to(target_device)
+        return final_penalty
 
     def get_delta_norms(self) -> Tuple[Optional[float], Optional[float]]:
-      """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
-      # (Inalterado)
-      return self.current_total_delta_norm, self.reference_delta_norm
+        """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
+        return self.current_total_delta_norm, self.reference_delta_norm
 
-    # INÍCIO ALTERAÇÃO: Adaptado para iterar sobre a coleção
-    def save_pattern(self, save_dir: str = "./training_pattern"):
-      """Calcula o delta final da Run 1 e salva em um arquivo."""
-      if not self.initial_weights_run1:
-        print("[DeltaPattern] Error: Initial weights (Run 1) were not captured. Cannot save delta pattern.")
-        return None
+    def save_pattern(
+        self, save_dir: str = "./training_pattern", base_filename: Optional[str] = None, filename_suffix: str = ""
+    ):
+        """
+        Calcula o delta final da Run 1 (final_weights - initial_weights_run1),
+        salva em um arquivo .pt e escreve um log .txt com metadados e normas.
+        Permite especificar um nome base e um sufixo para o arquivo.
+        Retorna o caminho do arquivo .pt salvo ou None em caso de falha.
+        """
+        if not self.initial_weights_run1:
+            print(
+                "[DeltaPattern] Erro: Pesos iniciais (Run 1) não foram capturados. Não é possível salvar o padrão delta."
+            )
+            return None
 
-      print("[DeltaPattern] Calculating final delta pattern (Run 1)...")
-      final_deltas: Dict[str, torch.Tensor] = {}
-      final_weights_norm_sq = 0.0
-      processed_keys = set()
+        print(f"[DeltaPattern] Calculando padrão de delta final (Run 1)...")
+        final_deltas_cpu: Dict[str, torch.Tensor] = {}
+        final_weights_list_cpu = {}  # Para calcular norma final
+        num_params_processed = 0
 
-      for key, param, device in self._iterate_params():
-        if key in processed_keys:
-          continue
+        try:
+            for key, final_param, _ in self._iterate_params():
+                if key in self.initial_weights_run1:
+                    initial_weight_cpu = self.initial_weights_run1[key]
+                    final_delta_cpu = final_param.detach().cpu() - initial_weight_cpu
+                    final_deltas_cpu[key] = final_delta_cpu
+                    final_weights_list_cpu[key] = final_param.detach().cpu()
+                    num_params_processed += 1
+        except Exception as e:
+            print(f"[DeltaPattern] Erro ao calcular deltas finais: {e}")
+            traceback.print_exc()
+            return None
 
-        if key in self.initial_weights_run1:
-          # Calcula o delta final em CPU
-          initial_weight_cpu = self.initial_weights_run1[key]
-          final_delta_cpu = param.detach().cpu() - initial_weight_cpu
-          final_deltas[key] = final_delta_cpu # Armazena delta em CPU
+        if num_params_processed == 0:
+            print("[DeltaPattern] Erro: Nenhum parâmetro correspondente encontrado para calcular o delta final.")
+            return None
 
-          final_weights_norm_sq += torch.norm(param.detach().cpu().to(torch.float32))**2
-          processed_keys.add(key)
+        # Calcula as normas L2 totais (todos os tensores estão em CPU)
+        initial_weights_norm = self._calculate_total_norm(self.initial_weights_run1)
+        final_weights_norm = self._calculate_total_norm(final_weights_list_cpu)
+        final_delta_norm = self._calculate_total_norm(final_deltas_cpu)
+
+        print(f"[DeltaPattern] Norma L2 Inicial (Run 1): {initial_weights_norm:.4f}")
+        print(f"[DeltaPattern] Norma L2 Final (Run 1): {final_weights_norm:.4f}")
+        print(f"[DeltaPattern] Norma L2 Delta Final (Run 1): {final_delta_norm:.4f}")
+
+        # Cria diretório e nome de arquivo
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Define o nome base do arquivo
+        if base_filename:
+            # Remove extensão .pt se presente no nome base vindo do config
+            if base_filename.lower().endswith(".pt"):
+                base_filename = base_filename[:-3]
         else:
-          # Isso não deveria acontecer se capture_weights foi chamado corretamente
-          warnings.warn(f"Parameter {key} found during save but not in initial weights capture.", UserWarning)
+            # Usa um nome genérico se não fornecido
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            base_filename = f"pattern_{timestamp}"  # Nome antigo como fallback
 
+        # Adiciona o sufixo (pode conter epoch/step)
+        full_base_filename = base_filename + filename_suffix
 
-      initial_weights_norm = self._calculate_total_norm(self.initial_weights_run1)
-      final_weights_norm = torch.sqrt(torch.tensor(final_weights_norm_sq)).item()
-      final_delta_norm = self._calculate_total_norm(final_deltas)
+        pattern_path = os.path.join(save_dir, full_base_filename + ".pt")
+        log_path = os.path.join(save_dir, full_base_filename + ".txt")
 
-      if not final_deltas:
-        print("[DeltaPattern] Error: No matching parameters found to calculate final delta.")
-        return None
+        try:
+            torch.save(final_deltas_cpu, pattern_path)
+            print(f"[DeltaPattern] Padrão de delta final salvo em {pattern_path}")
 
-      # (Lógica de salvar o arquivo e log inalterada)
-      os.makedirs(save_dir, exist_ok=True)
-      timestamp = time.strftime("%Y%m%d_%H%M%S")
-      base_path = os.path.join(save_dir, f"pattern_{timestamp}")
-      pattern_path = base_path + ".pt"
-      log_path = base_path + ".txt"
+            with open(log_path, "w") as f:
+                f.write(f"Padrão Delta Salvo: {pattern_path}\n")
+                # Incluir informações sobre o passo/época se disponíveis no sufixo?
+                # f.write(f"Sufixo (Epoch/Step info): {filename_suffix}\n")
+                f.write(f"Timestamp da Criação do Arquivo: {time.strftime('%Y%m%d_%H%M%S')}\n")
+                f.write(f"Número de deltas de parâmetros no padrão: {len(final_deltas_cpu)}\n")
+                try:
+                    num_groups = len(
+                        getattr(
+                            self.param_collection, "_NamedParameterGroupCollection__groups", list(self.param_collection)
+                        )
+                    )
+                    f.write(f"Número de grupos de parâmetros considerados: {num_groups}\n")
+                except:
+                    f.write("Número de grupos de parâmetros considerados: (Não foi possível determinar)\n")
+                f.write(f"Norma L2 Total dos Pesos Iniciais (Run 1): {initial_weights_norm:.4f}\n")
+                f.write(f"Norma L2 Total dos Pesos Finais (capturados neste save): {final_weights_norm:.4f}\n")
+                f.write(f"Norma L2 Total do Delta (Finais - Iniciais): {final_delta_norm:.4f}\n\n")
+                f.write("Detalhes do Delta por Parâmetro (Top 20 por Norma L2):\n")
 
-      try:
-        torch.save(final_deltas, pattern_path)
-        print(f"[DeltaPattern] Saved final delta pattern to {pattern_path}")
+                sorted_deltas = sorted(
+                    final_deltas_cpu.items(), key=lambda item: torch.norm(item[1], p=2).item(), reverse=True
+                )
+                for name, tensor in sorted_deltas[:20]:
+                    f.write(f"- {name}: {torch.norm(tensor, p=2).item():.6f}\n")
+                if len(sorted_deltas) > 20:
+                    f.write("...\n")
 
-        with open(log_path, "w") as f:
-          f.write(f"Delta pattern saved: {pattern_path}\n")
-          f.write(f"Timestamp: {timestamp}\n")
-          f.write(f"Number of parameter deltas in pattern: {len(final_deltas)}\n")
-          f.write(f"Number of parameter groups considered: {len(self.param_collection._NamedParameterGroupCollection__groups)}\n")
-          f.write(f"Initial weights total norm (Run 1): {initial_weights_norm:.4f}\n")
-          f.write(f"Final weights total norm (Run 1): {final_weights_norm:.4f}\n")
-          f.write(f"Final delta total norm (Run 1): {final_delta_norm:.4f}\n\n")
-          f.write("Delta details per parameter (Top 20 by Norm):\n")
-          # Log apenas os top N deltas para evitar logs muito grandes
-          sorted_deltas = sorted(final_deltas.items(), key=lambda item: item[1].norm().item(), reverse=True)
-          for name, tensor in sorted_deltas[:20]:
-            f.write(f"- {name}: {tensor.norm().item():.6f}\n")
-          if len(sorted_deltas) > 20:
-            f.write("...\n")
-
-
-        return pattern_path
-      except Exception as e:
-        print(f"[DeltaPattern] Error saving delta pattern: {e}")
-        return None
-    # FIM ALTERAÇÃO
+            return pattern_path
+        except Exception as e:
+            print(f"[DeltaPattern] Erro ao salvar o padrão delta ou log: {e}")
+            traceback.print_exc()
+            if os.path.exists(pattern_path):
+                os.remove(pattern_path)
+            if os.path.exists(log_path):
+                os.remove(log_path)
+            return None

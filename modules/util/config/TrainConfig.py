@@ -312,10 +312,6 @@ class TrainConfig(BaseConfig):
     learning_rate_scaler: LearningRateScaler
     clip_grad_norm: float
     loss_mode_fn: LossMode
-    delta_pattern_save_it: bool
-    delta_pattern_use_it: bool
-    delta_pattern_path: str
-    delta_pattern_weight: float
 
     # noise
     offset_noise_weight: float
@@ -389,7 +385,7 @@ class TrainConfig(BaseConfig):
     lora_weight_dtype: DataType
     lora_layers: str  # comma-separated
     lora_layer_preset: str
-    lora_layer_patterns: dict[str, dict[str, int | float]] 
+    lora_layer_rules: dict[str, dict[str, int | float]]
     lora_layers_blacklist: list[str]
     bundle_additional_embeddings: bool
 
@@ -426,6 +422,14 @@ class TrainConfig(BaseConfig):
     # secrets - not saved into config file
     secrets: SecretsConfig
 
+    # delta pattern settings
+    delta_pattern_save_it: bool
+    delta_pattern_use_it: bool
+    delta_pattern_path: str
+    delta_pattern_weight: float
+    delta_pattern_save_every: int = 0
+    delta_pattern_save_every_unit: TimeUnit = TimeUnit.EPOCH
+
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -441,16 +445,16 @@ class TrainConfig(BaseConfig):
         )
 
     def __migration_0(self, data: dict) -> dict:
+        migrated_data = data.copy()
         optimizer_settings = {}
-        migrated_data = {}
+
         for key, value in data.items():
-            # move optimizer settings to sub object
             if key == 'optimizer':
                 optimizer_settings['optimizer'] = value
             elif key.startswith('optimizer'):
                 optimizer_settings[key.removeprefix('optimizer_')] = value
             else:
-                migrated_data[key] = value
+                continue  # Deixa o restante no migrated_data
 
         if 'optimizer' in optimizer_settings:
             migrated_data['optimizer'] = optimizer_settings
@@ -919,8 +923,8 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_norm_epsilon", True, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("lora_layers", "", str, False))
-        data.append(("lora_layer_preset", None, str, False))
-        data.append(("lora_layer_patterns", {}, dict[str, dict[str, int | float]] , False))
+        data.append(("lora_layer_preset", None, str, True))
+        data.append(("lora_layer_rules", {}, dict[str, dict[str, int | float]], False)) # None como padrão
         data.append(("lora_layers_blacklist", [], list[str], False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 

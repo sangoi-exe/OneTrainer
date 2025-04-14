@@ -59,15 +59,14 @@ def init_model_parameters(
         optimizer_to_device_(model.optimizer, train_device)
     model.optimizer_state_dict = None
 
-    print("==== DEBUG FINAL DO OTIMIZADOR ====")
-    print("type:", type(model.optimizer))
-    print("param_groups:")
-    for i, g in enumerate(model.optimizer.param_groups):
-        print(f"Group {i}:")
-        print(f" - keys: {list(g.keys())}")
-        print(f" - param count: {len(g['params'])}")
-        print(f" - lr: {g.get('lr')}")
-        #print(f" - names (if available): {[getattr(p, 'name', 'n/a') for p in g['params']]}")
+    # print("==== DEBUG FINAL DO OTIMIZADOR ====")
+    # print("type:", type(model.optimizer))
+    # print("param_groups:")
+    # for i, g in enumerate(model.optimizer.param_groups):
+    #     print(f"Group {i}:")
+    #     print(f" - param count: {len(g['params'])}")
+    #     print(f" - lr: {g.get('lr')}")
+    #     print(f" - names (if available): {[getattr(p, 'name', 'n/a') for p in g['params']]}")
 
     model.ema = create.create_ema(parameters.parameters(), model.ema_state_dict, model.train_config)
     model.ema_state_dict = None

@@ -1,8 +1,9 @@
-# snapshotIt.py
+# snapshotOT.py
 import os
 import re
 import io
-import fnmatch
+
+# import fnmatch # Não é mais necessário
 from datetime import datetime
 from pathlib import Path
 
@@ -11,61 +12,13 @@ try:
 except ImportError:
     Tk = None
 
-# --- CONFIGURAÇÕES DE FILTRAGEM ---
-CORE_FILES_TO_INCLUDE = {
-    "BaseModelSetup.py",
-    "BaseModelLoader.py",
-    "BaseModelSaver.py",
-    "BaseModel.py",
-    "BaseDataLoader.py",
-    "BaseTrainer.py",
-    "LoRAModule.py",
-    "DataLoaderMgdsMixin.py",
-    "DataLoaderText2ImageMixin.py",
-    "EmbeddingLoaderMixin.py",
-    "HFModelLoaderMixin.py",
-    "InternalModelLoaderMixin.py",
-    "ModelSpecModelLoaderMixin.py",
-    "SDConfigModelLoaderMixin.py",
-    "DtypeModelSaverMixin.py",
-    "EmbeddingSaverMixin.py",
-    "InternalModelSaverMixin.py",
-    "ModelSetupDebugMixin.py",
-    "ModelSetupDiffusionLossMixin.py",
-    "ModelSetupDiffusionMixin.py",
-    "ModelSetupEmbeddingMixin.py",
-    "ModelSetupFlowMatchingMixin.py",
-    "ModelSetupNoiseMixin.py",
-    "AdditionalEmbeddingWrapper.py",
-    "EMAModule.py",
-    "TrainConfig.py",
-    "ConceptConfig.py",
-    "SampleConfig.py",
-    "SecretsConfig.py",
-    "CloudConfig.py",  # MANTIDO CloudConfig por causa de SecretsConfig
-    "BaseArgs.py",
-    "TrainArgs.py",
-    "TrainCallbacks.py",
-    "TrainCommands.py",
-    "ModelNames.py",
-    "ModelWeightDtypes.py",
-    "NamedParameterGroup.py",
-    "TrainProgress.py",
-    "TimedActionMixin.py",
-    "checkpointing_util.py",
-    "dtype_util.py",
-    "path_util.py",
-    "torch_util.py",
-    "create.py",
-    "dynamic_loss_strength.py",
-    "masked_loss.py",
-    "vb_loss.py",
-    "GenericTrainer.py",
-}
-SDXL_PATH_KEYWORDS = ["stablediffusionxl", "sdxl"]
+# --- CONFIGURAÇÕES DE FILTRAGEM (BLACKLIST) ---
 include_extensions = {".py", ".json"}
+
 ignore_dirs = {
     ".git",
+    ".idea",
+    ".vscode",
     "dist",
     "node_modules",
     "test",
@@ -77,85 +30,238 @@ ignore_dirs = {
     "docs",
     "external",
     "resources",
-    # Excluir outros modelos
-    "wuerstchen",
-    "pixartAlpha",
-    "stableDiffusion",
-    "stableDiffusion3",
-    "flux",
-    "sana",
-    "hunyuanVideo",
-    # Excluir UI, Cloud, Scripts, etc. (Opcional, descomente para mais foco)
+    # Diretórios específicos de outros modelos
+    "modules/model/wuerstchen",
+    "modules/model/pixartAlpha",
+    "modules/model/stableDiffusion",
+    "modules/model/stableDiffusion3",
+    "modules/model/flux",
+    "modules/model/sana",
+    "modules/model/hunyuanVideo",
+    "modules/modelLoader/wuerstchen",
+    "modules/modelLoader/pixartAlpha",
+    "modules/modelLoader/stableDiffusion",
+    "modules/modelLoader/stableDiffusion3",
+    "modules/modelLoader/flux",
+    "modules/modelLoader/sana",
+    "modules/modelLoader/hunyuanVideo",
+    "modules/modelSaver/wuerstchen",
+    "modules/modelSaver/pixartAlpha",
+    "modules/modelSaver/stableDiffusion",
+    "modules/modelSaver/stableDiffusion3",
+    "modules/modelSaver/flux",
+    "modules/modelSaver/sana",
+    "modules/modelSaver/hunyuanVideo",
+    "modules/modelSetup/wuerstchen",
+    "modules/modelSetup/pixartAlpha",
+    "modules/modelSetup/stableDiffusion",
+    "modules/modelSetup/stableDiffusion3",
+    "modules/modelSetup/flux",
+    "modules/modelSetup/sana",
+    "modules/modelSetup/hunyuanVideo",
+    "modules/dataLoader/wuerstchen",
+    "modules/dataLoader/pixartAlpha",
+    "modules/dataLoader/stableDiffusion",
+    "modules/dataLoader/stableDiffusion3",
+    "modules/dataLoader/flux",
+    "modules/dataLoader/sana",
+    "modules/dataLoader/hunyuanVideo",
+    "modules/modelSampler/wuerstchen",  # Ignora explicitamente samplers não SDXL/Base
+    "modules/modelSampler/pixartAlpha",
+    "modules/modelSampler/stableDiffusion",
+    "modules/modelSampler/stableDiffusion3",
+    "modules/modelSampler/flux",
+    "modules/modelSampler/sana",
+    "modules/modelSampler/hunyuanVideo",
+    # Outros diretórios
     "modules/cloud",
-    "scripts",
+    "scripts",  # Scripts da raiz
     "embedding_templates",
     "zluda",
-    # "modules/modelSampler", # Descomente se não precisar da lógica de sampling
-    # "modules/util/convert", # Descomente se não precisar da lógica de conversão
-    "modules/module/quantized",  # Descomente se não precisar da lógica de quantização agora
+    "modules/module/quantized",
+    "modules/ui",
+    "training_concepts",
+    "training_deltas",
+    "training_presets",
+    "training_samples",
+    "modules/util/convert",  # Ignora utilitários de conversão
 }
-ignore_files = {"snapshotIt.py", "secrets.json"}
+
+ignore_files = {
+    # Scripts e configs da raiz
+    "snapshotOT.py",
+    "limpaLayer.py",
+    "config.json",  # Ignora config.json se não for relevante
+    "full.txt",
+    "filtered_layers.txt",
+    "secrets.json",
+    ".gitignore",
+    ".gitattributes",
+    # Arquivos Base/Loader/Saver/Setup/Sampler de OUTROS modelos (exceto SDXL e Base)
+    # DataLoader
+    "FluxBaseDataLoader.py",
+    "HunyuanVideoBaseDataLoader.py",
+    "PixArtAlphaBaseDataLoader.py",
+    "SanaBaseDataLoader.py",
+    "StableDiffusion3BaseDataLoader.py",
+    "StableDiffusionBaseDataLoader.py",
+    "StableDiffusionFineTuneVaeDataLoader.py",  # Específico SD VAE
+    "WuerstchenBaseDataLoader.py",
+    # Model
+    "FluxModel.py",
+    "HunyuanVideoModel.py",
+    "PixArtAlphaModel.py",
+    "SanaModel.py",
+    "StableDiffusion3Model.py",
+    "StableDiffusionModel.py",  # Exclui SD 1.5/2.x
+    "WuerstchenModel.py",
+    # ModelLoader (exceto os de SDXL e Base)
+    "FluxEmbeddingModelLoader.py",
+    "FluxFineTuneModelLoader.py",
+    "FluxLoRAModelLoader.py",
+    "HunyuanVideoEmbeddingModelLoader.py",
+    "HunyuanVideoFineTuneModelLoader.py",
+    "HunyuanVideoLoRAModelLoader.py",
+    "PixArtAlphaEmbeddingModelLoader.py",
+    "PixArtAlphaFineTuneModelLoader.py",
+    "PixArtAlphaLoRAModelLoader.py",
+    "SanaEmbeddingModelLoader.py",
+    "SanaFineTuneModelLoader.py",
+    "SanaLoRAModelLoader.py",
+    "StableDiffusion3EmbeddingModelLoader.py",
+    "StableDiffusion3FineTuneModelLoader.py",
+    "StableDiffusion3LoRAModelLoader.py",
+    "StableDiffusionEmbeddingModelLoader.py",
+    "StableDiffusionFineTuneModelLoader.py",
+    "StableDiffusionLoRAModelLoader.py",
+    "WuerstchenEmbeddingModelLoader.py",
+    "WuerstchenFineTuneModelLoader.py",
+    "WuerstchenLoRAModelLoader.py",
+    # ModelSaver (exceto os de SDXL e Base)
+    "FluxEmbeddingModelSaver.py",
+    "FluxFineTuneModelSaver.py",
+    "FluxLoRAModelSaver.py",
+    "HunyuanVideoEmbeddingModelSaver.py",
+    "HunyuanVideoFineTuneModelSaver.py",
+    "HunyuanVideoLoRAModelSaver.py",
+    "PixArtAlphaEmbeddingModelSaver.py",
+    "PixArtAlphaFineTuneModelSaver.py",
+    "PixArtAlphaLoRAModelSaver.py",
+    "SanaEmbeddingModelSaver.py",
+    "SanaFineTuneModelSaver.py",
+    "SanaLoRAModelSaver.py",
+    "StableDiffusion3EmbeddingModelSaver.py",
+    "StableDiffusion3FineTuneModelSaver.py",
+    "StableDiffusion3LoRAModelSaver.py",
+    "StableDiffusionEmbeddingModelSaver.py",
+    "StableDiffusionFineTuneModelSaver.py",
+    "StableDiffusionLoRAModelSaver.py",
+    "WuerstchenEmbeddingModelSaver.py",
+    "WuerstchenFineTuneModelSaver.py",
+    "WuerstchenLoRAModelSaver.py",
+    # ModelSetup (exceto os de SDXL e Base)
+    "BaseFluxSetup.py",
+    "FluxEmbeddingSetup.py",
+    "FluxFineTuneSetup.py",
+    "FluxLoRASetup.py",
+    "BaseHunyuanVideoSetup.py",
+    "HunyuanVideoEmbeddingSetup.py",
+    "HunyuanVideoFineTuneSetup.py",
+    "HunyuanVideoLoRASetup.py",
+    "BasePixArtAlphaSetup.py",
+    "PixArtAlphaEmbeddingSetup.py",
+    "PixArtAlphaFineTuneSetup.py",
+    "PixArtAlphaLoRASetup.py",
+    "BaseSanaSetup.py",
+    "SanaEmbeddingSetup.py",
+    "SanaFineTuneSetup.py",
+    "SanaLoRASetup.py",
+    "BaseStableDiffusion3Setup.py",
+    "StableDiffusion3EmbeddingSetup.py",
+    "StableDiffusion3FineTuneSetup.py",
+    "StableDiffusion3LoRASetup.py",
+    "BaseStableDiffusionSetup.py",
+    "StableDiffusionEmbeddingSetup.py",
+    "StableDiffusionFineTuneSetup.py",
+    "StableDiffusionFineTuneVaeSetup.py",
+    "StableDiffusionLoRASetup.py",
+    "BaseWuerstchenSetup.py",
+    "WuerstchenEmbeddingSetup.py",
+    "WuerstchenFineTuneSetup.py",
+    "WuerstchenLoRASetup.py",
+    # ModelSampler (exceto SDXL e Base)
+    "FluxSampler.py",
+    "HunyuanVideoSampler.py",
+    "PixArtAlphaSampler.py",
+    "SanaSampler.py",
+    "StableDiffusion3Sampler.py",
+    "StableDiffusionSampler.py",  # Exclui SD 1.5/2.x
+    "StableDiffusionVaeSampler.py",  # Exclui sampler VAE
+    "WuerstchenSampler.py",
+    # Módulos não-core em modules/module
+    "AestheticScoreModel.py",
+    "BaseImageCaptionModel.py",  # Base para captioning, talvez não core
+    "BaseImageMaskModel.py",  # Base para masking, talvez não core
+    "BaseRembgModel.py",  # Base para rembg, talvez não core
+    "Blip2Model.py",
+    "BlipModel.py",
+    "ClipSegModel.py",
+    "GenerateLossesModel.py",
+    "HPSv2ScoreModel.py",
+    "MaskByColor.py",
+    "RembgHumanModel.py",
+    "RembgModel.py",
+    "WDModel.py",
+}
+
+# Padrões de nomes de arquivos a serem ignorados (regex)
 ignore_file_patterns = [
     re.compile(r".*\.spec\.(js|py)$"),
     re.compile(r".*\.min\.(js|css)$"),
     re.compile(r".*test.*\.py$"),
+    re.compile(r".*\.pyc$"),
+    re.compile(r".*\.log$"),
+    re.compile(r".*\.bak$"),
+    re.compile(r".*\.tmp$"),
+    re.compile(r".*\.swp$"),
+    re.compile(r"\.DS_Store$"),
 ]
 # --- FIM DAS CONFIGURAÇÕES ---
 
-# ... (resto do script como na sua versão anterior, incluindo optimize_content, should_include_file, tree e __main__) ...
-# A função should_include_file já usa CORE_FILES_TO_INCLUDE e SDXL_PATH_KEYWORDS corretamente.
-# A função tree já usa pathlib e as_posix corretamente.
+# ... (Restante do script optimize_content, should_include_file, tree, __main__ MANTIDO COMO NA RESPOSTA ANTERIOR) ...
 
 
 def optimize_content(content, ext):
     # Sua função optimize_content (mantida como está)
     if ext in {".js", ".css"}:
         content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
-        lines = [
-            l.rstrip() for l in content.splitlines() if not l.lstrip().startswith("//")
-        ]
+        lines = [l.rstrip() for l in content.splitlines() if not l.lstrip().startswith("//")]
     elif ext == ".py":
-        # Mantém type hints e imports, mas remove comentários de linha única
         lines = []
         in_multiline_comment = False
         for l in content.splitlines():
             stripped_l = l.lstrip()
             if stripped_l.startswith('"""') or stripped_l.startswith("'''"):
-                # Conta aspas triplas para tratar docstrings de múltiplas linhas corretamente
                 quote_count = stripped_l.count('"""') + stripped_l.count("'''")
-                if (
-                    quote_count % 2 != 0
-                ):  # Se número ímpar de aspas triplas, inverte o estado
+                if quote_count % 2 != 0:  # Se número ímpar de aspas triplas, inverte o estado
                     in_multiline_comment = not in_multiline_comment
-                    # Se for uma docstring de linha única que começa e termina na mesma linha
-                    if (
-                        quote_count == 2
-                        and stripped_l.endswith(('"""', "'''"))
-                        and len(stripped_l) > 5
-                    ):
+                    if quote_count == 2 and stripped_l.endswith(('"""', "'''")) and len(stripped_l) > 5:
                         continue  # Pula docstring de linha única
 
-                if in_multiline_comment and not stripped_l.endswith(
-                    ('"""', "'''")
-                ):  # Se está começando um bloco, pula a linha de abertura
+                if in_multiline_comment and not stripped_l.endswith(('"""', "'''")):  # Se está começando um bloco, pula a linha de abertura
                     continue
                 elif not in_multiline_comment and stripped_l.startswith(
                     ('"""', "'''")
                 ):  # Se está terminando um bloco, permite a linha de fechamento (será adicionada abaixo se não for comentário)
                     pass  # Não faz nada aqui, deixa o if abaixo adicionar se não for #
-                # Se for uma docstring de linha única (começa e termina com aspas triplas)
                 elif quote_count >= 2 and stripped_l.endswith(('"""', "'''")):
                     continue  # Pula docstrings de linha única
 
-            if (
-                in_multiline_comment
-            ):  # Se está dentro de um comentário multi-linha, pula a linha
-                # Verifica se esta linha fecha o comentário multi-linha
+            if in_multiline_comment:  # Se está dentro de um comentário multi-linha, pula a linha
                 if stripped_l.endswith('"""') or stripped_l.endswith("'''"):
                     in_multiline_comment = False  # Fecha o bloco
                 continue  # Pula a linha atual (seja ela de fechamento ou intermediária)
 
-            # Remove comentários de linha única, mas preserva diretivas
             if (
                 not stripped_l.startswith("#")
                 or stripped_l.startswith("# type:")
@@ -170,7 +276,6 @@ def optimize_content(content, ext):
     else:
         lines = [l.rstrip() for l in content.splitlines()]
 
-    # Remove linhas vazias duplicadas
     optimized, prev_empty = [], False
     for l in lines:
         if not l.strip():  # Verifica se a linha está vazia ou contém apenas espaços
@@ -180,58 +285,48 @@ def optimize_content(content, ext):
         else:
             optimized.append(l)
             prev_empty = False
-    # Remove linha vazia no final, se houver
     if optimized and not optimized[-1].strip():
         optimized.pop()
 
     return "\n".join(optimized)
 
 
-# Modificada para receber o caminho relativo e verificar keywords e core files
-def should_include_file(relative_path_str: str):
-    file_name = os.path.basename(relative_path_str)
-    relative_path_lower = relative_path_str.lower().replace("\\", "/")
-    relative_parts = set(
-        relative_path_lower.split("/")
-    )  # Conjunto de partes do caminho
+# Lógica de filtragem revisada para usar pathlib e checar pais
+def should_include_file(relative_path: Path):
+    """
+    Verifica se um arquivo deve ser incluído no snapshot.
+    A lógica é: incluir tudo, exceto o que está explicitamente ignorado.
+    """
+    file_name = relative_path.name
 
-    # 0. Checagem de Diretório Ignorado (mais eficiente fazer aqui)
-    for ignored in ignore_dirs:
-        ignored_parts = set(ignored.lower().replace("\\", "/").split("/"))
-        # Verifica se todas as partes do diretório ignorado estão no início do caminho relativo
-        # Ou se o nome exato do diretório está em alguma parte do caminho
-        if ignored_parts.issubset(relative_parts) or any(
-            part == ignored for part in relative_parts
-        ):
-            # Checagem mais robusta para subdiretórios
-            # Ex: 'modules/ui' em ignore_dirs deve ignorar 'modules/ui/button.py'
-            # Transforma 'modules/ui' em ['modules', 'ui']
-            ignored_parts_list = ignored.lower().replace("\\", "/").split("/")
-            relative_parts_list = relative_path_lower.split("/")
-            # Verifica se a sequência de partes ignoradas ocorre no início do caminho relativo
-            if relative_parts_list[: len(ignored_parts_list)] == ignored_parts_list:
-                return False
+    # 1. Checagem de Diretório Ignorado
+    # Verifica se algum componente do caminho está na lista de ignorados
+    # ou se o caminho começa com um padrão ignorado.
+    path_parts = {part for part in relative_path.parts}
+    if any(ignored in path_parts for ignored in ignore_dirs):
+        return False
+    # Checagem mais robusta para subdiretórios
+    for ignored_dir_pattern in ignore_dirs:
+        ignored_path = Path(ignored_dir_pattern)
+        # Verifica se o caminho relativo começa com o caminho ignorado
+        if ignored_path.parts == relative_path.parts[: len(ignored_path.parts)]:
+            return False
 
-    # 1. Checagem de Exclusão Rígida
+    # 2. Checagem de Arquivo Ignorado
     if file_name in ignore_files:
         return False
-    # Verifica extensão (case-insensitive)
-    file_ext_lower = os.path.splitext(file_name)[1].lower()
+
+    # 3. Checagem de Extensão
+    file_ext_lower = relative_path.suffix.lower()
     if not file_ext_lower or file_ext_lower not in include_extensions:
         return False
+
+    # 4. Checagem de Padrão Ignorado
     if any(p.match(file_name) for p in ignore_file_patterns):
         return False
 
-    # 2. Checagem de Inclusão Essencial
-    if file_name in CORE_FILES_TO_INCLUDE:
-        return True
-
-    # 3. Checagem de Palavra-chave de Caminho (SDXL)
-    if any(keyword in relative_path_lower for keyword in SDXL_PATH_KEYWORDS):
-        return True
-
-    # 4. Se não for essencial nem tiver keyword SDXL, excluir
-    return False
+    # 5. Se passou por todas as checagens de exclusão, incluir.
+    return True
 
 
 def tree(
@@ -241,67 +336,83 @@ def tree(
     out: io.StringIO,
     print_files: bool,
 ):
+    """
+    Percorre recursivamente a árvore de diretórios, aplicando filtros
+    e escrevendo a estrutura e o conteúdo dos arquivos selecionados.
+    """
     full_path = root_path / current_rel_path
     try:
-        # Itera sobre itens, tratando erros de permissão etc.
-        items = list(full_path.iterdir())
+        # Ordena para consistência: pastas primeiro, depois arquivos, alfabeticamente
+        items = sorted(list(full_path.iterdir()), key=lambda p: (p.is_file(), p.name.lower()))
     except OSError as e:
-        # Se for um diretório ignorado, não precisa reportar erro
-        if str(current_rel_path).replace("\\", "/") in ignore_dirs:
+        # Evita logar erro para diretórios que já sabemos que devem ser ignorados
+        if any(ignored in current_rel_path.parts for ignored in ignore_dirs):
             return
-        out.write(f"{pad}+-- [Erro ao listar {current_rel_path}: {e}]\n")
+        # Checagem mais robusta para subdiretórios
+        should_ignore = False
+        for ignored_dir_pattern in ignore_dirs:
+            ignored_path = Path(ignored_dir_pattern)
+            if ignored_path.parts == current_rel_path.parts[: len(ignored_path.parts)]:
+                should_ignore = True
+                break
+        if should_ignore:
+            return
+        out.write(f"{pad}+-- [Erro ao listar {current_rel_path.as_posix()}: {e}]\n")
         return
 
-    dirs, files = [], []
+    dirs_to_process = []
+    files_to_process = []
+
+    # Primeiro, coleta diretórios e arquivos que *não* são imediatamente ignorados
     for item_path in items:
         item_name = item_path.name
+        relative_item_path = current_rel_path / item_name
+
         # Verifica se o diretório PAI deve ser ignorado antes de processar o filho
-        if item_path.is_dir():
-            relative_dir_path_for_check = current_rel_path / item_name
-            # Checa se o diretório atual ou qualquer pai está na lista de ignorados
-            should_ignore_dir = False
-            current_check_path = relative_dir_path_for_check
-            while current_check_path != Path("."):  # Itera até a raiz relativa
-                if (
-                    str(current_check_path).replace("\\", "/") in ignore_dirs
-                    or current_check_path.name in ignore_dirs
-                ):
-                    should_ignore_dir = True
+        is_in_ignored_dir = False
+        temp_path = relative_item_path.parent
+        while temp_path != Path("."):
+            if temp_path.as_posix() in ignore_dirs or temp_path.name in ignore_dirs:
+                is_in_ignored_dir = True
+                break
+            # Checagem de prefixo mais robusta
+            for ignored_dir_pattern in ignore_dirs:
+                ignored_path = Path(ignored_dir_pattern)
+                if ignored_path.parts == temp_path.parts[: len(ignored_path.parts)]:
+                    is_in_ignored_dir = True
                     break
-                current_check_path = current_check_path.parent
-            if not should_ignore_dir and item_name not in ignore_dirs:
-                dirs.append(item_name)
+            if is_in_ignored_dir:
+                break
+            temp_path = temp_path.parent
+        if is_in_ignored_dir:
+            continue  # Pula item se o pai está ignorado
 
+        if item_path.is_dir():
+            # Adiciona à lista para processar DEPOIS dos arquivos, se não for ignorado
+            if item_name not in ignore_dirs and relative_item_path.as_posix() not in ignore_dirs:
+                dirs_to_process.append(item_name)
         elif item_path.is_file():
-            # Passa o caminho relativo para a função de checagem
-            relative_path_for_check = current_rel_path / item_name
-            if should_include_file(str(relative_path_for_check)):
-                files.append(item_name)
+            # Checa se o arquivo deve ser incluído
+            if should_include_file(relative_item_path):
+                files_to_process.append(item_name)
 
-    # Imprime arquivos primeiro
-    for f in sorted(files):
-        relative_file_path = current_rel_path / f
-        out.write(
-            f"{pad}+-- {relative_file_path.as_posix()}\n"
-        )  # Usa as_posix para barras consistentes
+    # Imprime arquivos que passaram no filtro
+    for f_name in files_to_process:
+        relative_file_path = current_rel_path / f_name
+        out.write(f"{pad}+-- {relative_file_path.as_posix()}\n")
         if print_files:
             try:
-                # Leitura do arquivo
-                with open(full_path / f, "r", encoding="utf-8", errors="replace") as fc:
+                with open(full_path / f_name, "r", encoding="utf-8", errors="replace") as fc:
                     content = fc.read()
-                # Otimização e escrita
-                ext = os.path.splitext(f)[1].lower()
-                # Ajusta a indentação do bloco de código
-                code_pad = pad + "    "  # 4 espaços extras
-                out.write(
-                    f"{code_pad}```{os.path.splitext(f)[1].lstrip('.')} linenums=\"1\"\n{optimize_content(content, ext)}\n{code_pad}```\n\n"
-                )  # Adiciona linguagem e números de linha
+                ext = os.path.splitext(f_name)[1].lower()
+                code_pad = pad + "    "
+                out.write(f"{code_pad}```{ext.lstrip('.')} linenums=\"1\"\n{optimize_content(content, ext)}\n{code_pad}```\n\n")
             except Exception as e:
-                out.write(f"{pad}    [Erro ao ler {f}: {e}]\n\n")
+                out.write(f"{pad}    [Erro ao ler {f_name}: {e}]\n\n")
 
-    # Depois imprime diretórios e recursão
-    for d in sorted(dirs):
-        new_rel_path = current_rel_path / d
+    # Processa diretórios recursivamente
+    for d_name in dirs_to_process:
+        new_rel_path = current_rel_path / d_name
         out.write(f"{pad}+-- {new_rel_path.as_posix()}/\n")
         tree(root_path, new_rel_path, pad + "    ", out, print_files)
 
@@ -309,41 +420,36 @@ def tree(
 if __name__ == "__main__":
     if Tk:
         Tk().withdraw()
-        project_dir_str = (
-            filedialog.askdirectory(title="Selecione a pasta do projeto") or os.getcwd()
-        )
+        project_dir_str = filedialog.askdirectory(title="Selecione a pasta do projeto") or os.getcwd()
     else:
         project_dir_str = os.getcwd()
 
-    project_dir = Path(project_dir_str)  # Trabalha com Pathlib
+    project_dir = Path(project_dir_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Gera a árvore de diretórios (sem conteúdo de arquivo)
     simple_tree_buffer = io.StringIO()
-    tree(project_dir, Path(""), "", simple_tree_buffer, False)  # Inicia com Path vazio
+    tree(project_dir, Path(""), "", simple_tree_buffer, False)
     dir_tree_str = simple_tree_buffer.getvalue()
 
-    # Gera o snapshot detalhado (com conteúdo de arquivo)
     detailed_buffer = io.StringIO()
-    tree(project_dir, Path(""), "", detailed_buffer, True)  # Inicia com Path vazio
+    tree(project_dir, Path(""), "", detailed_buffer, True)
     detailed_snapshot = detailed_buffer.getvalue()
 
-    # Monta o snapshot final
-    header_template = f"""# Snapshot do Projeto (Focado em SDXL)
+    header_template = f"""# Snapshot do Projeto (Foco em SDXL e Core)
 Timestamp: {timestamp}
 
-## Estrutura do Projeto (Arquivos Relevantes):
+## Estrutura do Projeto (Arquivos Incluídos):
 {dir_tree_str}
 ## Conteúdo do Projeto:
 """
     final_snapshot = header_template + detailed_snapshot
 
     folder_name = project_dir.name
-    output_file = f"snapshot_SDXL_{folder_name}_{timestamp}.txt"
+    output_file = f"snapshot_SDXL_Core_{folder_name}_{timestamp}.txt"
     try:
         with open(output_file, "w", encoding="utf-8") as out:
             out.write(final_snapshot)
-        print(f"Snapshot focado em SDXL salvo em {output_file}")
+        print(f"Snapshot focado em SDXL e Core salvo em {output_file}")
     except Exception as e:
         print(f"Erro ao salvar o snapshot: {e}")
