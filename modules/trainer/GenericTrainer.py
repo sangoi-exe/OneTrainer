@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from datetime import datetime
 import json
 import os
 import shutil
@@ -822,6 +823,12 @@ class GenericTrainer(BaseTrainer):
             )
         elif self.model is not None:
             self.model.to(self.temp_device)
+
+        if self.delta_pattern is not None:
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+          self.delta_pattern.save_group_deltas(
+              os.path.join(self.config.workspace_dir, "training_deltas", f"Training_Deltas_{timestamp}.json")
+    )
 
         self.tensorboard.close()
 
