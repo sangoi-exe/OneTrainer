@@ -503,10 +503,10 @@ class DeltaPatternRegularizer:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
         return self.current_total_delta_norm, self.reference_delta_norm
 
-    def log_group_deltas(self, epoch: int):
+     def log_group_deltas(self, epoch: int):
         """
         Salva norma L2 do delta para cada grupo (NamedParameterGroup) no epoch atual.
-        Usa self.initial_weights_run1 como base.
+        Usa self.initial_weights_run1 como base. Parâmetros vêm de self.param_collection (NamedParameterGroupCollection).
         """
         if not self.initial_weights_run1:
             print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
@@ -516,12 +516,19 @@ class DeltaPatternRegularizer:
         self.delta_log_by_module[epoch_key] = {}
 
         for group in self.param_collection:
+            prefix = group.unique_name  # Ex: "lora_unet_down_blocks_2_resnets_1"
             group_norm_sq = 0.0
-            for name, param in group.named_parameters():
-                if name in self.initial_weights_run1:
-                    delta = param.detach().float() - self.initial_weights_run1[name].float()
-                    group_norm_sq += torch.norm(delta, p=2).pow(2).item()
-            group_delta_norm = group_norm_sq ** 0.5
+            param_count = 0
+
+            for name, initial_weight in self.initial_weights_run1.items():
+                if name.startswith(prefix):
+                    current_param = self.model.unet_lora.state_dict().get(name, None)
+                    if current_param is not None:
+                        delta = current_param.detach().float() - initial_weight.float()
+                        group_norm_sq += torch.norm(delta, p=2).pow(2).item()
+                        param_count += 1
+
+            group_delta_norm = group_norm_sq ** 0.5 if param_count > 0 else 0.0
             self.delta_log_by_module[epoch_key][group.display_name] = group_delta_norm
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
