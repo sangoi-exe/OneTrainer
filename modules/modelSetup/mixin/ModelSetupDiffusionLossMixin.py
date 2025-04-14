@@ -83,39 +83,39 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = masked_losses(
                 losses=F.mse_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                     reduction="none",
                 ),
                 mask=batch["latent_mask"].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         # MAE/L1 Loss
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = masked_losses(
                 losses=F.l1_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                     reduction="none",
                 ),
                 mask=batch["latent_mask"].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         # log-cosh Loss
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_loss = masked_losses(
                 losses=self.__log_cosh_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                 ),
                 mask=batch["latent_mask"].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         match config.loss_mode_fn:
             case config.loss_mode_fn.ORIGINAL:
@@ -131,16 +131,15 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         masked_losses(
                             losses=vb_losses(
                                 coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"].to(dtype=torch.float32),
-                                x_t=data["noisy_latent_image"].to(dtype=torch.float32),
-                                t=data["timestep"],
-                                predicted_eps=data["predicted"].to(dtype=torch.float32),
-                                predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                                x_0=data["scaled_latent_image"],
+                                x_t=data["noisy_latent_image"],
+                                predicted_eps=data["predicted"],
+                                predicted_var_values=data["predicted_var_values"],
                             ),
                             mask=batch["latent_mask"].to(dtype=torch.float32),
                             unmasked_weight=config.unmasked_weight,
                             normalize_masked_area_loss=config.normalize_masked_area_loss,
-                        ).mean([1, 2, 3])
+                        ).mean(dim=(1, 2, 3))
                         * config.vb_loss_strength
                     )
 
@@ -203,7 +202,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 data["predicted"].to(dtype=torch.float32),
                 data["target"].to(dtype=torch.float32),
                 reduction="none",
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         # MAE/L1 Loss
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
@@ -211,14 +210,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 data["predicted"].to(dtype=torch.float32),
                 data["target"].to(dtype=torch.float32),
                 reduction="none",
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         # log-cosh Loss
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_loss = self.__log_cosh_loss(
                 data["predicted"].to(dtype=torch.float32),
                 data["target"].to(dtype=torch.float32),
-            ).mean([1, 2, 3])
+            ).mean(dim=(1, 2, 3))
 
         match config.loss_mode_fn:
             case config.loss_mode_fn.ORIGINAL:
@@ -243,7 +242,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                             mask=batch["latent_mask"].to(dtype=torch.float32),
                             unmasked_weight=config.unmasked_weight,
                             normalize_masked_area_loss=config.normalize_masked_area_loss,
-                        ).mean([1, 2, 3])
+                        ).mean(dim=(1, 2, 3))
                         * config.vb_loss_strength
                     )
 
