@@ -1,3 +1,4 @@
+import json
 import traceback
 from torch.nn import Parameter
 
@@ -311,10 +312,9 @@ class DeltaPatternRegularizer:
             raise ValueError("param_collection não pode ser None para DeltaPatternRegularizer.")
         self.model = model
         self.param_collection: "NamedParameterGroupCollection" = param_collection
+        self.delta_log_by_module: Dict[str, Dict[str, float]] = {}
         self.initial_weights_run1: Dict[str, torch.Tensor] = {}  # Pesos no início da Run 1 (para salvar) - Em CPU
-        self.initial_weights_run2: Dict[str, torch.Tensor] = (
-            {}
-        )  # Pesos no início da Run 2 (para calcular penalidade) - Em CPU
+        self.initial_weights_run2: Dict[str, torch.Tensor] = {}  # Pesos no início da Run 2 (para calcular penalidade) - Em CPU
         self.reference_deltas: Dict[str, torch.Tensor] = {}  # Deltas carregados da Run 1 - Em CPU
         self.current_total_delta_norm: Optional[float] = None  # Cache da norma L2 do delta atual
         self.reference_delta_norm: Optional[float] = None  # Cache da norma L2 do delta de referência
@@ -503,109 +503,31 @@ class DeltaPatternRegularizer:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
         return self.current_total_delta_norm, self.reference_delta_norm
 
-    def save_pattern(
-        self, save_dir: str = "./training_pattern", base_filename: Optional[str] = None, filename_suffix: str = ""
-    ):
+    def log_group_deltas(self, epoch: int):
         """
-        Calcula o delta final da Run 1 (final_weights - initial_weights_run1),
-        salva em um arquivo .pt e escreve um log .txt com metadados e normas.
-        Permite especificar um nome base e um sufixo para o arquivo.
-        Retorna o caminho do arquivo .pt salvo ou None em caso de falha.
+        Salva norma L2 do delta para cada grupo (NamedParameterGroup) no epoch atual.
+        Usa self.initial_weights_run1 como base.
         """
         if not self.initial_weights_run1:
-            print(
-                "[DeltaPattern] Erro: Pesos iniciais (Run 1) não foram capturados. Não é possível salvar o padrão delta."
-            )
-            return None
+            print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
+            return
 
-        print(f"[DeltaPattern] Calculando padrão de delta final (Run 1)...")
-        final_deltas_cpu: Dict[str, torch.Tensor] = {}
-        final_weights_list_cpu = {}  # Para calcular norma final
-        num_params_processed = 0
+        epoch_key = f"epoch_{epoch}"
+        self.delta_log_by_module[epoch_key] = {}
 
-        try:
-            for key, final_param, _ in self._iterate_params():
-                if key in self.initial_weights_run1:
-                    initial_weight_cpu = self.initial_weights_run1[key]
-                    final_delta_cpu = final_param.detach().cpu() - initial_weight_cpu
-                    final_deltas_cpu[key] = final_delta_cpu
-                    final_weights_list_cpu[key] = final_param.detach().cpu()
-                    num_params_processed += 1
-        except Exception as e:
-            print(f"[DeltaPattern] Erro ao calcular deltas finais: {e}")
-            traceback.print_exc()
-            return None
+        for group in self.param_collection:
+            group_norm_sq = 0.0
+            for name, param in group.named_parameters():
+                if name in self.initial_weights_run1:
+                    delta = param.detach().float() - self.initial_weights_run1[name].float()
+                    group_norm_sq += torch.norm(delta, p=2).pow(2).item()
+            group_delta_norm = group_norm_sq ** 0.5
+            self.delta_log_by_module[epoch_key][group.display_name] = group_delta_norm
 
-        if num_params_processed == 0:
-            print("[DeltaPattern] Erro: Nenhum parâmetro correspondente encontrado para calcular o delta final.")
-            return None
+        print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
 
-        # Calcula as normas L2 totais (todos os tensores estão em CPU)
-        initial_weights_norm = self._calculate_total_norm(self.initial_weights_run1)
-        final_weights_norm = self._calculate_total_norm(final_weights_list_cpu)
-        final_delta_norm = self._calculate_total_norm(final_deltas_cpu)
-
-        print(f"[DeltaPattern] Norma L2 Inicial (Run 1): {initial_weights_norm:.4f}")
-        print(f"[DeltaPattern] Norma L2 Final (Run 1): {final_weights_norm:.4f}")
-        print(f"[DeltaPattern] Norma L2 Delta Final (Run 1): {final_delta_norm:.4f}")
-
-        # Cria diretório e nome de arquivo
-        os.makedirs(save_dir, exist_ok=True)
-
-        # Define o nome base do arquivo
-        if base_filename:
-            # Remove extensão .pt se presente no nome base vindo do config
-            if base_filename.lower().endswith(".pt"):
-                base_filename = base_filename[:-3]
-        else:
-            # Usa um nome genérico se não fornecido
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            base_filename = f"pattern_{timestamp}"  # Nome antigo como fallback
-
-        # Adiciona o sufixo (pode conter epoch/step)
-        full_base_filename = base_filename + filename_suffix
-
-        pattern_path = os.path.join(save_dir, full_base_filename + ".pt")
-        log_path = os.path.join(save_dir, full_base_filename + ".txt")
-
-        try:
-            torch.save(final_deltas_cpu, pattern_path)
-            print(f"[DeltaPattern] Padrão de delta final salvo em {pattern_path}")
-
-            with open(log_path, "w") as f:
-                f.write(f"Padrão Delta Salvo: {pattern_path}\n")
-                # Incluir informações sobre o passo/época se disponíveis no sufixo?
-                # f.write(f"Sufixo (Epoch/Step info): {filename_suffix}\n")
-                f.write(f"Timestamp da Criação do Arquivo: {time.strftime('%Y%m%d_%H%M%S')}\n")
-                f.write(f"Número de deltas de parâmetros no padrão: {len(final_deltas_cpu)}\n")
-                try:
-                    num_groups = len(
-                        getattr(
-                            self.param_collection, "_NamedParameterGroupCollection__groups", list(self.param_collection)
-                        )
-                    )
-                    f.write(f"Número de grupos de parâmetros considerados: {num_groups}\n")
-                except:
-                    f.write("Número de grupos de parâmetros considerados: (Não foi possível determinar)\n")
-                f.write(f"Norma L2 Total dos Pesos Iniciais (Run 1): {initial_weights_norm:.4f}\n")
-                f.write(f"Norma L2 Total dos Pesos Finais (capturados neste save): {final_weights_norm:.4f}\n")
-                f.write(f"Norma L2 Total do Delta (Finais - Iniciais): {final_delta_norm:.4f}\n\n")
-                f.write("Detalhes do Delta por Parâmetro (Top 20 por Norma L2):\n")
-
-                sorted_deltas = sorted(
-                    final_deltas_cpu.items(), key=lambda item: torch.norm(item[1], p=2).item(), reverse=True
-                )
-                for name, tensor in sorted_deltas[:20]:
-                    f.write(f"- {name}: {torch.norm(tensor, p=2).item():.6f}\n")
-                if len(sorted_deltas) > 20:
-                    f.write("...\n")
-
-            return pattern_path
-        except Exception as e:
-            print(f"[DeltaPattern] Erro ao salvar o padrão delta ou log: {e}")
-            traceback.print_exc()
-            if os.path.exists(pattern_path):
-                os.remove(pattern_path)
-            if os.path.exists(log_path):
-                os.remove(log_path)
-            return None
+    def save_group_deltas(self, path: str = "./training_pattern/delta_log_by_module.json"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.delta_log_by_module, f, indent=2)
+        print(f"[DeltaPattern] Delta por grupo salvo em {path}")
