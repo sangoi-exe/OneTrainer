@@ -657,7 +657,7 @@ class GenericTrainer(BaseTrainer):
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                     global_step=train_progress.global_step,
                 )
-
+            
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
             step_tqdm = tqdm(
                 self.data_loader.get_data_loader(),
@@ -789,6 +789,7 @@ class GenericTrainer(BaseTrainer):
 
             if self.config.delta_pattern_save_it and self.delta_pattern is not None:
                 self.delta_pattern.log_group_deltas(train_progress.epoch)
+                print(f"self.delta_pattern salvo")                
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 

@@ -1,8 +1,8 @@
 import json
 import traceback
+from typing import Deque
 from torch.nn import Parameter
 
-# FIM ALTERAÇÃO
 import os
 import time
 import warnings
@@ -11,19 +11,13 @@ from torch import Tensor
 from collections import deque
 from safetensors.torch import load_file
 
-# INÍCIO ALTERAÇÃO: Ajustar imports e tipos
 from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
 
 from modules.util.NamedParameterGroup import NamedParameterGroup
 
-# Usar TYPE_CHECKING para evitar importação circular se NamedParameterGroupCollection estiver em outro módulo
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-# FIM ALTERAÇÃO
 
-###############################################################################
-# NOVO: Variável global para controlar o modo (scalar vs. batch)
-###############################################################################
 BATCH_MODE = True
 """
 Se BATCH_MODE for False, comporta-se como no código original (usa .item()).
@@ -49,9 +43,9 @@ class LossTracker:
         self.use_mad: bool = use_mad
 
         # As filas continuarão existindo, mas podem armazenar floats ou Tensores
-        self.mse_losses: deque = deque(maxlen=window_size)
-        self.mae_losses: deque = deque(maxlen=window_size)
-        self.log_cosh_losses: deque = deque(maxlen=window_size)
+        self.mse_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
+        self.mae_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
+        self.log_cosh_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
         """
@@ -78,7 +72,7 @@ class LossTracker:
 
     def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
         try:
-            arr = torch.cat([x.view(-1) for x in values_list], dim=0)
+            arr = torch.cat([x.view(-1) if isinstance(x, Tensor) else torch.tensor([x]) for x in values_list], dim=0)
             if not self.use_mad:
                 mean_val = arr.mean()
                 std_val = arr.std(unbiased=False)
@@ -143,7 +137,7 @@ class DynamicLossStrength:
         use_ema: bool = False,
         ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
-        schedule_params: Dict[str, Dict[str, float]] = None,
+        schedule_params: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> None:
         """
         Initializes the DynamicLossStrength.
@@ -503,10 +497,10 @@ class DeltaPatternRegularizer:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
         return self.current_total_delta_norm, self.reference_delta_norm
 
-     def log_group_deltas(self, epoch: int):
+    def log_group_deltas(self, epoch: int):
         """
-        Salva norma L2 do delta para cada grupo (NamedParameterGroup) no epoch atual.
-        Usa self.initial_weights_run1 como base. Parâmetros vêm de self.param_collection (NamedParameterGroupCollection).
+        Salva norma L2 do delta para cada grupo (agrupados por prefixo simples) no epoch atual.
+        Usa self.initial_weights_run1 como base.
         """
         if not self.initial_weights_run1:
             print("[DeltaPattern] log_group_deltas: pesos iniciais não capturados.")
@@ -515,23 +509,34 @@ class DeltaPatternRegularizer:
         epoch_key = f"epoch_{epoch}"
         self.delta_log_by_module[epoch_key] = {}
 
-        for group in self.param_collection:
-            prefix = group.unique_name  # Ex: "lora_unet_down_blocks_2_resnets_1"
-            group_norm_sq = 0.0
-            param_count = 0
+        # INÍCIO ALTERAÇÃO: iterar sobre parâmetros reais e agrupar por prefixo
+        group_norms: Dict[str, float] = {}
+        param_counts: Dict[str, int] = {}
 
-            for name, initial_weight in self.initial_weights_run1.items():
-                if name.startswith(prefix):
-                    current_param = self.model.unet_lora.state_dict().get(name, None)
-                    if current_param is not None:
-                        delta = current_param.detach().float() - initial_weight.float()
-                        group_norm_sq += torch.norm(delta, p=2).pow(2).item()
-                        param_count += 1
+        for name, current_param, _ in self._iterate_params():
+            if name not in self.initial_weights_run1:
+                continue
 
-            group_delta_norm = group_norm_sq ** 0.5 if param_count > 0 else 0.0
-            self.delta_log_by_module[epoch_key][group.display_name] = group_delta_norm
+            initial_weight = self.initial_weights_run1[name].to(dtype=torch.float32, device=current_param.device)
+            delta = current_param.detach().float() - initial_weight
+
+            # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
+            prefix = name.split(".")[0]  # ou use um parser mais detalhado se quiser algo como 'up_blocks_2_resnets_1'
+            
+            group_norms.setdefault(prefix, 0.0)
+            param_counts.setdefault(prefix, 0)
+
+            group_norms[prefix] += torch.norm(delta, p=2).pow(2).item()
+            param_counts[prefix] += 1
+
+        for prefix, norm_sq in group_norms.items():
+            count = param_counts[prefix]
+            delta_norm = norm_sq ** 0.5 if count > 0 else 0.0
+            self.delta_log_by_module[epoch_key][prefix] = delta_norm
+        # FIM ALTERAÇÃO
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
+
 
     def save_group_deltas(self, path: str = "./training_pattern/delta_log_by_module.json"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
