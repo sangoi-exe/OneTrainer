@@ -101,7 +101,8 @@ class TrainUI(ctk.CTk):
 
     def __close(self):
         self.top_bar_component.save_default()
-        self.quit()
+        print("[UI] Janela fechada. O treinamento continua em segundo plano.")
+        self.withdraw() 
 
     def top_bar(self, master):
         return TopBar(

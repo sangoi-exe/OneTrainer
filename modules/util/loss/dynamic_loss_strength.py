@@ -535,6 +535,7 @@ class DeltaPatternRegularizer:
             self.delta_log_by_module[epoch_key][prefix] = delta_norm
         # FIM ALTERAÇÃO
 
+
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")
 
 

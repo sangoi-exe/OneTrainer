@@ -4,11 +4,12 @@ script_imports()
 
 from modules.ui.TrainUI import TrainUI
 
+global_ui = None
 
 def main():
-    ui = TrainUI()
-    ui.mainloop()
-
+    global global_ui
+    global_ui = TrainUI()
+    global_ui.mainloop()
 
 if __name__ == '__main__':
     main()
