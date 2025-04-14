@@ -11,6 +11,8 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
+from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+
 
 class BaseModelSetup(
     TimedActionMixin,
@@ -73,7 +75,16 @@ class BaseModelSetup(
         pass
 
     @abstractmethod
-    def calculate_loss(self, model: BaseModel, batch: dict, data: dict, config: TrainConfig, progress: TrainProgress, tensorboard: SummaryWriter) -> Tensor:
+    def calculate_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
+        progress: TrainProgress,
+        tensorboard: SummaryWriter,
+        delta_pattern: DeltaPatternRegularizer,
+    ) -> Tensor:
         pass
 
     @abstractmethod
@@ -86,11 +97,11 @@ class BaseModelSetup(
         pass
 
     def report_to_tensorboard(
-            self,
-            model: BaseModel,
-            config: TrainConfig,
-            scheduler: LRScheduler,
-            tensorboard: SummaryWriter,
+        self,
+        model: BaseModel,
+        config: TrainConfig,
+        scheduler: LRScheduler,
+        tensorboard: SummaryWriter,
     ):
         lrs = scheduler.get_last_lr()
         parameters = model.parameters.display_name_mapping
@@ -98,21 +109,21 @@ class BaseModelSetup(
         reported_learning_rates = {}
         for lr, parameter in zip(lrs, parameters, strict=True):
             # only use the prefix. this prevents multiple embedding reports. TODO: find a better solution
-            name = parameter.split('/')[0]
-            
+            name = parameter.split("/")[0]
+
             tensorboard.add_scalar(
                 f"lr/{name}_orig", lr, model.train_progress.global_step
             )
 
             if name not in reported_learning_rates:
                 reported_learning_rates[name] = lr
-            
-        reported_learning_rates = config.optimizer.optimizer.maybe_adjust_lrs(reported_learning_rates, model.optimizer)
+
+        reported_learning_rates = config.optimizer.optimizer.maybe_adjust_lrs(
+            reported_learning_rates, model.optimizer
+        )
 
         for name, lr in reported_learning_rates.items():
-            tensorboard.add_scalar(
-                f"lr/{name}", lr, model.train_progress.global_step
-            )
+            tensorboard.add_scalar(f"lr/{name}", lr, model.train_progress.global_step)
 
     def stop_unet_training_elapsed(
         self,

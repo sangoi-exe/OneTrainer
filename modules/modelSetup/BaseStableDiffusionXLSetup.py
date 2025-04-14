@@ -17,6 +17,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
 from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
 from torch.utils.tensorboard import SummaryWriter
@@ -382,7 +383,8 @@ class BaseStableDiffusionXLSetup(
 			data: dict,
 			config: TrainConfig,
 			progress: TrainProgress,
-			tensorboard: SummaryWriter
+			tensorboard: SummaryWriter,
+			delta_pattern: DeltaPatternRegularizer,
 	) -> Tensor:
 		return self._diffusion_losses(
 			batch=batch,
@@ -391,6 +393,7 @@ class BaseStableDiffusionXLSetup(
 			config=config,
 			progress=progress,
 			tensorboard=tensorboard,
+			delta_pattern=delta_pattern,
 			train_device=self.train_device,
 			betas=model.noise_scheduler.betas.to(device=self.train_device),
 		).mean()

@@ -163,22 +163,22 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     + log_cosh_loss * log_cosh_weight * config.log_cosh_strength
                 )
 
-                if self.tensorboard != None:
-                    self.tensorboard.add_scalar(
-                        "sangoi/7mse",
-                        mse_weight,
-                        progress.global_step,
-                    )
-                    self.tensorboard.add_scalar(
-                        "sangoi/8mae",
-                        mae_weight,
-                        progress.global_step,
-                    )
-                    self.tensorboard.add_scalar(
-                        "sangoi/9log_cosh",
-                        log_cosh_weight,
-                        progress.global_step,
-                    )
+                # if self.tensorboard != None:
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/7mse",
+                #         mse_weight,
+                #         progress.global_step,
+                #     )
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/8mae",
+                #         mae_weight,
+                #         progress.global_step,
+                #     )
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/9log_cosh",
+                #         log_cosh_weight,
+                #         progress.global_step,
+                #     )
 
         return losses
 
@@ -263,22 +263,22 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     + log_cosh_loss * log_cosh_weight * config.log_cosh_strength
                 )
 
-                if self.tensorboard != None:
-                    self.tensorboard.add_scalar(
-                        "sangoi/7mse",
-                        mse_weight,
-                        progress.global_step,
-                    )
-                    self.tensorboard.add_scalar(
-                        "sangoi/8mae",
-                        mae_weight,
-                        progress.global_step,
-                    )
-                    self.tensorboard.add_scalar(
-                        "sangoi/9log_cosh",
-                        log_cosh_weight,
-                        progress.global_step,
-                    )
+                # if self.tensorboard != None:
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/7mse",
+                #         mse_weight,
+                #         progress.global_step,
+                #     )
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/8mae",
+                #         mae_weight,
+                #         progress.global_step,
+                #     )
+                #     self.tensorboard.add_scalar(
+                #         "sangoi/9log_cosh",
+                #         log_cosh_weight,
+                #         progress.global_step,
+                #     )
 
         return losses
 
@@ -441,6 +441,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         tensorboard: SummaryWriter,
         train_device: torch.device,
         model: torch.nn.Module,
+        delta_pattern: DeltaPatternRegularizer,
         betas: Tensor | None = None,
         alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None = None,
     ) -> Tensor:
@@ -448,6 +449,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = config
         self.progress = progress
         self.tensorboard = tensorboard
+        self.delta_pattern = delta_pattern
 
         if self.delta_pattern is None and (config.delta_pattern_save_it or config.delta_pattern_use_it):
             # Verifica se NamedParameterGroupCollection foi importado corretamente
@@ -456,25 +458,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     "NamedParameterGroupCollection não pôde ser importado. Verifique a estrutura do projeto/dependências."
                 )
             # Tenta acessar a coleção de parâmetros do modelo. Ajuste o nome do atributo se necessário.
-            param_collection = getattr(model, "parameter_groups", None)
-            if not isinstance(param_collection, NamedParameterGroupCollection):
-                # Tenta outros nomes comuns ou gera erro
-                param_collection = getattr(model, "param_groups", None)  # Exemplo alternativo
-                param_collection = getattr(model, "_parameter_groups", None)  # Outro exemplo
-                if not isinstance(param_collection, NamedParameterGroupCollection):
-                    # Verifica se 'parameters' é uma NamedParameterGroupCollection (caso comum em OneTrainer)
-                    param_collection_direct = getattr(model, "parameters", None)
-                    if isinstance(param_collection_direct, NamedParameterGroupCollection):
-                        param_collection = param_collection_direct
-                    else:
-                        print(
-                            f"[DeltaPattern] Atributos tentados: 'parameter_groups', 'param_groups', '_parameter_groups', 'parameters'"
-                        )
-                        raise AttributeError(
-                            "Não foi possível encontrar NamedParameterGroupCollection no modelo. Verifique o nome do atributo que contém os grupos de parâmetros (p. ex., 'parameter_groups', 'parameters') na classe do seu modelo e ajuste em LossesMixin.py"
-                        )
-
-            self.delta_pattern = DeltaPatternRegularizer(model, param_collection)
+            param_collection = getattr(self.delta_pattern, "parameters", None)
 
             if config.delta_pattern_save_it:
                 print("[DeltaPattern] Capturando pesos iniciais para cálculo do delta (Run 1).")
@@ -551,11 +535,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         losses.device,
                     )
                 case LossWeight.SANGOI:
-                    tensorboard.add_scalar(
-                        "sangoi/5loss_b4_sangoi",
-                        losses.mean().item(),
-                        self.progress.global_step,
-                    )
+                    # tensorboard.add_scalar(
+                    #     "sangoi/5loss_b4_sangoi",
+                    #     losses.mean().item(),
+                    #     self.progress.global_step,
+                    # )
                     losses *= self.__sangoi_loss_weighting(
                         data["timestep"],
                         data["predicted"],
@@ -564,11 +548,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         tensorboard,
                         config.loss_weight_strength,
                     )
-                    tensorboard.add_scalar(
-                        "sangoi/6loss_after_sangoi",
-                        losses.mean().item(),
-                        self.progress.global_step,
-                    )
+                    # tensorboard.add_scalar(
+                    #     "sangoi/6loss_after_sangoi",
+                    #     losses.mean().item(),
+                    #     self.progress.global_step,
+                    # )
 
             # INÍCIO ALTERAÇÃO: Aplicação da penalidade Delta Pattern (Movido para depois dos outros weights)
             if config.delta_pattern_use_it and self.delta_pattern is not None and self.delta_pattern.reference_deltas:
@@ -580,21 +564,18 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
                 losses += penalty  # Adiciona o escalar à loss de cada item do batch
 
-                if self.tensorboard:
-                    self.tensorboard.add_scalar("delta_pattern/penalty", penalty.item(), self.progress.global_step)
-                    # Opcional: Logar a norma do delta atual e do delta de referência
-                    current_delta_norm, ref_delta_norm = self.delta_pattern.get_delta_norms()
-                    if current_delta_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/current_total_delta_norm", current_delta_norm, self.progress.global_step
-                        )
-                    if ref_delta_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/reference_delta_norm", ref_delta_norm, self.progress.global_step
-                        )
-        # FIM ALTERAÇÃO
+                # if self.tensorboard:
+                #     self.tensorboard.add_scalar("delta_pattern/penalty", penalty.item(), self.progress.global_step)
+                #     current_delta_norm, ref_delta_norm = self.delta_pattern.get_delta_norms()
+                #     if current_delta_norm is not None:
+                #         self.tensorboard.add_scalar(
+                #             "delta_pattern/current_total_delta_norm", current_delta_norm, self.progress.global_step
+                #         )
+                #     if ref_delta_norm is not None:
+                #         self.tensorboard.add_scalar(
+                #             "delta_pattern/reference_delta_norm", ref_delta_norm, self.progress.global_step
+                #         )
 
-        # Retorna a loss final (por item do batch)
         return losses
 
     def _flow_matching_losses(

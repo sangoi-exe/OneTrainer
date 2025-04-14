@@ -24,6 +24,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
 from modules.util.memory_util import TorchMemoryRecorder
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -56,6 +57,7 @@ class GenericTrainer(BaseTrainer):
     parameters: list[Parameter]
 
     tensorboard: SummaryWriter
+    delta_pattern: DeltaPatternRegularizer
 
     grad_hook_handles: list[RemovableHandle]
 
@@ -71,6 +73,7 @@ class GenericTrainer(BaseTrainer):
             super()._start_tensorboard()
 
         self.model = None
+        self.delta_pattern = None
         self.one_step_trained = False
 
         self.grad_hook_handles = []
@@ -583,6 +586,7 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
+        self.delta_pattern = DeltaPatternRegularizer(self.model, self.parameters)
 
         def wrap_scheduler_step(orig_step):
             def wrapped(*args, **kwargs):
@@ -611,11 +615,11 @@ class GenericTrainer(BaseTrainer):
         # This is used to schedule sampling only when the gradients don't take up any space
         has_gradient = False
 
-        accumulated_loss_tensor = torch.tensor(0.0, device=train_device, dtype=torch.float32)
-        ema_loss_tensor = None
+        accumulated_loss = 0.0
+        ema_loss = None
 
         lr_scheduler = None
-        ema_loss_steps = 0
+        
         for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
             self.callbacks.on_update_status("starting epoch/caching")
 
@@ -706,7 +710,7 @@ class GenericTrainer(BaseTrainer):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
                     loss = self.model_setup.calculate_loss(
-                        self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
+                        self.model, batch, model_output_data, self.config, train_progress, self.tensorboard, self.delta_pattern
                     )
 
                     loss = loss / self.config.gradient_accumulation_steps
@@ -717,7 +721,7 @@ class GenericTrainer(BaseTrainer):
                         loss.backward()
 
                     has_gradient = True
-                    accumulated_loss_tensor += loss.detach()
+                    accumulated_loss += loss.item()
 
                     if self.__is_update_step(train_progress):
                         if (
@@ -745,44 +749,28 @@ class GenericTrainer(BaseTrainer):
                         # Report learning rate after potential scheduler step
                         self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler, self.tensorboard)
 
-                        # Obter valor escalar da loss acumulada APENAS para logging/EMA
-                        accumulated_loss_scalar = accumulated_loss_tensor.item()
-                        self.tensorboard.add_scalar(
-                            "loss/train_step", accumulated_loss_scalar, train_progress.global_step
-                        )
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
+                        ema_loss = ema_loss or accumulated_loss
+                        ema_loss = (ema_loss * 0.99) + (accumulated_loss * 0.01)
+                        step_tqdm.set_postfix({
+                            'loss': accumulated_loss,
+                            'smooth loss': ema_loss,
+                        })
+                        self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
+                        accumulated_loss = 0.0
 
-                        # Atualizar EMA loss (mantendo como tensor para consistência, converter para float no display)
-                        if ema_loss_tensor is None:
-                            ema_loss_tensor = accumulated_loss_tensor.clone()  # Inicializa com o valor atual
-                            # Não incrementa ema_loss_steps na primeira vez
-                        else:
-                            ema_loss_steps += 1  # Incrementa após a inicialização
-                            # Calcula decay como float
-                            ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps)) if ema_loss_steps > 0 else 0.99
-                            # Atualiza tensor EMA
-                            ema_loss_tensor = (ema_loss_tensor * ema_loss_decay) + (
-                                accumulated_loss_tensor * (1 - ema_loss_decay)
-                            )
-                        
-                        # Logar e mostrar loss (usando .item() aqui para display/log)
-                        step_tqdm.set_postfix(
-                            {
-                                "loss": accumulated_loss_scalar,
-                                "smooth loss": ema_loss_tensor.item(),  # Converte para float para display
-                            }
-                        )
-
-                        self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss_tensor.item(), train_progress.global_step) # Loga float
-                        accumulated_loss_tensor.zero_() # Reseta o tensor acumulador
-
-                        if hasattr(self.model_setup, "after_optimizer_step"):
-                            self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
                         if self.model.ema:
                             update_step = train_progress.global_step // self.config.gradient_accumulation_steps
                             self.tensorboard.add_scalar(
-                                "ema_decay", self.model.ema.get_current_decay(update_step), train_progress.global_step
+                                "ema_decay",
+                                self.model.ema.get_current_decay(update_step),
+                                train_progress.global_step
                             )
-                            self.model.ema.step(self.parameters, update_step)
+                            self.model.ema.step(
+                                self.parameters,
+                                update_step
+                            )
 
                         self.one_step_trained = True
 
