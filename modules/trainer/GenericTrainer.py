@@ -588,6 +588,9 @@ class GenericTrainer(BaseTrainer):
     def train(self):
         scheduler_step_counter = 0
         self.delta_pattern = DeltaPatternRegularizer(self.model, self.parameters)
+        if self.config.delta_pattern_save_it:
+          print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
+          self.delta_pattern.capture_weights()
 
         def wrap_scheduler_step(orig_step):
             def wrapped(*args, **kwargs):
@@ -784,6 +787,8 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     return
 
+            if self.config.delta_pattern_save_it and self.delta_pattern is not None:
+                self.delta_pattern.log_group_deltas(train_progress.epoch)
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
