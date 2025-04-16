@@ -530,7 +530,7 @@ class LoRAModule(PeftBase):
 
         lora_output = self.lora_up(self.lora_down(self.dropout(x)))
         original_output = self.orig_forward(x)
-        scale = self.alpha.item() / self.rank
+        scale = (self.alpha.to(dtype=x.dtype) / self.rank)
         return original_output + lora_output * scale
 
     def apply_to_module(self):
@@ -553,6 +553,7 @@ class DoRAModule(LoRAModule):
         self.norm_epsilon = bool(kwargs.pop('norm_epsilon', False))
         self.train_device = kwargs.pop("train_device", torch.device("cpu"))  # Default device
         self.dora_scale = None  # Initialize as None
+        self._cached_orig_weight = None
         super().__init__(*args, **kwargs)
 
     def initialize_weights(self):
@@ -600,7 +601,11 @@ class DoRAModule(LoRAModule):
         A = self.lora_down.weight
         B = self.lora_up.weight
 
-        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
+        if self._cached_orig_weight is None or self._cached_orig_weight.device != x.device:
+            self._cached_orig_weight = get_unquantized_weight(
+                self.orig_module, A.dtype, x.device
+            ).detach()                                          
+        orig_weight = self._cached_orig_weight
 
         WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
         

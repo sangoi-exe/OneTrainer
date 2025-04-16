@@ -48,6 +48,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = None
         self.delta_pattern = None
         self.loaded_pattern_deltas = None
+        self._log2_const = torch.log(torch.tensor(2.0))  # Tensor padrão (fp32, CPU)
         self.loss_tracker = LossTracker(window_size=100, use_mad=False)
         self.dynamic_loss_strengthing = DynamicLossStrength()
 
@@ -59,7 +60,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         diff = pred - target
 
         # log(cosh(x)) = softplus(-2x) - log(2)
-        log2 = torch.log(torch.tensor(2.0, dtype=diff.dtype, device=diff.device))
+        log2 = self._log2_const.to(dtype=diff.dtype, device=diff.device)
         loss = F.softplus(-2.0 * diff) - log2
 
         return loss
@@ -145,7 +146,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
             case config.loss_mode_fn.SANGOI:
                 # Update LossTracker
-                self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
+                self.loss_tracker.update(
+                    mse_loss.detach(), mae_loss.detach(), log_cosh_loss.detach()
+                )
 
                 # Compute z-scores
                 mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)

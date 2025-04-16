@@ -50,16 +50,16 @@ class LossTracker:
         # ou apenas a média do batch, dependendo da sua necessidade.
         # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach)
         # para depois concatenar na hora de computar estatísticas.
-        self.mse_losses.append(mse_loss)
-        self.mae_losses.append(mae_loss)
-        self.log_cosh_losses.append(log_cosh_loss)
+        # self.mse_losses.append(mse_loss)
+        # self.mae_losses.append(mae_loss)
+        # self.log_cosh_losses.append(log_cosh_loss)
 
         """
         SE DER OOM, USAR MEAN NESSA BOSTA
         """
-        # self.mse_losses.append(mse_loss.detach().mean())
-        # self.mae_losses.append(mae_loss.detach().mean())
-        # self.log_cosh_losses.append(log_cosh_loss.detach().mean())
+        self.mse_losses.append(float(mse_loss.detach().mean()))
+        self.mae_losses.append(float(mae_loss.detach().mean()))
+        self.log_cosh_losses.append(float(log_cosh_loss.detach().mean()))
 
     def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
         """
@@ -80,7 +80,7 @@ class LossTracker:
         # Cada elemento de values_list pode ser shape [] (loss já reduzido)
         # ou [batch_size]. Aqui assumimos que cada item é [batch_size],
         # mas se for scalar, a concat ainda funciona com .view(-1).
-        arr = torch.cat([x.view(-1).to(dtype=torch.float32) for x in values_list], dim=0)
+        arr = torch.tensor(values_list, dtype=torch.float32, device="cpu")
 
         if not self.use_mad:
             mean_val = arr.mean()
@@ -351,7 +351,7 @@ class DeltaPatternRegularizer:
         count = 0
         try:
             for key, param, _ in self._iterate_params():
-                self.initial_weights_run1[key] = param.detach().clone().cpu()  # Armazena em CPU
+                self.initial_weights_run1[key] = param.detach().cpu()  # Armazena em CPU
                 count += 1
         except Exception as e:
             print(f"[DeltaPattern] Erro durante capture_weights: {e}")
