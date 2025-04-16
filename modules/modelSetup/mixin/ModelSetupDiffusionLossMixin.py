@@ -16,7 +16,11 @@ from torch import Tensor
 from torch.utils.tensorboard.writer import SummaryWriter  # Adicionado para type hint
 from modules.util.TrainProgress import TrainProgress  # Adicionado para type hint
 from modules.util.config.TrainConfig import TrainConfig  # Adicionado para type hint
-from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
+from modules.util.loss.dynamic_loss_strength import (
+    LossTracker,
+    DynamicLossStrength,
+    DeltaPatternRegularizer,
+)
 
 from typing import TYPE_CHECKING
 
@@ -64,7 +68,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         loss = F.softplus(-2.0 * diff) - log2
 
         return loss
-
 
     def __masked_losses(
         self,
@@ -127,7 +130,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 )
 
                 # VB loss
-                if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+                if (
+                    config.vb_loss_strength != 0
+                    and "predicted_var_values" in data
+                    and self.__coefficients is not None
+                ):
                     losses += (
                         masked_losses(
                             losses=vb_losses(
@@ -151,14 +158,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 )
 
                 # Compute z-scores
-                mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
-
-                # Ajusta pesos dinamicamente + scheduler de prioridades
-                mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
-                    mse_z, mae_z, log_cosh_z, config, progress
+                mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
+                    mse_loss, mae_loss, log_cosh_loss
                 )
 
-                self.dynamic_loss_strengthing.maybe_log_deltas(self.tensorboard, self.delta_pattern, self.progress)
+                # Ajusta pesos dinamicamente + scheduler de prioridades
+                mse_weight, mae_weight, log_cosh_weight = (
+                    self.dynamic_loss_strengthing.adjust_weights(
+                        mse_z, mae_z, log_cosh_z, config, progress
+                    )
+                )
+
+                self.dynamic_loss_strengthing.maybe_log_deltas(
+                    self.tensorboard, self.delta_pattern, self.progress
+                )
 
                 losses = (
                     mse_loss * mse_weight * config.mse_strength
@@ -231,7 +244,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 )
 
                 # VB loss
-                if config.vb_loss_strength != 0 and "predicted_var_values" in data and self.__coefficients is not None:
+                if (
+                    config.vb_loss_strength != 0
+                    and "predicted_var_values" in data
+                    and self.__coefficients is not None
+                ):
                     losses += (
                         masked_losses(
                             losses=vb_losses(
@@ -251,14 +268,22 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
             case config.loss_mode_fn.SANGOI:
                 # Update LossTracker
-                self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
+                self.loss_tracker.update(
+                    mse_loss.detach().mean(),
+                    mae_loss.detach().mean(),
+                    log_cosh_loss.detach().mean(),
+                )
 
                 # Compute z-scores
-                mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
+                mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(
+                    mse_loss, mae_loss, log_cosh_loss
+                )
 
                 # Ajusta pesos dinamicamente + scheduler de prioridades
-                mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
-                    mse_z, mae_z, log_cosh_z, config, progress
+                mse_weight, mae_weight, log_cosh_weight = (
+                    self.dynamic_loss_strengthing.adjust_weights(
+                        mse_z, mae_z, log_cosh_z, config, progress
+                    )
                 )
                 losses = (
                     mse_loss * mse_weight * config.mse_strength
@@ -287,16 +312,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     def __snr(self, timesteps: Tensor, device: torch.device):
         if self.__coefficients:
-            all_snr = (self.__coefficients.sqrt_alphas_cumprod / self.__coefficients.sqrt_one_minus_alphas_cumprod) ** 2
-            all_snr.to(device)
+            all_snr = (
+                self.__coefficients.sqrt_alphas_cumprod
+                / self.__coefficients.sqrt_one_minus_alphas_cumprod
+            ) ** 2
+            all_snr = all_snr.to(device)
             snr = all_snr[timesteps]
         else:
-            alphas_cumprod = self.__alphas_cumprod_fun(timesteps, 1)
+            alphas_cumprod = self.__alphas_cumprod_fun(timesteps, 1).to(device)
             snr = alphas_cumprod / (1.0 - alphas_cumprod)
-
         return snr
 
-    def __min_snr_weight(self, timesteps: Tensor, gamma: float, v_prediction: bool, device: torch.device) -> Tensor:
+    def __min_snr_weight(
+        self, timesteps: Tensor, gamma: float, v_prediction: bool, device: torch.device
+    ) -> Tensor:
         snr = self.__snr(timesteps, device)
         min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
         # Denominator of the snr_weight increased by 1 if v-prediction is being used.
@@ -305,7 +334,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         snr_weight = (min_snr_gamma / snr).to(device)
         return snr_weight
 
-    def __debiased_estimation_weight(self, timesteps: Tensor, v_prediction: bool, device: torch.device) -> Tensor:
+    def __debiased_estimation_weight(
+        self, timesteps: Tensor, v_prediction: bool, device: torch.device
+    ) -> Tensor:
         snr = self.__snr(timesteps, device)
         weight = snr
         # The line below is a departure from the original paper.
@@ -360,7 +391,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         # 2) Cálculo do MAPE (já presente)
         # 2) Blend MAPE + MSPE (peso 50/50)
-        abs_percent_error = torch.abs((target - predicted) / (target + epsilon)).clamp(min=0, max=1)
+        abs_percent_error = torch.abs((target - predicted) / (target + epsilon)).clamp(
+            min=0, max=1
+        )
         sq_percent_error = abs_percent_error**2
         blended_error = 0.5 * abs_percent_error + 0.5 * sq_percent_error
         mape = blended_error.mean(dim=[1, 2, 3])
@@ -404,13 +437,17 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         #
         # Depois, interpolamos linearmente entre esses dois extremos pelo fator alpha.
 
-        snr_weight_low_first = torch.log(1.0 + 1.0 / (snr + epsilon))  # enfatiza SNR baixo
+        snr_weight_low_first = torch.log(
+            1.0 + 1.0 / (snr + epsilon)
+        )  # enfatiza SNR baixo
         snr_weight_high_first = torch.log(snr + 1.0)  # enfatiza SNR alto
 
         # Interpolação linear:
         # alpha=0 => weight = snr_weight_low_first
         # alpha=1 => weight = snr_weight_high_first
-        scenario_snr_weight = (1.0 - alpha) * snr_weight_low_first + alpha * snr_weight_high_first
+        scenario_snr_weight = (
+            1.0 - alpha
+        ) * snr_weight_low_first + alpha * snr_weight_high_first
         mape_reward = 1 - mape
         raw_reward = torch.exp(-mape_reward * scenario_snr_weight)
         # Ex: pode dar valores na casa de 0.08, 0.2, 1.1, etc.
@@ -422,10 +459,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         reward = gamma + (1.0 - gamma) * clamped_reward
 
         # Logging no TensorBoard
-        tensorboard.add_scalar("sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/4reward", reward.mean().item(), progress.global_step)
+        tensorboard.add_scalar(
+            "sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step
+        )
+        tensorboard.add_scalar(
+            "sangoi/2scenario_snr_weight",
+            scenario_snr_weight.mean().item(),
+            progress.global_step,
+        )
+        tensorboard.add_scalar(
+            "sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step
+        )
+        tensorboard.add_scalar(
+            "sangoi/4reward", reward.mean().item(), progress.global_step
+        )
         tensorboard.add_scalar("sangoi/alpha", alpha, progress.global_step)
         tensorboard.add_scalar(
             "sangoi/scenario_snr_weight_mean",
@@ -454,7 +501,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.tensorboard = tensorboard
         self.delta_pattern = delta_pattern
 
-        if self.delta_pattern is None and (config.delta_pattern_save_it or config.delta_pattern_use_it):
+        if self.delta_pattern is None and (
+            config.delta_pattern_save_it or config.delta_pattern_use_it
+        ):
             # Verifica se NamedParameterGroupCollection foi importado corretamente
             if NamedParameterGroupCollection is None:
                 raise ImportError(
@@ -464,34 +513,54 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             param_collection = getattr(self.delta_pattern, "parameters", None)
 
             if config.delta_pattern_save_it:
-                print("[DeltaPattern] Capturando pesos iniciais para cálculo do delta (Run 1).")
+                print(
+                    "[DeltaPattern] Capturando pesos iniciais para cálculo do delta (Run 1)."
+                )
                 self.delta_pattern.capture_weights()  # Captura pesos iniciais da Run 1
 
             if config.delta_pattern_use_it:
-                if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-                    print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
-                    self.delta_pattern.load_reference_pattern(config.delta_pattern_path)  # Carrega deltas da Run 1
-                    if self.delta_pattern.reference_deltas:  # Verifica se carregou com sucesso
-                        print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
+                if config.delta_pattern_path and os.path.exists(
+                    config.delta_pattern_path
+                ):
+                    print(
+                        f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}"
+                    )
+                    self.delta_pattern.load_reference_pattern(
+                        config.delta_pattern_path
+                    )  # Carrega deltas da Run 1
+                    if (
+                        self.delta_pattern.reference_deltas
+                    ):  # Verifica se carregou com sucesso
+                        print(
+                            "[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2)."
+                        )
                         self.delta_pattern.capture_initial_weights_run2()  # Captura pesos iniciais da Run 2
                     else:
                         print(
                             f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada."
                         )
-                        config.delta_pattern_use_it = False  # Desativa se não conseguiu carregar
+                        config.delta_pattern_use_it = (
+                            False  # Desativa se não conseguiu carregar
+                        )
                 else:
                     print(
                         f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada."
                     )
-                    config.delta_pattern_use_it = False  # Desativa se o caminho não existe
+                    config.delta_pattern_use_it = (
+                        False  # Desativa se o caminho não existe
+                    )
 
         loss_weight = batch["loss_weight"]
 
         batch_size_scale = (
-            1 if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION] else config.batch_size
+            1
+            if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION]
+            else config.batch_size
         )
         gradient_accumulation_steps_scale = (
-            1 if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH] else config.gradient_accumulation_steps
+            1
+            if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH]
+            else config.gradient_accumulation_steps
         )
 
         if self.__coefficients is None and betas is not None:
@@ -507,7 +576,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         else:
             # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
             #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
-            if config.masked_training and not config.model_type.has_conditioning_image_input():
+            if (
+                config.masked_training
+                and not config.model_type.has_conditioning_image_input()
+            ):
                 losses = self.__masked_losses(batch, data, config)
             else:
                 losses = self.__unmasked_losses(batch, data, config)
@@ -529,7 +601,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         losses.device,
                     )
                 case LossWeight.DEBIASED_ESTIMATION:
-                    losses *= self.__debiased_estimation_weight(data["timestep"], v_pred, losses.device)
+                    losses *= self.__debiased_estimation_weight(
+                        data["timestep"], v_pred, losses.device
+                    )
                 case LossWeight.P2:
                     losses *= self.__p2_loss_weight(
                         data["timestep"],
@@ -558,10 +632,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     # )
 
             # INÍCIO ALTERAÇÃO: Aplicação da penalidade Delta Pattern (Movido para depois dos outros weights)
-            if config.delta_pattern_use_it and self.delta_pattern is not None and self.delta_pattern.reference_deltas:
+            if (
+                config.delta_pattern_use_it
+                and self.delta_pattern is not None
+                and self.delta_pattern.reference_deltas
+            ):
                 # Calcula a penalidade usando os pesos *atuais* do modelo
                 # e comparando o delta *acumulado atual* com o delta de referência
-                penalty = self.delta_pattern.compute_penalty(lambda_weight=config.delta_pattern_weight)
+                penalty = self.delta_pattern.compute_penalty(
+                    lambda_weight=config.delta_pattern_weight
+                )
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
@@ -591,10 +671,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     ) -> Tensor:
         loss_weight = batch["loss_weight"]
         batch_size_scale = (
-            1 if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION] else config.batch_size
+            1
+            if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION]
+            else config.batch_size
         )
         gradient_accumulation_steps_scale = (
-            1 if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH] else config.gradient_accumulation_steps
+            1
+            if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH]
+            else config.gradient_accumulation_steps
         )
 
         if self.__sigmas is None and sigmas is not None:
@@ -613,7 +697,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         else:
             # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
             #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
-            if config.masked_training and not config.model_type.has_conditioning_image_input():
+            if (
+                config.masked_training
+                and not config.model_type.has_conditioning_image_input()
+            ):
                 losses = self.__masked_losses(batch, data, config)
             else:
                 losses = self.__unmasked_losses(batch, data, config)

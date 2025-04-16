@@ -300,10 +300,10 @@ class PeftBase(nn.Module):
                 )
                 lora_up = Conv2d(
                     self.rank,
-                    out_channels // groups,
+                    out_channels,         # antes era out_channels // groups
                     (1, 1),
-                    stride=1,  # Corrigido para 1 como no original
-                    padding=0,  # Corrigido para 0 como no original
+                    stride=1,
+                    padding=0,
                     bias=False,
                     device=device,
                 )
