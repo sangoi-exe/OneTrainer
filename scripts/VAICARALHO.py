@@ -11,7 +11,7 @@ from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.config.TrainConfig import TrainConfig
 
 # === CONFIGURAR CAMINHO DO CONFIG MANUALMENTE ===
-CONFIG_PATH = "F:/OneTrainer/training_presets/Nat.cyb85.001.json"
+CONFIG_PATH = r"F:\OneTrainer\training_presets\Sil.cyb70.001.json"
 SECRETS_PATH = "secrets.json"  # Se não estiver usando, pode deixar como está
 
 def main():

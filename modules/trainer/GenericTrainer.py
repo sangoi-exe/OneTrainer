@@ -717,7 +717,7 @@ class GenericTrainer(BaseTrainer):
                         self.model, batch, model_output_data, self.config, train_progress, self.tensorboard, self.delta_pattern
                     )
 
-                    loss = loss / self.config.gradient_accumulation_steps
+                    loss = loss / float(self.config.gradient_accumulation_steps)
 
                     if scaler:
                         scaler.scale(loss).backward()
@@ -725,7 +725,10 @@ class GenericTrainer(BaseTrainer):
                         loss.backward()
 
                     has_gradient = True
-                    accumulated_loss += loss.item()
+                    if not isinstance(accumulated_loss, torch.Tensor):
+                        accumulated_loss = loss.detach()
+                    else:
+                        accumulated_loss += loss.detach()
 
                     if self.__is_update_step(train_progress):
                         if (
@@ -753,9 +756,9 @@ class GenericTrainer(BaseTrainer):
                         # Report learning rate after potential scheduler step
                         self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler, self.tensorboard)
 
-                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss, train_progress.global_step)
-                        ema_loss = ema_loss or accumulated_loss
-                        ema_loss = (ema_loss * 0.99) + (accumulated_loss * 0.01)
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss.item(), train_progress.global_step)
+                        ema_loss = ema_loss or accumulated_loss.item()
+                        ema_loss = (ema_loss * 0.99) + (accumulated_loss.item() * 0.01)
                         step_tqdm.set_postfix({
                             'loss': accumulated_loss,
                             'smooth loss': ema_loss,

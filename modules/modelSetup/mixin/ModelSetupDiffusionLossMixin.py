@@ -11,10 +11,9 @@ from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses
 from modules.util.loss.vb_loss import vb_losses
-from torch.utils.tensorboard import SummaryWriter
 
 from torch import Tensor
-from torch.utils.tensorboard import SummaryWriter  # Adicionado para type hint
+from torch.utils.tensorboard.writer import SummaryWriter  # Adicionado para type hint
 from modules.util.TrainProgress import TrainProgress  # Adicionado para type hint
 from modules.util.config.TrainConfig import TrainConfig  # Adicionado para type hint
 from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
@@ -52,18 +51,19 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.loss_tracker = LossTracker(window_size=100, use_mad=False)
         self.dynamic_loss_strengthing = DynamicLossStrength()
 
-    def __log_cosh_loss(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ):
+    def __log_cosh_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Calcula a loss log-cosh corretamente e de forma numericamente estável.
+        Compatível com bfloat16 e sem alocação desnecessária.
+        """
         diff = pred - target
-        loss = (
-            diff
-            + torch.nn.functional.softplus(-2.0 * diff)
-            - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
-        )
+
+        # log(cosh(x)) = softplus(-2x) - log(2)
+        log2 = torch.log(torch.tensor(2.0, dtype=diff.dtype, device=diff.device))
+        loss = F.softplus(-2.0 * diff) - log2
+
         return loss
+
 
     def __masked_losses(
         self,
@@ -199,24 +199,24 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # MSE/L2 Loss
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = F.mse_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
                 reduction="none",
             ).mean(dim=(1, 2, 3))
 
         # MAE/L1 Loss
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = F.l1_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
                 reduction="none",
             ).mean(dim=(1, 2, 3))
 
         # log-cosh Loss
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_loss = self.__log_cosh_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
             ).mean(dim=(1, 2, 3))
 
         match config.loss_mode_fn:
@@ -233,13 +233,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         masked_losses(
                             losses=vb_losses(
                                 coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"].to(dtype=torch.float32),
-                                x_t=data["noisy_latent_image"].to(dtype=torch.float32),
+                                x_0=data["scaled_latent_image"],
+                                x_t=data["noisy_latent_image"],
                                 t=data["timestep"],
-                                predicted_eps=data["predicted"].to(dtype=torch.float32),
-                                predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                                predicted_eps=data["predicted"],
+                                predicted_var_values=data["predicted_var_values"],
                             ),
-                            mask=batch["latent_mask"].to(dtype=torch.float32),
+                            mask=batch["latent_mask"],
                             unmasked_weight=config.unmasked_weight,
                             normalize_masked_area_loss=config.normalize_masked_area_loss,
                         ).mean(dim=(1, 2, 3))

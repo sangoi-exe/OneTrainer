@@ -1,8 +1,5 @@
 import json
 import traceback
-from typing import Deque
-from torch.nn import Parameter
-
 import os
 import time
 import warnings
@@ -17,13 +14,6 @@ from modules.util.NamedParameterGroup import NamedParameterGroup
 
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-
-BATCH_MODE = True
-"""
-Se BATCH_MODE for False, comporta-se como no código original (usa .item()).
-Se BATCH_MODE for True, as operações são feitas usando Tensores em lote (batch).
-"""
-
 
 class LossTracker:
     """
@@ -43,9 +33,9 @@ class LossTracker:
         self.use_mad: bool = use_mad
 
         # As filas continuarão existindo, mas podem armazenar floats ou Tensores
-        self.mse_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
-        self.mae_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
-        self.log_cosh_losses: Deque[Union[float, Tensor]] = deque(maxlen=window_size)
+        self.mse_losses: deque = deque(maxlen=window_size)
+        self.mae_losses: deque = deque(maxlen=window_size)
+        self.log_cosh_losses: deque = deque(maxlen=window_size)
 
     def update(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> None:
         """
@@ -56,39 +46,56 @@ class LossTracker:
             mae_loss (Tensor): The Mean Absolute Error loss.
             log_cosh_loss (Tensor): The log-cosh loss.
         """
-        if not BATCH_MODE:
-            # Modo original (scalar)
-            self.mse_losses.append(mse_loss.item())
-            self.mae_losses.append(mae_loss.item())
-            self.log_cosh_losses.append(log_cosh_loss.item())
-        else:
-            # Modo batch: podemos armazenar o Tensor inteiro,
-            # ou apenas a média do batch, dependendo da sua necessidade.
-            # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach)
-            # para depois concatenar na hora de computar estatísticas.
-            self.mse_losses.append(mse_loss.detach())
-            self.mae_losses.append(mae_loss.detach())
-            self.log_cosh_losses.append(log_cosh_loss.detach())
+        # Modo batch: podemos armazenar o Tensor inteiro,
+        # ou apenas a média do batch, dependendo da sua necessidade.
+        # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach)
+        # para depois concatenar na hora de computar estatísticas.
+        self.mse_losses.append(mse_loss)
+        self.mae_losses.append(mae_loss)
+        self.log_cosh_losses.append(log_cosh_loss)
+
+        """
+        SE DER OOM, USAR MEAN NESSA BOSTA
+        """
+        # self.mse_losses.append(mse_loss.detach().mean())
+        # self.mae_losses.append(mae_loss.detach().mean())
+        # self.log_cosh_losses.append(log_cosh_loss.detach().mean())
 
     def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
-        try:
-            arr = torch.cat([x.view(-1) if isinstance(x, Tensor) else torch.tensor([x]) for x in values_list], dim=0)
-            if not self.use_mad:
-                mean_val = arr.mean()
-                std_val = arr.std(unbiased=False)
-                return float(mean_val), max(float(std_val), 1e-8)
-            else:
-                median_val = arr.median()
-                abs_dev = torch.abs(arr - median_val)
-                mad_val = abs_dev.median()
-                return median_val.item(), max(mad_val.item(), 1e-8)
-        except RuntimeError as oom:
-            print(f"[LossTracker] OOM detected in compute_stats: fallback to mean-only. Err: {oom}")
-            mean_vals = [x.mean().item() if isinstance(x, Tensor) else x for x in values_list]
-            arr = torch.tensor(mean_vals)
-            return arr.mean().item(), max(arr.std(unbiased=False).item(), 1e-8)
+        """
+        Computes statistics for a list of loss values.
 
-    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> Tuple[float, float, float]:
+        Args:
+            values_list (List[float or Tensor]): The list of loss values (scalar ou Tensor).
+
+        Returns:
+            Tuple[float, float]: If use_mad is False, returns (mean, std).
+                                 If use_mad is True, returns (median, MAD).
+        """
+        if len(values_list) < 2:
+            # Evitar problemas no início do treinamento
+            return 0.0, 1e-8
+
+        # Modo batch: "desempacota" Tensores em um único Tensor
+        # Cada elemento de values_list pode ser shape [] (loss já reduzido)
+        # ou [batch_size]. Aqui assumimos que cada item é [batch_size],
+        # mas se for scalar, a concat ainda funciona com .view(-1).
+        arr = torch.cat([x.view(-1).to(dtype=torch.float32) for x in values_list], dim=0)
+
+        if not self.use_mad:
+            mean_val = arr.mean()
+            std_val = arr.std(unbiased=False)
+            # .item() será chamado apenas quando for realmente necessário obter um float na CPU
+            return mean_val, torch.clamp(std_val, min=1e-8)  # Retorna tensores escalares
+        else:
+            median_val = arr.median()
+            abs_dev = torch.abs(arr - median_val)
+            mad_val = abs_dev.median().values
+            return median_val, torch.clamp(mad_val, min=1e-8)  # Retorna tensores escalares
+
+    def compute_z_scores(
+        self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
+    ) -> Union[Tuple[float, float, float], Tuple[Tensor, Tensor, Tensor]]:
         """
         Computes z-scores for the given loss values.
 
@@ -98,29 +105,18 @@ class LossTracker:
             log_cosh_loss (Tensor): The log-cosh loss.
 
         Returns:
-            Tuple[float, float, float]: The z-scores for MSE, MAE, and log-cosh losses.
+            Union[Tuple[float, float, float], Tuple[Tensor, Tensor, Tensor]]:
+            The z-scores for MSE, MAE, and log-cosh losses.
+            Tensors (shape like input losses).
         """
-        # Primeiro, obtém as estatísticas de cada fila
-        mse_center, mse_scale = self.compute_stats(self.mse_losses)
-        mae_center, mae_scale = self.compute_stats(self.mae_losses)
-        log_cosh_center, log_cosh_scale = self.compute_stats(self.log_cosh_losses)
 
-        # Em modo batch, podemos tirar a média antes de calcular .item()
-        # ou podemos calcular cada z-score como um vetor. Abaixo, fazemos
-        # do jeito mais simples: tiramos a média do batch para manter
-        # a coerência com o retorno float original.
-        if not BATCH_MODE:
-            mse_val = mse_loss.item()
-            mae_val = mae_loss.item()
-            log_cosh_val = log_cosh_loss.item()
-        else:
-            mse_val = mse_loss.mean().item()
-            mae_val = mae_loss.mean().item()
-            log_cosh_val = log_cosh_loss.mean().item()
+        mse_center, mse_scale = self.compute_stats(list(self.mse_losses))
+        mae_center, mae_scale = self.compute_stats(list(self.mae_losses))
+        log_cosh_center, log_cosh_scale = self.compute_stats(list(self.log_cosh_losses))
 
-        mse_z = (mse_val - mse_center) / mse_scale
-        mae_z = (mae_val - mae_center) / mae_scale
-        log_cosh_z = (log_cosh_val - log_cosh_center) / log_cosh_scale
+        mse_z = (mse_loss - mse_center) / mse_scale
+        mae_z = (mae_loss - mae_center) / mae_scale
+        log_cosh_z = (log_cosh_loss - log_cosh_center) / log_cosh_scale
 
         return mse_z, mae_z, log_cosh_z
 
@@ -137,7 +133,7 @@ class DynamicLossStrength:
         use_ema: bool = False,
         ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
-        schedule_params: Optional[Dict[str, Dict[str, float]]] = None,
+        schedule_params: Dict[str, Dict[str, float]] = None,
     ) -> None:
         """
         Initializes the DynamicLossStrength.
@@ -187,9 +183,9 @@ class DynamicLossStrength:
 
     def adjust_weights(
         self,
-        mse_z: float,
-        mae_z: float,
-        log_cosh_z: float,
+        mse_z: Union[float, Tensor],
+        mae_z: Union[float, Tensor],
+        log_cosh_z: Union[float, Tensor],
         config,
         progress,
     ) -> Tuple[float, float, float]:
@@ -203,9 +199,9 @@ class DynamicLossStrength:
         4) Applying Exponential Moving Average (if enabled).
         5) Scheduling weight priorities over training epochs.
 
-        Args:
-            mse_z (float): Z-score for MSE loss.
-            mae_z (float): Z-score for MAE loss.
+        Args: # INÍCIO ALTERAÇÃO: Atualizar docstring
+            mse_z (Union[float, Tensor]): Z-score(s) for MSE loss.
+            mae_z (Union[float, Tensor]): Z-score(s) for MAE loss.
             log_cosh_z (float): Z-score for log-cosh loss.
             config: Configuration object containing training parameters (e.g., total epochs).
             progress: Progress object containing current epoch information.
@@ -214,43 +210,62 @@ class DynamicLossStrength:
             Tuple[float, float, float]: The adjusted weights for MSE, MAE, and log-cosh losses.
         """
         # 1) Clamping z-scores
-        z_scores = {
-            "mse": min(abs(mse_z), self.outlier_threshold),
-            "mae": min(abs(mae_z), self.outlier_threshold),
-            "log_cosh": min(abs(log_cosh_z), self.outlier_threshold),
+        _abs = torch.abs
+        _clamp_max = lambda t, val: torch.clamp(t, max=val)
+        _sum = lambda d: torch.stack(list(d.values())).sum(dim=0)
+        _mean = lambda t: t.mean()  # Usado para obter pesos escalares finais
+        is_tensor_mode = True
+
+
+        # 1) Clamping z-scores (valor absoluto clampado)
+        # Clampa o valor *absoluto* e depois o usa. Ou clampa o z original entre -thresh e +thresh?
+        # O código original fazia min(abs(z), threshold). Vamos manter isso.
+        clamped_abs_z = {
+            "mse": _clamp_max(_abs(mse_z), self.outlier_threshold),
+            "mae": _clamp_max(_abs(mae_z), self.outlier_threshold),
+            "log_cosh": _clamp_max(_abs(log_cosh_z), self.outlier_threshold),
         }
 
-        total_z = sum(z_scores.values())
-        if total_z < 1e-8:
-            total_z = 1.0
+        # 2) Invertendo z-scores relativos
+        # A lógica original era: inv_z = (total_abs_z - abs_z) / total_abs_z
+        # Isso dá peso maior para quem tem z-score absoluto menor.
+        total_abs_z = _sum(clamped_abs_z)
+        # Adicionar epsilon para evitar divisão por zero (importante para tensores)
+        epsilon = 1e-8
+        total_abs_z = total_abs_z + epsilon  # Broadcasting se for tensor
 
-        # 2) Inverting z-scores
-        inverted_z = {loss: (total_z - z) / total_z for loss, z in z_scores.items()}
+        inverted_z = {loss: (total_abs_z - z) / total_abs_z for loss, z in clamped_abs_z.items()}
 
-        sum_inv = sum(inverted_z.values())
-        if sum_inv < 1e-8:
-            sum_inv = 1.0
-
-        # 3) Normalizing inverted z-scores
-        base_weights = {loss: inv_z / sum_inv for loss, inv_z in inverted_z.items()}
+        # 3) Normalizando pesos base
+        # sum_inv_z = (total-z1)/total + (total-z2)/total + (total-z3)/total
+        #           = (3*total - (z1+z2+z3))/total = (3*total - total)/total = 2*total / total = 2 (se total > 0)
+        # Portanto, a soma dos inverted_z deveria ser 2 (ou próximo disso devido ao clamp e epsilon).
+        # Normalizar dividindo pela soma garante que os pesos somem 1.
+        sum_inv_z = _sum(inverted_z) + epsilon
+        base_weights = {loss: inv_z / sum_inv_z for loss, inv_z in inverted_z.items()}
 
         # 4) Exponential Moving Average
         if self.use_ema:
             if not self.initialized:
+                # Inicializa com os pesos atuais (podem ser tensores ou floats)
                 for loss in self.ema_weights:
                     self.ema_weights[loss] = base_weights[loss]
-                self.initialized = True
             else:
                 alpha = 1.0 - self.ema_decay
                 for loss in self.ema_weights:
                     self.ema_weights[loss] = (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
-
+                # self.initialized = True # Cuidado: Se base_weights for Tensor, ema_weights vira Tensor
             # Normaliza as weights do EMA
             sum_ema = sum(self.ema_weights.values())
-            if sum_ema < 1e-8:
-                sum_ema = 1.0
-            normalized_ema_weights = {loss: w / sum_ema for loss, w in self.ema_weights.items()}
+
+            # Se ema_weights for Tensor, sum_ema será Tensor. Adicionar epsilon.
+            sum_ema = sum_ema + epsilon
+            normalized_ema_weights = {
+                loss: w / sum_ema for loss, w in self.ema_weights.items()
+            }  # Broadcasting se Tensor
             base_weights = normalized_ema_weights
+            # Se inicializou com tensores, aqui base_weights são tensores
+            self.initialized = True  # Marcar como inicializado após a primeira atualização/leitura
 
         # 5) Scheduler
         if config.epochs > 1:
@@ -261,20 +276,27 @@ class DynamicLossStrength:
 
         scheduled_factors = {}
         for loss, params in self.schedule_params.items():
+            # params são floats, o resultado é float
             scheduled_factors[loss] = params["start"] * (1 - frac) + params["end"] * frac
 
         # Multiplica cada base weight pelo fator do scheduler
+        # Se base_weights for Tensor, o fator float faz broadcasting
         weighted_weights = {loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights}
 
-        # Normaliza
-        sum_weighted = sum(weighted_weights.values())
-        if sum_weighted < 1e-8:
-            sum_weighted = 1.0
-
+        # Normaliza final
+        sum_weighted = _sum(weighted_weights) + epsilon
         final_weights = {loss: w / sum_weighted for loss, w in weighted_weights.items()}
 
+        # 6) Redução para escalar (se necessário)
+        # A loss final espera pesos escalares. Se estávamos no modo tensor,
+        # pegamos a média dos pesos no batch.
+        if is_tensor_mode:
+            final_weights_scalar = {loss: float(torch.mean(w)) for loss, w in final_weights.items()}
+        else:
+            final_weights_scalar = final_weights  # Já são floats
+
         # Retorna na ordem desejada
-        return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]
+        return final_weights_scalar["mse"], final_weights_scalar["mae"], final_weights_scalar["log_cosh"]
 
     def maybe_log_deltas(self, tensorboard, delta_regularizer, progress):
         if not hasattr(self, "progress") or not self.progress:
@@ -366,47 +388,40 @@ class DeltaPatternRegularizer:
             # print(f"[DeltaPattern] Norma L2 total dos pesos iniciais (Run 2): {initial_norm_run2:.4f}")
 
     def load_reference_pattern(self, pattern_path: str):
-        """Carrega o padrão de delta de referência de um arquivo para a CPU."""
-        self.reference_deltas = {}  # Reseta antes de carregar
+        """Carrega o padrão de delta de referência de um arquivo JSON."""
+        self.reference_deltas = {}
         self.reference_delta_norm = None
-        if not os.path.exists(pattern_path):
-            print(f"Arquivo de padrão de delta de referência não encontrado: {pattern_path}")
+
+        if not os.path.isfile(pattern_path):
+            print(f"[DeltaPattern] Arquivo JSON não encontrado: {pattern_path}")
             return
 
         try:
-            # Garante que carregue na CPU
-            loaded_data = load_file(pattern_path)
-            if isinstance(loaded_data, dict):
-                # Validação simples: verifica se as chaves parecem ser strings e valores são tensores
-                if all(isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in loaded_data.items()):
-                    self.reference_deltas = loaded_data
-                    print(
-                        f"[DeltaPattern] Padrão de delta de referência carregado com {len(self.reference_deltas)} deltas de parâmetros."
-                    )
-                    # Calcula a norma L2 total dos deltas carregados (já estão em CPU)
-                    self.reference_delta_norm = self._calculate_total_norm(self.reference_deltas)
-                    print(f"[DeltaPattern] Norma L2 total do delta de referência: {self.reference_delta_norm:.4f}")
-                else:
-                    print(
-                        f"Arquivo de padrão de delta carregado tem formato de chave/valor inesperado: {pattern_path}",
-                        UserWarning,
-                    )
-                    self.reference_deltas = {}  # Limpa se o formato estiver incorreto
-            else:
-                print(f"Arquivo de padrão de delta carregado não é um dicionário: {pattern_path}")
-        except Exception as e:
-            print(f"Falha ao carregar padrão de delta de referência de {pattern_path}: {e}")
-            self.reference_deltas = {}  # Limpa em caso de erro
+            with open(pattern_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
 
-    def _calculate_total_norm(self, weight_dict: Dict[str, Tensor]) -> float:
-        """Calcula a norma L2 total sobre todos os tensores no dicionário (assume que estão em CPU)."""
-        if not weight_dict:
-            return 0.0
-        total_norm_sq = torch.tensor(0.0, dtype=torch.float64)  # Usa float64 para precisão na soma
-        for tensor in weight_dict.values():
-            # Garante que o tensor está em CPU e calcula a norma quadrada
-            total_norm_sq += torch.norm(tensor.float().cpu(), p=2).pow(2).double()
-        return torch.sqrt(total_norm_sq).item()
+            flat_dict = {}
+            for epoch_key, metrics in json_data.items():
+                for param_name, value in metrics.items():
+                    full_key = f"{epoch_key}/{param_name}"
+                    flat_dict[full_key] = torch.tensor(value, dtype=torch.float32, device="cpu")
+
+            if flat_dict:
+                self.reference_deltas = flat_dict
+                self.reference_delta_norm = self._calculate_total_norm(self.reference_deltas)
+                epoch_numbers = [
+                    int(k.split("/")[0].replace("epoch_", "")) for k in flat_dict.keys() if k.startswith("epoch_")
+                ]
+                self.max_epoch_loaded = max(epoch_numbers) if epoch_numbers else None
+                print(f"[DeltaPattern] JSON '{pattern_path}' carregado com {len(flat_dict)} deltas.")
+                print(f"[DeltaPattern] Último epoch registrado no JSON: {self.max_epoch_loaded}")
+                print(f"[DeltaPattern] Norma L2 total do delta de referência: {self.reference_delta_norm:.4f}")
+            else:
+                print("[DeltaPattern] JSON estava vazio ou mal formatado.")
+        except Exception as e:
+            print(f"[DeltaPattern] Falha ao carregar JSON de deltas: {e}")
+            traceback.print_exc()
+            self.reference_deltas = {}
 
     def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
         """
@@ -414,84 +429,147 @@ class DeltaPatternRegularizer:
         e o delta de referência (carregado da Run 1).
         Retorna um tensor escalar no device do primeiro parâmetro do modelo.
         """
-        # Tenta obter o device do primeiro parâmetro para o tensor de retorno (ou usa CPU como fallback)
         try:
-            _, _, target_device = next(self._iterate_params())
+            # INÍCIO ALTERAÇÃO: Obter device e dtype do modelo
+            first_param = next(self.model.parameters())
+            target_device = first_param.device
+            target_dtype = first_param.dtype # Assume bf16 se o modelo estiver em bf16
+            # FIM ALTERAÇÃO
         except StopIteration:
             target_device = torch.device("cpu")
+            target_dtype = torch.float32 # Fallback dtype
             print(
-                "[DeltaPattern] Não foi possível determinar o device do modelo para retornar a penalidade. Usando CPU.",
+                "[DeltaPattern] Não foi possível determinar o device/dtype do modelo. Usando CPU/float32.",
                 UserWarning,
             )
 
-        # Verifica se temos tudo necessário
-        if not self.reference_deltas or not self.initial_weights_run2:
-            if not self.reference_deltas:
-                # Log apenas uma vez ou periodicamente para não poluir
-                pass  # print("[DeltaPattern] Aviso: Padrão de delta de referência não carregado. Penalidade será 0.")
-            if not self.initial_weights_run2:
-                # Log apenas uma vez ou periodicamente
-                pass  # print("[DeltaPattern] Aviso: Pesos iniciais da Run 2 não capturados. Penalidade será 0.")
-            self.current_total_delta_norm = 0.0  # Reseta norma atual se não puder calcular
-            return torch.tensor(0.0, device=target_device)
+        if hasattr(self, "max_epoch_loaded") and hasattr(self.model, "train_progress"):
+            current_epoch = self.model.train_progress.epoch
+            if self.max_epoch_loaded is not None and current_epoch > self.max_epoch_loaded:
+                print(f"[DeltaPattern] Aviso: Epoch atual ({current_epoch}) excede o máximo registrado no padrão ({self.max_epoch_loaded}). Penalidade será ignorada.")
 
-        total_penalty_cpu = torch.tensor(0.0, dtype=torch.float32, device="cpu")  # Acumula MSE em CPU
-        current_deltas_for_norm = {}  # Guarda deltas atuais (em CPU) para cálculo da norma L2
-        num_params_matched = 0
+        if not self.reference_deltas or not self.initial_weights_run2:
+            self.current_total_delta_norm = None
+            return torch.tensor(0.0, device=target_device, dtype=target_dtype) # Usa dtype do modelo
 
         try:
-            # INÍCIO ALTERAÇÃO: Cache dos tensores já no device
-            target_device = next(self.model.parameters()).device
             initial_run2_device = {
-                k: v.to(dtype=torch.float32, device=target_device)
+                k: v.to(device=target_device, dtype=target_dtype, non_blocking=True)
                 for k, v in self.initial_weights_run2.items()
             }
             ref_delta_device = {
-                k: v.to(dtype=torch.float32, device=target_device)
+                k: v.to(device=target_device, dtype=target_dtype, non_blocking=True)
                 for k, v in self.reference_deltas.items()
             }
-            # FIM ALTERAÇÃO
+        except Exception as e:
+             print(f"[DeltaPattern] Erro ao mover/castar pesos iniciais/referência para {target_device}/{target_dtype}: {e}")
+             traceback.print_exc()
+             return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
-            for key, current_param, device in self._iterate_params():
+        # INÍCIO ALTERAÇÃO: Acumular penalidade e deltas na GPU
+        total_penalty_gpu = torch.tensor(0.0, dtype=torch.float32, device=target_device)
+        total_elements = 0
+        current_deltas_gpu = {} # Guarda deltas atuais na GPU para cálculo da norma L2
+        # FIM ALTERAÇÃO
+        num_params_matched = 0
+
+        try:
+            # REMOVIDO: Cache redundante que estava dentro do try original
+            # target_device = next(self.model.parameters()).device
+            # initial_run2_device = { ... }
+            # ref_delta_device = { ... }
+
+            for key, current_param, _ in self._iterate_params(): # device não é mais necessário aqui
+                # Certifica-se que o parâmetro atual está no dtype correto (deve estar, mas por segurança)
+                current_param_detached = current_param.detach().to(dtype=target_dtype)
+
+                # Loop interno simplificado: procura pela chave completa primeiro
+                ref_key_found = None
                 if key in ref_delta_device and key in initial_run2_device:
+                     ref_key_found = key
+                else:
+                    # Fallback: procurar por nome do parâmetro após a "/" (menos eficiente)
+                    for ref_key in ref_delta_device:
+                        if "/" in ref_key:
+                            _, param_name = ref_key.split("/", 1)
+                        else:
+                            param_name = ref_key
+
+                        if param_name == key and key in initial_run2_device:
+                            ref_key_found = ref_key
+                            print(f"[DeltaPattern] Fallback de nome de parâmetro: usando '{ref_key}' para '{key}'")
+                            break # Encontrou um match pelo nome
+
+                if ref_key_found:
+                    ref_delta = ref_delta_device[ref_key_found]
                     initial_weight_run2 = initial_run2_device[key]
-                    ref_delta = ref_delta_device[key]
 
-                    current_delta = current_param.detach().to(dtype=torch.float32) - initial_weight_run2
-
-                    penalty_term = torch.nn.functional.mse_loss(current_delta, ref_delta)
-
-                    # INÍCIO ALTERAÇÃO: evitar cópia para CPU desnecessária
-                    total_penalty_cpu += penalty_term.to("cpu")
-                    current_deltas_for_norm[key] = current_delta.to("cpu")
+                    # INÍCIO ALTERAÇÃO: Calcular delta no dtype do modelo (e.g., bf16)
+                    # current_delta = current_param.detach().to(dtype=torch.float32) - initial_weight_run2 # Removido cast float32
+                    current_delta = current_param_detached - initial_weight_run2
                     # FIM ALTERAÇÃO
 
+                    # INÍCIO ALTERAÇÃO: Calcular MSE loss. Cast para float32 APENAS para MSE se necessário.
+                    # O MSE pode ser mais estável em float32.
+                    penalty_term = torch.nn.functional.mse_loss(
+                        current_delta.to(torch.float32), # Cast para float32 aqui
+                        ref_delta.to(torch.float32)      # Cast para float32 aqui
+                    )
+                    # FIM ALTERAÇÃO
+
+                    # INÍCIO ALTERAÇÃO: Acumular na GPU e guardar delta na GPU
+                    # total_penalty_cpu += penalty_term.to("cpu") # Removido
+                    total_penalty_gpu += penalty_term * current_delta.numel()
+                    total_elements += current_delta.numel()
+
+                    # current_deltas_for_norm[key] = current_delta.to("cpu") # Removido
+                    current_deltas_gpu[key] = current_delta # Armazena delta (bf16) na GPU
+                    # FIM ALTERAÇÃO
                     num_params_matched += 1
+                    # break # Removido: O break só deve ocorrer no loop interno de fallback
 
         except Exception as e:
             print(f"[DeltaPattern] Erro durante compute_penalty ao iterar parâmetros: {e}")
             traceback.print_exc()
-            self.current_total_delta_norm = None  # Invalida norma cacheada
-            return torch.tensor(0.0, device=target_device)  # Retorna 0 em caso de erro
+            self.current_total_delta_norm = None
+            return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
         if num_params_matched > 0:
-            # Calcula a norma L2 total do delta *atual* usando os deltas em CPU
-            self.current_total_delta_norm = self._calculate_total_norm(current_deltas_for_norm)
-            # Calcula a penalidade média pelos parâmetros comparados
-            average_penalty_cpu = total_penalty_cpu / num_params_matched
+            # INÍCIO ALTERAÇÃO: Calcular norma L2 na GPU e depois mover para CPU
+            # Calcula a norma L2 total do delta *atual* usando os deltas na GPU
+            # self.current_total_delta_norm = self._calculate_total_norm(current_deltas_for_norm) # Modificado
+            current_norm_sq_gpu = torch.tensor(0.0, dtype=torch.float64, device=target_device) # float64 para precisão
+            for delta_gpu in current_deltas_gpu.values():
+                delta_norm_sq = torch.norm(delta_gpu.to(torch.float32), p=2).pow(2).double()
+                current_norm_sq_gpu += delta_norm_sq
+            self.current_total_delta_norm = torch.sqrt(current_norm_sq_gpu).item() # .item() move escalar final para CPU
+            # FIM ALTERAÇÃO
+
+            # Calcula a penalidade média pelos parâmetros comparados (ainda na GPU)
+            average_penalty_gpu = total_penalty_gpu / total_elements
         else:
             self.current_total_delta_norm = 0.0
-            # Avisa se não houve correspondência, mas tínhamos os dados
             if self.reference_deltas and self.initial_weights_run2:
-                print(
-                    "[DeltaPattern] Nenhum parâmetro correspondente encontrado entre o modelo atual, pesos iniciais da Run 2 e padrão de delta de referência.",
-                    UserWarning,
-                )
-            average_penalty_cpu = torch.tensor(0.0, device="cpu")
+                 print("[DeltaPattern] Nenhum parâmetro correspondente encontrado...", UserWarning) # Mensagem existente
+            average_penalty_gpu = torch.tensor(0.0, device=target_device, dtype=torch.float32) # Penalidade média 0 na GPU
 
-        # Retorna a penalidade média ponderada, movida para o device alvo
-        final_penalty = (lambda_weight * average_penalty_cpu).to(target_device)
+        # Retorna a penalidade média ponderada, no device e dtype originais do modelo
+        final_penalty = (lambda_weight * average_penalty_gpu).to(dtype=target_dtype) # Cast final para dtype do modelo
         return final_penalty
+
+    # INÍCIO ALTERAÇÃO: Modificar _calculate_total_norm para aceitar device
+    def _calculate_total_norm(self, weight_dict: Dict[str, Tensor], device: torch.device = torch.device('cpu')) -> float:
+        """Calcula a norma L2 total sobre todos os tensores no dicionário."""
+        if not weight_dict:
+            return 0.0
+        # Usa float64 para precisão na soma, no device especificado
+        total_norm_sq = torch.tensor(0.0, dtype=torch.float64, device=device)
+        for tensor in weight_dict.values():
+            # Garante que o tensor está no device correto e calcula a norma quadrada
+            # Usa .float() para norm que pode não suportar bf16 diretamente
+            total_norm_sq += torch.norm(tensor.to(device=device, non_blocking=True).float(), p=2).pow(2).double()
+        return torch.sqrt(total_norm_sq).item() # .item() move para CPU
+    # FIM ALTERAÇÃO
 
     def get_delta_norms(self) -> Tuple[Optional[float], Optional[float]]:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
@@ -508,6 +586,7 @@ class DeltaPatternRegularizer:
 
         epoch_key = f"epoch_{epoch}"
         self.delta_log_by_module[epoch_key] = {}
+        # do_tensorboard = hasattr(self, "tensorboard") and self.tensorboard is not None
 
         # INÍCIO ALTERAÇÃO: iterar sobre parâmetros reais e agrupar por prefixo
         group_norms: Dict[str, float] = {}
@@ -518,7 +597,7 @@ class DeltaPatternRegularizer:
                 continue
 
             initial_weight = self.initial_weights_run1[name].to(dtype=torch.float32, device=current_param.device)
-            delta = current_param.detach().float() - initial_weight
+            delta = current_param.detach().to(dtype=torch.float32) - initial_weight
 
             # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
             prefix = name.split(".")[0]  # ou use um parser mais detalhado se quiser algo como 'up_blocks_2_resnets_1'
@@ -534,6 +613,8 @@ class DeltaPatternRegularizer:
             delta_norm = norm_sq ** 0.5 if count > 0 else 0.0
             self.delta_log_by_module[epoch_key][prefix] = delta_norm
         # FIM ALTERAÇÃO
+        # if do_tensorboard:
+        #     self.tensorboard.add_scalar(f"delta/by_group/{prefix}", delta_norm, epoch)
 
 
         print(f"[DeltaPattern] Deltas logados para epoch {epoch_key}.")

@@ -562,7 +562,7 @@ class DoRAModule(LoRAModule):
             return
 
         super().initialize_weights()  # Calls create_layer, inits lora_down/up/alpha
-        
+
         if not self._initialized:
             return  # Stop if LoRA init failed
 
@@ -583,12 +583,19 @@ class DoRAModule(LoRAModule):
 
         del orig_weight
 
+
     def check_initialized(self):
         super().check_initialized()
         assert self.dora_scale is not None, f"DoRA scale not initialized for {self.prefix}"
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
+
+        if self.op is None:  # Se a camada original não era suportada
+            print(
+                f"Aviso: Pulando forward de DoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original."
+            )
+            return self.orig_forward(x)
 
         A = self.lora_down.weight
         B = self.lora_up.weight
@@ -894,6 +901,7 @@ class LoRAModuleWrapper:
         print(f"  - Created: {modules_created_count} PEFT modules.")
         print(f"  - Skipped (Filter): {modules_skipped_filter} Linear/Conv2d modules.")
         print(f"  - Skipped (Type): {modules_skipped_type} non-Linear/Conv2d modules.")
+        #self.generate_keys_by_block_file()
         return lora_modules
 
     def load_state_dict(self, state_dict: dict[str, Tensor]):
