@@ -83,7 +83,6 @@ class BaseModelSetup(
         config: TrainConfig,
         progress: TrainProgress,
         tensorboard: SummaryWriter,
-        delta_pattern: DeltaPatternRegularizer,
     ) -> Tensor:
         pass
 

@@ -47,20 +47,11 @@ class LossTracker:
             mae_loss (Tensor): The Mean Absolute Error loss.
             log_cosh_loss (Tensor): The log-cosh loss.
         """
-        # Modo batch: podemos armazenar o Tensor inteiro,
-        # ou apenas a média do batch, dependendo da sua necessidade.
-        # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach)
-        # para depois concatenar na hora de computar estatísticas.
-        # self.mse_losses.append(mse_loss)
-        # self.mae_losses.append(mae_loss)
-        # self.log_cosh_losses.append(log_cosh_loss)
 
-        """
-        SE DER OOM, USAR MEAN NESSA BOSTA
-        """
-        self.mse_losses.append(float(mse_loss.detach().mean()))
-        self.mae_losses.append(float(mae_loss.detach().mean()))
-        self.log_cosh_losses.append(float(log_cosh_loss.detach().mean()))
+        # Modo batch: armazena o tensor inteiro mas já movido para a CPU
+        self.mse_losses.append(mse_loss.detach().cpu())
+        self.mae_losses.append(mae_loss.detach().cpu())
+        self.log_cosh_losses.append(log_cosh_loss.detach().cpu())
 
     def compute_stats(
         self, values_list: List[Union[float, Tensor]]

@@ -545,16 +545,21 @@ class LoRAModule(PeftBase):
 class DoRAModule(LoRAModule):
     """Weight-decomposed low rank adaptation."""
 
+    # dora_num_dims is implicitly handled by norm calculation now
     dora_scale: Parameter | None  # Use Parameter for trainable scale
     norm_epsilon: bool
     train_device: torch.device  # Add train_device attribute
 
     def __init__(self, *args, **kwargs):
-        self.norm_epsilon = bool(kwargs.pop('norm_epsilon', False))
-        self.train_device = kwargs.pop("train_device", torch.device("cpu"))  # Default device
+        # Pop DoRA specific kwargs before calling super().__init__
+        self.norm_epsilon = kwargs.pop("norm_epsilon", 1e-6)  # Default epsilon
+        self.train_device = kwargs.pop(
+            "train_device", torch.device("cpu")
+        )  # Default device
         self.dora_scale = None  # Initialize as None
-        self._cached_orig_weight = None
+        # Call LoRAModule's __init__ with remaining args/kwargs
         super().__init__(*args, **kwargs)
+        # Note: initialize_weights is called by super() if orig_module exists
 
     def initialize_weights(self):
         if self._initialized:
@@ -562,74 +567,142 @@ class DoRAModule(LoRAModule):
         if self._orig_module is None:
             return
 
-        super().initialize_weights()  # Calls create_layer, inits lora_down/up/alpha
-
+        # 1. Initialize LoRA components first
+        super().initialize_weights()  # Calls create_layer, inits lora_down/up
         if not self._initialized:
             return  # Stop if LoRA init failed
 
-        orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
-
-        # Cálculo de dora_num_dims restaurado do original
-        self.dora_num_dims = orig_weight.dim() - 1
-        # Cálculo de dora_scale restaurado do original, usando dora_num_dims
-        self.dora_scale = nn.Parameter(
-            torch.norm(
-                orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
-                dim=1, keepdim=True)
-            .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
-            .transpose(1, 0)
-            .to(device=self.orig_module.weight.device, dtype=self.orig_module.weight.dtype) # Garante device/dtype corretos
+        # 2. Initialize DoRA specific scale
+        # Use float32 for norm calculation stability, then cast back
+        orig_weight = get_unquantized_weight(
+            self.orig_module, torch.float32, self.train_device
         )
-        # FIM ALTERAÇÃO
+        eps = torch.finfo(orig_weight.dtype).eps if self.norm_epsilon else 0.0
 
+        # Calculate norm based on layer type (more explicit version from modified file)
+        if isinstance(self.orig_module, nn.Conv2d):
+            # Norm per output filter (output channel dim 0)
+            norm = (
+                torch.linalg.vector_norm(
+                    orig_weight, ord=2, dim=(1, 2, 3), keepdim=True
+                )
+                + eps
+            )
+        elif isinstance(self.orig_module, nn.Linear):
+            # Norm per output neuron (output channel dim 0) -> weight dims are (out, in)
+            norm = (
+                torch.linalg.vector_norm(orig_weight, ord=2, dim=1, keepdim=True) + eps
+            )
+            # Alternative for Linear (like original): norm per column (input feature)
+            # norm = torch.linalg.vector_norm(orig_weight, ord=2, dim=0, keepdim=True) + eps
+            # Let's stick to norm per output neuron, seems more common for magnitude scaling
+        else:
+            # Fallback or should not happen due to initial checks
+            print(
+                f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA init for {self.prefix}"
+            )
+            norm = (
+                torch.linalg.vector_norm(orig_weight.flatten(), ord=2) + eps
+            )  # Norm of flattened tensor
+            # Reshape might be needed depending on how scale is used, but this is fallback
+            norm = norm.reshape(1 for _ in orig_weight.dim())  # Make it broadcastable
+
+        # Create scale Parameter on the correct device and dtype
+        self.dora_scale = Parameter(
+            norm.to(
+                device=self.orig_module.weight.device,
+                dtype=self.orig_module.weight.dtype,
+            )
+        )
+        # self._initialized is already True from super().initialize_weights()
         del orig_weight
-
 
     def check_initialized(self):
         super().check_initialized()
-        assert self.dora_scale is not None, f"DoRA scale not initialized for {self.prefix}"
+        assert (
+            self.dora_scale is not None
+        ), f"DoRA scale not initialized for {self.prefix}"
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-
-        if self.op is None:  # Se a camada original não era suportada
+        # que aplica dropout no input e calcula norma corretamente
+        if self.op is None:  # If the original layer was not supported
             print(
-                f"Aviso: Pulando forward de DoRA para {self.prefix} (tipo de camada não suportado). Retornando saída original."
+                f"Warning: Skipping DoRA forward for {self.prefix} (unsupported layer type). Returning original output."
             )
-            return self.orig_forward(x)
+            # Still need to apply dropout if it's part of the DoRA spec
+            return self.orig_forward(
+                self.dropout(x)
+            )  # Apply dropout as per DoRA paper mention
 
+        # Get components
         A = self.lora_down.weight
         B = self.lora_up.weight
+        # Calculate LoRA delta, use float32 for intermediate calcs if needed
+        lora_dtype = A.dtype
+        orig_weight = get_unquantized_weight(
+            self.orig_module, lora_dtype, self.train_device
+        )
 
-        if self._cached_orig_weight is None or self._cached_orig_weight.device != x.device:
-            self._cached_orig_weight = get_unquantized_weight(
-                self.orig_module, A.dtype, x.device
-            ).detach()                                          
-        orig_weight = self._cached_orig_weight
+        # Calculate the LoRA modification scaled by alpha/rank
+        lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
 
-        WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
-        
-        del orig_weight
-        # A norm should never really end up zero at any point, but epsilon just
-        # to be safe if we underflow or something. Also, as per section 4.3 of
-        # the paper, we treat the norm as a constant for the purposes of
-        # backpropagation in order to save VRAM (to do this, we detach it from
-        # the gradient graph).
-        eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        norm = WP.detach() \
-                 .transpose(0, 1) \
-                 .reshape(WP.shape[1], -1) \
-                 .norm(dim=1, keepdim=True) \
-                 .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
-                 .transpose(0, 1) + eps
-        WP = self.dora_scale * (WP / norm)
-        # In the DoRA codebase (and thus the paper results), they perform
-        # dropout on the *input*, rather than between layers, so we duplicate
-        # that here.
-        return self.op(self.dropout(x),
-                       WP,
-                       self.orig_module.bias,
-                       **self.layer_kwargs)
+        # Calculate the adapted weight matrix W' = W + deltaW
+        adapted_weight = orig_weight + lora_delta_w
+
+        # Calculate the norm of the adapted weight matrix W'
+        # Use float32 for stability, detach for backprop as per paper
+        adapted_weight_f32 = adapted_weight.to(torch.float32)
+        eps = torch.finfo(adapted_weight_f32.dtype).eps if self.norm_epsilon else 0.0
+
+        if isinstance(self.orig_module, nn.Conv2d):
+            norm = (
+                torch.linalg.vector_norm(
+                    adapted_weight_f32.detach(), ord=2, dim=(1, 2, 3), keepdim=True
+                )
+                + eps
+            )
+        elif isinstance(self.orig_module, nn.Linear):
+            norm = (
+                torch.linalg.vector_norm(
+                    adapted_weight_f32.detach(), ord=2, dim=1, keepdim=True
+                )
+                + eps
+            )  # Per output neuron
+            # norm = torch.linalg.vector_norm(adapted_weight_f32.detach(), ord=2, dim=0, keepdim=True) + eps # Per input feature (alternative)
+        else:
+            # Fallback - should not happen
+            norm = (
+                torch.linalg.vector_norm(adapted_weight_f32.detach().flatten(), ord=2)
+                + eps
+            )
+            norm = norm.reshape(1 for _ in adapted_weight_f32.dim())
+
+        # Normalize the adapted weight and scale by DoRA magnitude
+        # Ensure norm is on the correct device and dtype before division
+        norm = norm.to(device=adapted_weight.device, dtype=adapted_weight.dtype)
+        final_weight = self.dora_scale * (adapted_weight / norm)
+
+        # Apply dropout to input x as mentioned in DoRA implementations
+        x_dropout = self.dropout(x)
+
+        # Perform the original operation with the final DoRA weight
+        output = self.op(
+            x_dropout,
+            final_weight,
+            self.orig_module.bias,  # Use original bias
+            **self.layer_kwargs,
+        )
+
+        del (
+            orig_weight,
+            lora_delta_w,
+            adapted_weight,
+            adapted_weight_f32,
+            norm,
+            final_weight,
+        )  # Memory cleanup
+        return output
 
 DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()

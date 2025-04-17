@@ -73,7 +73,6 @@ class GenericTrainer(BaseTrainer):
             super()._start_tensorboard()
 
         self.model = None
-        self.delta_pattern = None
         self.one_step_trained = False
 
         self.grad_hook_handles = []

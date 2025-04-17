@@ -38,7 +38,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     config: TrainConfig | None  # Adicionado tipo para clareza
     progress: TrainProgress | None  # Adicionado tipo para clareza
     tensorboard: SummaryWriter | None  # Adicionado tipo para clareza
-    delta_pattern: DeltaPatternRegularizer | None
 
     def __init__(self):
         super().__init__()
@@ -83,11 +82,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = masked_losses(
                 losses=F.mse_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                     reduction="none",
                 ),
-                mask=batch["latent_mask"].to(dtype=torch.float32),
+                mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
@@ -96,11 +95,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = masked_losses(
                 losses=F.l1_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                     reduction="none",
                 ),
-                mask=batch["latent_mask"].to(dtype=torch.float32),
+                mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
@@ -109,10 +108,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_loss = masked_losses(
                 losses=self.__log_cosh_loss(
-                    data["predicted"].to(dtype=torch.float32),
-                    data["target"].to(dtype=torch.float32),
+                    data["predicted"],
+                    data["target"],
                 ),
-                mask=batch["latent_mask"].to(dtype=torch.float32),
+                mask=batch["latent_mask"],
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
             ).mean([1, 2, 3])
@@ -131,13 +130,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         masked_losses(
                             losses=vb_losses(
                                 coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"].to(dtype=torch.float32),
-                                x_t=data["noisy_latent_image"].to(dtype=torch.float32),
+                                x_0=data["scaled_latent_image"],
+                                x_t=data["noisy_latent_image"],
                                 t=data["timestep"],
-                                predicted_eps=data["predicted"].to(dtype=torch.float32),
-                                predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                                predicted_eps=data["predicted"],
+                                predicted_var_values=data["predicted_var_values"],
                             ),
-                            mask=batch["latent_mask"].to(dtype=torch.float32),
+                            mask=batch["latent_mask"],
                             unmasked_weight=config.unmasked_weight,
                             normalize_masked_area_loss=config.normalize_masked_area_loss,
                         ).mean([1, 2, 3])
@@ -155,8 +154,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
                     mse_z, mae_z, log_cosh_z, config, progress
                 )
-
-                self.dynamic_loss_strengthing.maybe_log_deltas(self.tensorboard, self.delta_pattern, self.progress)
 
                 losses = (
                     mse_loss * mse_weight * config.mse_strength
@@ -200,24 +197,24 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # MSE/L2 Loss
         if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
             mse_loss = F.mse_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
                 reduction="none",
             ).mean([1, 2, 3])
 
         # MAE/L1 Loss
         if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
             mae_loss = F.l1_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
                 reduction="none",
             ).mean([1, 2, 3])
 
         # log-cosh Loss
         if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
             log_cosh_loss = self.__log_cosh_loss(
-                data["predicted"].to(dtype=torch.float32),
-                data["target"].to(dtype=torch.float32),
+                data["predicted"],
+                data["target"],
             ).mean([1, 2, 3])
 
         match config.loss_mode_fn:
@@ -234,13 +231,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         masked_losses(
                             losses=vb_losses(
                                 coefficients=self.__coefficients,
-                                x_0=data["scaled_latent_image"].to(dtype=torch.float32),
-                                x_t=data["noisy_latent_image"].to(dtype=torch.float32),
+                                x_0=data["scaled_latent_image"],
+                                x_t=data["noisy_latent_image"],
                                 t=data["timestep"],
-                                predicted_eps=data["predicted"].to(dtype=torch.float32),
-                                predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
+                                predicted_eps=data["predicted"],
+                                predicted_var_values=data["predicted_var_values"],
                             ),
-                            mask=batch["latent_mask"].to(dtype=torch.float32),
+                            mask=batch["latent_mask"],
                             unmasked_weight=config.unmasked_weight,
                             normalize_masked_area_loss=config.normalize_masked_area_loss,
                         ).mean([1, 2, 3])
@@ -450,55 +447,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.progress = progress
         self.tensorboard = tensorboard
         delta_instance: DeltaPatternRegularizer | None = getattr(model, 'deltas', None)
-
-        if self.delta_pattern is None and (config.delta_pattern_save_it or config.delta_pattern_use_it):
-            # Verifica se NamedParameterGroupCollection foi importado corretamente
-            if NamedParameterGroupCollection is None:
-                raise ImportError(
-                    "NamedParameterGroupCollection não pôde ser importado. Verifique a estrutura do projeto/dependências."
-                )
-            # Tenta acessar a coleção de parâmetros do modelo. Ajuste o nome do atributo se necessário.
-            param_collection = getattr(model, "parameter_groups", None)
-            if not isinstance(param_collection, NamedParameterGroupCollection):
-                # Tenta outros nomes comuns ou gera erro
-                param_collection = getattr(model, "param_groups", None)  # Exemplo alternativo
-                param_collection = getattr(model, "_parameter_groups", None)  # Outro exemplo
-                if not isinstance(param_collection, NamedParameterGroupCollection):
-                    # Verifica se 'parameters' é uma NamedParameterGroupCollection (caso comum em OneTrainer)
-                    param_collection_direct = getattr(model, "parameters", None)
-                    if isinstance(param_collection_direct, NamedParameterGroupCollection):
-                        param_collection = param_collection_direct
-                    else:
-                        print(
-                            f"[DeltaPattern] Atributos tentados: 'parameter_groups', 'param_groups', '_parameter_groups', 'parameters'"
-                        )
-                        raise AttributeError(
-                            "Não foi possível encontrar NamedParameterGroupCollection no modelo. Verifique o nome do atributo que contém os grupos de parâmetros (p. ex., 'parameter_groups', 'parameters') na classe do seu modelo e ajuste em LossesMixin.py"
-                        )
-
-            self.delta_pattern = DeltaPatternRegularizer(model, param_collection)
-
-            if config.delta_pattern_save_it:
-                print("[DeltaPattern] Capturando pesos iniciais para cálculo do delta (Run 1).")
-                self.delta_pattern.capture_weights()  # Captura pesos iniciais da Run 1
-
-            if config.delta_pattern_use_it:
-                if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
-                    print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
-                    self.delta_pattern.load_reference_pattern(config.delta_pattern_path)  # Carrega deltas da Run 1
-                    if self.delta_pattern.reference_deltas:  # Verifica se carregou com sucesso
-                        print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
-                        self.delta_pattern.capture_initial_weights_run2()  # Captura pesos iniciais da Run 2
-                    else:
-                        print(
-                            f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada."
-                        )
-                        config.delta_pattern_use_it = False  # Desativa se não conseguiu carregar
-                else:
-                    print(
-                        f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada."
-                    )
-                    config.delta_pattern_use_it = False  # Desativa se o caminho não existe
 
         loss_weight = batch["loss_weight"]
 
