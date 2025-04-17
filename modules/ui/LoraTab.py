@@ -175,15 +175,25 @@ class LoraTab:
         # Ocupa colunas 1 a 4 para consistência com outros campos de texto longos.
         blacklist_entry.grid(row=7, column=1, columnspan=4, sticky="ew")
 
-        # Delta Pattern Path (Novo) - Inserido na linha 8
-        components.label(master, 8, 0, "Delta Pattern Path",
+        # Gradient Checkpointing Layers (Novo) - Inserido na linha 8
+        components.label(master, 8, 0, "Grad Ckpt Layers", # Label abreviada para espaço
+                         tooltip="Comma-separated list of layer patterns to apply gradient checkpointing to. Leave empty for default behavior (usually ON for specific blocks).")
+        gradient_ckpt_entry = components.entry(
+            master, 8, 1, self.ui_state, "gradient_checkpointing_layers",
+            tooltip="Define specific layers for gradient checkpointing. Example: 'mid_block,up_blocks.1'"
+        )
+        # Ocupa colunas 1 a 4.
+        gradient_ckpt_entry.grid(row=8, column=1, columnspan=4, sticky="ew")
+
+        # Delta Pattern Path - Movido para linha 9
+        components.label(master, 9, 0, "Delta Pattern Path",
                          tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
         delta_path_entry = components.file_entry(
-            master, 8, 1, self.ui_state, "delta_pattern_path"
+            master, 9, 1, self.ui_state, "delta_pattern_path"
             # Não há modificador de path específico aqui, assume-se que o componente lida com o caminho completo.
         )
         # Ocupa colunas 1 a 4.
-        delta_path_entry.grid(row=8, column=1, columnspan=4, sticky="ew")
+        delta_path_entry.grid(row=9, column=1, columnspan=4, sticky="ew")
 				
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits
