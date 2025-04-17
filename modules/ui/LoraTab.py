@@ -33,7 +33,6 @@ class LoraTab:
         self.prior_selected = None
         self.scroll_frame = None
         self.options_frame = None
-        self.custom_lora_layers = ""
 
         self.refresh_ui()
 
@@ -114,46 +113,80 @@ class LoraTab:
                              tooltip="Add an epsilon to the norm divison calculation in DoRA. Can aid in training stability, and also acts as regularization.")
             components.switch(master, 2, 4, self.ui_state, "lora_decompose_norm_epsilon")
 
-        # lora rank
+        # Movido para linha 3 para acomodar os novos campos relacionados ao Delta Pattern
         components.label(master, 2, 0, f"{name} alpha",
-                         tooltip="The alpha parameter used when creating a new f{name}")
+                         tooltip=f"The alpha parameter used when creating a new {name}")
         components.entry(master, 2, 1, self.ui_state, "lora_alpha")
 
         # Dropout Percentage
+        # Movido para linha 3
         components.label(master, 3, 0, "Dropout Probability",
-                         tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.")
+                         tooltip="Dropout probability. Helps with overfitting. 0 disables, 1 maximum.")
         components.entry(master, 3, 1, self.ui_state, "dropout_probability")
 
+        # Use Delta Pattern (Novo) - Inserido na linha 3, colunas 3 e 4
+        components.label(master, 3, 3, "Use Delta Pattern",
+                         tooltip="Apply a pre-defined delta pattern during training.")
+        components.switch(master, 3, 4, self.ui_state, "delta_pattern_use_it")
+
         # lora weight dtype
+        # Movido para linha 4
         components.label(master, 4, 0, f"{name} Weight Data Type",
-                         tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision")
-        components.options_kv(master, 4, 1, [
-            ("float32", DataType.FLOAT_32),
-            ("bfloat16", DataType.BFLOAT_16),
-        ], self.ui_state, "lora_weight_dtype")
+                         tooltip=f"The {name} weight data type. Can reduce memory, but reduces precision")
 
         # For use with additional embeddings.
+        # Save Delta Pattern (Novo) - Inserido na linha 4, colunas 3 e 4
+        components.label(master, 4, 3, "Save Delta Pattern",
+                         tooltip="Save the calculated delta pattern after training.")
+        components.switch(master, 4, 4, self.ui_state, "delta_pattern_save_it")
+
+        # Movido para linha 5
         components.label(master, 5, 0, "Bundle Embeddings",
-                         tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
+                         tooltip=f"Bundles any additional embeddings into the {name} output file")
         components.switch(master, 5, 1, self.ui_state, "bundle_additional_embeddings")
 
+        # Movido para linha 6
+        # Delta Pattern Weight (Novo) - Inserido na linha 5, colunas 3 e 4
+        components.label(master, 5, 3, "Delta Pattern Weight",
+                         tooltip="Weight multiplier for the delta pattern application.")
+        components.entry(master, 5, 4, self.ui_state, "delta_pattern_weight")
+
         components.label(master, 6, 0, "Layer Preset",
-                         tooltip="Select a preset defining which layers to train, or select 'Custom' to define your own")
+                         tooltip="Select a preset defining which layers to train, or select 'Custom'")
         self.layer_selector = components.options(
-                    master, 6, 1, self.presets_list, self.ui_state, "lora_layer_preset",
-                    command=self.__preset_set_layer_choice
-                )
-        # INÍCIO ALTERAÇÃO - Associar Entry a 'lora_layers' e tooltip ajustado
-        self.layer_entry = components.entry(
-            master, 6, 2, self.ui_state, "lora_layers", # Alterado de lora_layer_patterns para lora_layers
-            tooltip=f"Custom comma-separated list of layer name patterns (glob syntax like '*.attn*') to apply {name} to. Only used when 'custom' preset is selected."
+            master, 6, 1, self.presets_list, self.ui_state, "lora_layer_preset",
+            command=self.__preset_set_layer_choice
         )
-        # FIM ALTERAÇÃO
-        # INÍCIO ALTERAÇÃO - Armazenar o valor custom de lora_layers, não lora_layer_patterns
-        # self.prior_custom = self.train_config.lora_layers or "" # Linha original (referência)
-        self.custom_lora_layers = self.train_config.lora_layers or "" # Usar nova variável
-        # FIM ALTERAÇÃO
+
+        self.layer_entry = components.entry(
+            master, 6, 2, self.ui_state, "lora_layers",
+            tooltip=f"Comma-separated list of diffusion layers to apply the {name} to"
+        )
+        self.prior_custom = self.train_config.lora_layers or ""
         self.layer_entry.grid(row=6, column=2, columnspan=3, sticky="ew")
+
+        # Layer Blacklist (Novo) - Inserido na linha 7
+        components.label(master, 7, 0, "Layer Blacklist",
+                         tooltip="Comma-separated list of layers to exclude from training (blacklist).")
+        blacklist_entry = components.entry(
+            master, 7, 1, self.ui_state, "lora_layers_blacklist",
+            tooltip="Comma-separated list of layers to exclude from training. Example: 'down_blocks.0,mid_block'"
+        )
+        # Ocupa colunas 1 a 4 para consistência com outros campos de texto longos.
+        blacklist_entry.grid(row=7, column=1, columnspan=4, sticky="ew")
+        # // FIM ALTERAÇÃO
+
+        # Delta Pattern Path (Novo) - Inserido na linha 8
+        components.label(master, 8, 0, "Delta Pattern Path",
+                         tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
+        delta_path_entry = components.file_entry(
+            master, 8, 1, self.ui_state, "delta_pattern_path"
+            # Não há modificador de path específico aqui, assume-se que o componente lida com o caminho completo.
+        )
+        # Ocupa colunas 1 a 4.
+        delta_path_entry.grid(row=8, column=1, columnspan=4, sticky="ew")
+        # // FIM ALTERAÇÃO
+				
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits
         # the UI correctly.
@@ -165,24 +198,12 @@ class LoraTab:
         if not selected:
             selected = self.presets_list[0]
 
-        # INÍCIO ALTERAÇÃO - Lógica ajustada para habilitar/desabilitar 'lora_layers'
-        current_ui_value = self.layer_entry.get() # Valor atual na UI (que está ligado a lora_layers)
-
         if selected == "custom":
-            # Se mudando para custom, restaurar o valor custom salvo ou o valor atual se já era custom
-            if self.prior_selected != "custom":
-                self.layer_entry.cget('textvariable').set(self.custom_lora_layers)
             self.layer_entry.configure(state="normal")
+            self.layer_entry.cget('textvariable').set(self.prior_custom)
         else:
-            # Se mudando de custom para um preset, salvar o valor custom
             if self.prior_selected == "custom":
-                self.custom_lora_layers = current_ui_value
-
-            # Quando um preset é selecionado, desabilitar e limpar o campo lora_layers
-            # O preset + lora_layer_patterns (dict) + blacklist controlarão as camadas
+                self.prior_custom = self.layer_entry.get()
             self.layer_entry.configure(state="readonly")
-            self.layer_entry.cget('textvariable').set("") # Limpa o campo, preset controla
-            # Alternativa: Mostrar nome do preset
-            # self.layer_entry.cget('textvariable').set(f"Preset: {selected}")
-        # FIM ALTERAÇÃO
+            self.layer_entry.cget('textvariable').set(",".join(self.presets[selected]))
         self.prior_selected = selected
