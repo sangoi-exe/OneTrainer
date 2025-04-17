@@ -179,6 +179,10 @@ class StableDiffusionXLLoRASetup(
 
         model.parameters = parameter_collection
         
+        from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+        model.deltas = DeltaPatternRegularizer(model, parameter_collection)
+        model.deltas.capture_weights()
+        
 
     def setup_train_device(
             self,

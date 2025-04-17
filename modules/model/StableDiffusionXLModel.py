@@ -17,6 +17,8 @@ from torch import Tensor
 from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
+from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+
 
 class StableDiffusionXLModelEmbedding:
     def __init__(
@@ -70,6 +72,7 @@ class StableDiffusionXLModel(BaseModel):
     text_encoder_2_lora: LoRAModuleWrapper | None
     unet_lora: LoRAModuleWrapper | None
     lora_state_dict: dict | None
+    deltas: DeltaPatternRegularizer | None
 
     sd_config: dict | None
     sd_config_filename: str | None
@@ -105,6 +108,7 @@ class StableDiffusionXLModel(BaseModel):
         self.text_encoder_2_lora = None
         self.unet_lora = None
         self.lora_state_dict = None
+        self.deltas = None
 
         self.sd_config = None
         self.sd_config_filename = None

@@ -714,7 +714,7 @@ class GenericTrainer(BaseTrainer):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
                     loss = self.model_setup.calculate_loss(
-                        self.model, batch, model_output_data, self.config, train_progress, self.tensorboard, self.delta_pattern
+                        self.model, batch, model_output_data, self.config, train_progress, self.tensorboard
                     )
 
                     loss = loss / float(self.config.gradient_accumulation_steps)
@@ -790,9 +790,6 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     return
 
-            if self.config.delta_pattern_save_it and self.delta_pattern is not None:
-                self.delta_pattern.log_group_deltas(train_progress.epoch)
-                print(f"self.delta_pattern salvo")                
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
@@ -837,7 +834,7 @@ class GenericTrainer(BaseTrainer):
           timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
           self.delta_pattern.save_group_deltas(
               os.path.join(self.config.workspace_dir, "training_deltas", f"Training_Deltas_{timestamp}.json")
-    )
+   				 )
 
         self.tensorboard.close()
 
