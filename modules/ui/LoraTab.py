@@ -174,7 +174,6 @@ class LoraTab:
         )
         # Ocupa colunas 1 a 4 para consistência com outros campos de texto longos.
         blacklist_entry.grid(row=7, column=1, columnspan=4, sticky="ew")
-        # // FIM ALTERAÇÃO
 
         # Delta Pattern Path (Novo) - Inserido na linha 8
         components.label(master, 8, 0, "Delta Pattern Path",
@@ -185,7 +184,6 @@ class LoraTab:
         )
         # Ocupa colunas 1 a 4.
         delta_path_entry.grid(row=8, column=1, columnspan=4, sticky="ew")
-        # // FIM ALTERAÇÃO
 				
         # Some configs will come with the lora_layer_preset unset or wrong for
         # the new model, so let's set it now to a reasonable default so it hits

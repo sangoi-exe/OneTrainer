@@ -2,7 +2,7 @@ import contextlib
 import tkinter as tk
 from collections.abc import Callable
 from enum import Enum
-from typing import Any
+from typing import Any, get_origin
 
 from modules.util.config.BaseConfig import BaseConfig
 
@@ -195,6 +195,18 @@ class UIState:
                     var.set("" if obj_var is None else str(obj_var))
                     var.trace_add("write", self.__set_float_var(obj, is_dict, name, var, obj.nullables[name]))
                     new_vars[name] = var
+                # Adicionar tratamento para list (e potencialmente dict no futuro)
+                # Para list[str], usaremos uma string separada por vírgulas.
+                elif var_type is list or get_origin(var_type) is list:
+                    # Assume que a lista é de strings simples por enquanto (como lora_layers_blacklist)
+                    # Se houver listas de outros tipos (int, float, BaseConfig), isso precisará ser mais complexo.
+                    var = tk.StringVar(master=self.master)
+                    list_str = ",".join(map(str, obj_var)) if obj_var is not None else ""
+                    var.set(list_str)
+                    # Precisamos de uma nova função de trace para lidar com a conversão string <-> list
+                    var.trace_add("write", self.__set_list_str_var(obj, is_dict, name, var, obj.nullables[name]))
+                    new_vars[name] = var
+                # // FIM ALTERAÇÃO
         else:
             iterable = obj.items() if is_dict else vars(obj).items()
 
@@ -250,6 +262,14 @@ class UIState:
                 elif var_type in (int, float):
                     var = self.__vars[name]
                     var.set("" if obj_var is None else str(obj_var))
+                # // INÍCIO ALTERAÇÃO
+                # Atualizar a StringVar quando o atributo da lista no objeto mudar
+                elif var_type is list or get_origin(var_type) is list:
+                    if name in self.__vars: # Garante que a var foi criada
+                        var = self.__vars[name]
+                        list_str = ",".join(map(str, obj_var)) if obj_var is not None else ""
+                        var.set(list_str)
+                # // FIM ALTERAÇÃO
         else:
             for name, obj_var in iterable:
                 if isinstance(obj_var, str):
@@ -264,3 +284,29 @@ class UIState:
                 elif isinstance(obj_var, int | float):
                     var = self.__vars[name]
                     var.set(str(obj_var))
+
+    def __set_list_str_var(self, obj, is_dict, name, var, nullable):
+        if is_dict:
+            def update(_0, _1, _2):
+                string_var = var.get()
+                if (string_var == "" or string_var is None) and nullable:
+                    obj[name] = None
+                elif string_var == "" and not nullable:
+                     obj[name] = [] # Lista vazia se não nullable e string vazia
+                else:
+                    # Remove espaços em branco e ignora strings vazias após o split
+                    obj[name] = [item.strip() for item in string_var.split(',') if item.strip()]
+                self.__call_var_traces(name)
+        else:
+            def update(_0, _1, _2):
+                string_var = var.get()
+                if (string_var == "" or string_var is None) and nullable:
+                    setattr(obj, name, None)
+                elif string_var == "" and not nullable:
+                     setattr(obj, name, []) # Lista vazia se não nullable e string vazia
+                else:
+                    # Remove espaços em branco e ignora strings vazias após o split
+                    setattr(obj, name, [item.strip() for item in string_var.split(',') if item.strip()])
+                self.__call_var_traces(name)
+
+        return update
