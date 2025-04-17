@@ -1,3 +1,4 @@
+import os
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
@@ -180,8 +181,26 @@ class StableDiffusionXLLoRASetup(
         model.parameters = parameter_collection
         
         from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
-        model.deltas = DeltaPatternRegularizer(model, parameter_collection)
-        model.deltas.capture_weights()
+        model.deltas = DeltaPatternRegularizer(model, model.parameters)
+
+        # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)
+        if config.delta_pattern_save_it:
+            print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
+            model.deltas.capture_weights()
+
+        if config.delta_pattern_use_it:
+          if config.delta_pattern_path and os.path.exists(config.delta_pattern_path):
+              print(f"[DeltaPattern] Carregando padrão de delta de referência de: {config.delta_pattern_path}")
+              model.deltas.load_reference_pattern(config.delta_pattern_path)
+              if model.deltas.reference_deltas: # Verifica se carregou com sucesso
+                  print("[DeltaPattern] Capturando pesos iniciais para cálculo da penalidade (Run 2).")
+                  model.deltas.capture_initial_weights_run2()
+              else:
+                  print(f"[DeltaPattern] Aviso: Falha ao carregar o padrão de delta de '{config.delta_pattern_path}'. A penalidade será desativada.")
+                  config.delta_pattern_use_it = False # Desativa se não conseguiu carregar
+          else:
+              print(f"[DeltaPattern] Aviso: 'delta_pattern_use_it' é True, mas o caminho '{config.delta_pattern_path}' não foi encontrado ou não especificado. A penalidade será desativada.")
+              config.delta_pattern_use_it = False # Desativa se o caminho não existe
         
 
     def setup_train_device(

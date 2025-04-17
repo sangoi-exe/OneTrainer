@@ -1,8 +1,5 @@
 import json
 import traceback
-from torch.nn import Parameter
-
-# FIM ALTERAÇÃO
 import os
 import time
 import warnings
@@ -11,24 +8,12 @@ from torch import Tensor
 from collections import deque
 from safetensors.torch import load_file
 
-# INÍCIO ALTERAÇÃO: Ajustar imports e tipos
 from typing import Iterable, Tuple, List, Dict, Union, Optional, TYPE_CHECKING
 
 from modules.util.NamedParameterGroup import NamedParameterGroup
 
-# Usar TYPE_CHECKING para evitar importação circular se NamedParameterGroupCollection estiver em outro módulo
 if TYPE_CHECKING:
     from modules.util.NamedParameterGroup import NamedParameterGroupCollection
-# FIM ALTERAÇÃO
-
-###############################################################################
-# NOVO: Variável global para controlar o modo (scalar vs. batch)
-###############################################################################
-BATCH_MODE = True
-"""
-Se BATCH_MODE for False, comporta-se como no código original (usa .item()).
-Se BATCH_MODE for True, as operações são feitas usando Tensores em lote (batch).
-"""
 
 
 class LossTracker:
@@ -62,21 +47,24 @@ class LossTracker:
             mae_loss (Tensor): The Mean Absolute Error loss.
             log_cosh_loss (Tensor): The log-cosh loss.
         """
-        # INÍCIO ALTERAÇÃO: armazenar sempre na CPU para evitar consumo de VRAM
-        if not BATCH_MODE:
-            # Modo original (scalar)
-            self.mse_losses.append(mse_loss.item())
-            self.mae_losses.append(mae_loss.item())
-            self.log_cosh_losses.append(log_cosh_loss.item())
-        else:
-            # Modo batch: armazena o tensor inteiro mas já movido para a CPU
-            self.mse_losses.append(mse_loss.detach().cpu())
-            self.mae_losses.append(mae_loss.detach().cpu())
-            self.log_cosh_losses.append(log_cosh_loss.detach().cpu())
-        # FIM ALTERAÇÃO
+        # Modo batch: podemos armazenar o Tensor inteiro,
+        # ou apenas a média do batch, dependendo da sua necessidade.
+        # Aqui, por exemplo, vamos armazenar o Tensor inteiro (detach)
+        # para depois concatenar na hora de computar estatísticas.
+        # self.mse_losses.append(mse_loss)
+        # self.mae_losses.append(mae_loss)
+        # self.log_cosh_losses.append(log_cosh_loss)
 
+        """
+        SE DER OOM, USAR MEAN NESSA BOSTA
+        """
+        self.mse_losses.append(float(mse_loss.detach().mean()))
+        self.mae_losses.append(float(mae_loss.detach().mean()))
+        self.log_cosh_losses.append(float(log_cosh_loss.detach().mean()))
 
-    def compute_stats(self, values_list: List[Union[float, Tensor]]) -> Tuple[float, float]:
+    def compute_stats(
+        self, values_list: List[Union[float, Tensor]]
+    ) -> Tuple[float, float]:
         """
         Computes statistics for a list of loss values.
 
@@ -91,27 +79,30 @@ class LossTracker:
             # Evitar problemas no início do treinamento
             return 0.0, 1e-8
 
-        if not BATCH_MODE:
-            # Modo scalar original
-            arr = torch.tensor(values_list, dtype=torch.float32, device="cpu")
-        else:
-            # Modo batch: "desempacota" Tensores em um único Tensor
-            # Cada elemento de values_list pode ser shape [] (loss já reduzido)
-            # ou [batch_size]. Aqui assumimos que cada item é [batch_size],
-            # mas se for scalar, a concat ainda funciona com .view(-1).
-            arr = torch.cat([x.view(-1) for x in values_list], dim=0)
+        # Modo batch: "desempacota" Tensores em um único Tensor
+        # Cada elemento de values_list pode ser shape [] (loss já reduzido)
+        # ou [batch_size]. Aqui assumimos que cada item é [batch_size],
+        # mas se for scalar, a concat ainda funciona com .view(-1).
+        arr = torch.tensor(values_list, dtype=torch.float32, device="cpu")
 
         if not self.use_mad:
             mean_val = arr.mean()
             std_val = arr.std(unbiased=False)
-            return mean_val.item(), max(std_val.item(), 1e-8)
+            # .item() será chamado apenas quando for realmente necessário obter um float na CPU
+            return mean_val, torch.clamp(
+                std_val, min=1e-8
+            )  # Retorna tensores escalares
         else:
             median_val = arr.median()
             abs_dev = torch.abs(arr - median_val)
-            mad_val = abs_dev.median()
-            return median_val.item(), max(mad_val.item(), 1e-8)
+            mad_val = abs_dev.median().values
+            return median_val, torch.clamp(
+                mad_val, min=1e-8
+            )  # Retorna tensores escalares
 
-    def compute_z_scores(self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor) -> Tuple[float, float, float]:
+    def compute_z_scores(
+        self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
+    ) -> Union[Tuple[float, float, float], Tuple[Tensor, Tensor, Tensor]]:
         """
         Computes z-scores for the given loss values.
 
@@ -121,29 +112,18 @@ class LossTracker:
             log_cosh_loss (Tensor): The log-cosh loss.
 
         Returns:
-            Tuple[float, float, float]: The z-scores for MSE, MAE, and log-cosh losses.
+            Union[Tuple[float, float, float], Tuple[Tensor, Tensor, Tensor]]:
+            The z-scores for MSE, MAE, and log-cosh losses.
+            Tensors (shape like input losses).
         """
-        # Primeiro, obtém as estatísticas de cada fila
-        mse_center, mse_scale = self.compute_stats(self.mse_losses)
-        mae_center, mae_scale = self.compute_stats(self.mae_losses)
-        log_cosh_center, log_cosh_scale = self.compute_stats(self.log_cosh_losses)
 
-        # Em modo batch, podemos tirar a média antes de calcular .item()
-        # ou podemos calcular cada z-score como um vetor. Abaixo, fazemos
-        # do jeito mais simples: tiramos a média do batch para manter
-        # a coerência com o retorno float original.
-        if not BATCH_MODE:
-            mse_val = mse_loss.item()
-            mae_val = mae_loss.item()
-            log_cosh_val = log_cosh_loss.item()
-        else:
-            mse_val = mse_loss.mean().item()
-            mae_val = mae_loss.mean().item()
-            log_cosh_val = log_cosh_loss.mean().item()
+        mse_center, mse_scale = self.compute_stats(list(self.mse_losses))
+        mae_center, mae_scale = self.compute_stats(list(self.mae_losses))
+        log_cosh_center, log_cosh_scale = self.compute_stats(list(self.log_cosh_losses))
 
-        mse_z = (mse_val - mse_center) / mse_scale
-        mae_z = (mae_val - mae_center) / mae_scale
-        log_cosh_z = (log_cosh_val - log_cosh_center) / log_cosh_scale
+        mse_z = (mse_loss - mse_center) / mse_scale
+        mae_z = (mae_loss - mae_center) / mae_scale
+        log_cosh_z = (log_cosh_loss - log_cosh_center) / log_cosh_scale
 
         return mse_z, mae_z, log_cosh_z
 
@@ -178,7 +158,9 @@ class DynamicLossStrength:
         self.last_logged_delta_epoch = 0
 
         # Initialize scheduling parameters
-        self.schedule_params: Dict[str, Dict[str, float]] = self._initialize_schedule_params(schedule_params)
+        self.schedule_params: Dict[str, Dict[str, float]] = (
+            self._initialize_schedule_params(schedule_params)
+        )
 
         # EMA state
         self.ema_weights: Dict[str, float] = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
@@ -210,9 +192,9 @@ class DynamicLossStrength:
 
     def adjust_weights(
         self,
-        mse_z: float,
-        mae_z: float,
-        log_cosh_z: float,
+        mse_z: Union[float, Tensor],
+        mae_z: Union[float, Tensor],
+        log_cosh_z: Union[float, Tensor],
         config,
         progress,
     ) -> Tuple[float, float, float]:
@@ -226,9 +208,9 @@ class DynamicLossStrength:
         4) Applying Exponential Moving Average (if enabled).
         5) Scheduling weight priorities over training epochs.
 
-        Args:
-            mse_z (float): Z-score for MSE loss.
-            mae_z (float): Z-score for MAE loss.
+        Args: # INÍCIO ALTERAÇÃO: Atualizar docstring
+            mse_z (Union[float, Tensor]): Z-score(s) for MSE loss.
+            mae_z (Union[float, Tensor]): Z-score(s) for MAE loss.
             log_cosh_z (float): Z-score for log-cosh loss.
             config: Configuration object containing training parameters (e.g., total epochs).
             progress: Progress object containing current epoch information.
@@ -237,43 +219,67 @@ class DynamicLossStrength:
             Tuple[float, float, float]: The adjusted weights for MSE, MAE, and log-cosh losses.
         """
         # 1) Clamping z-scores
-        z_scores = {
-            "mse": min(abs(mse_z), self.outlier_threshold),
-            "mae": min(abs(mae_z), self.outlier_threshold),
-            "log_cosh": min(abs(log_cosh_z), self.outlier_threshold),
+        _abs = torch.abs
+        _clamp_max = lambda t, val: torch.clamp(t, max=val)
+        _sum = lambda d: torch.stack(list(d.values())).sum(dim=0)
+        _mean = lambda t: t.mean()  # Usado para obter pesos escalares finais
+        is_tensor_mode = True
+
+        # 1) Clamping z-scores (valor absoluto clampado)
+        # Clampa o valor *absoluto* e depois o usa. Ou clampa o z original entre -thresh e +thresh?
+        # O código original fazia min(abs(z), threshold). Vamos manter isso.
+        clamped_abs_z = {
+            "mse": _clamp_max(_abs(mse_z), self.outlier_threshold),
+            "mae": _clamp_max(_abs(mae_z), self.outlier_threshold),
+            "log_cosh": _clamp_max(_abs(log_cosh_z), self.outlier_threshold),
         }
 
-        total_z = sum(z_scores.values())
-        if total_z < 1e-8:
-            total_z = 1.0
+        # 2) Invertendo z-scores relativos
+        # A lógica original era: inv_z = (total_abs_z - abs_z) / total_abs_z
+        # Isso dá peso maior para quem tem z-score absoluto menor.
+        total_abs_z = _sum(clamped_abs_z)
+        # Adicionar epsilon para evitar divisão por zero (importante para tensores)
+        epsilon = 1e-8
+        total_abs_z = total_abs_z + epsilon  # Broadcasting se for tensor
 
-        # 2) Inverting z-scores
-        inverted_z = {loss: (total_z - z) / total_z for loss, z in z_scores.items()}
+        inverted_z = {
+            loss: (total_abs_z - z) / total_abs_z for loss, z in clamped_abs_z.items()
+        }
 
-        sum_inv = sum(inverted_z.values())
-        if sum_inv < 1e-8:
-            sum_inv = 1.0
-
-        # 3) Normalizing inverted z-scores
-        base_weights = {loss: inv_z / sum_inv for loss, inv_z in inverted_z.items()}
+        # 3) Normalizando pesos base
+        # sum_inv_z = (total-z1)/total + (total-z2)/total + (total-z3)/total
+        #           = (3*total - (z1+z2+z3))/total = (3*total - total)/total = 2*total / total = 2 (se total > 0)
+        # Portanto, a soma dos inverted_z deveria ser 2 (ou próximo disso devido ao clamp e epsilon).
+        # Normalizar dividindo pela soma garante que os pesos somem 1.
+        sum_inv_z = _sum(inverted_z) + epsilon
+        base_weights = {loss: inv_z / sum_inv_z for loss, inv_z in inverted_z.items()}
 
         # 4) Exponential Moving Average
         if self.use_ema:
             if not self.initialized:
+                # Inicializa com os pesos atuais (podem ser tensores ou floats)
                 for loss in self.ema_weights:
                     self.ema_weights[loss] = base_weights[loss]
-                self.initialized = True
             else:
                 alpha = 1.0 - self.ema_decay
                 for loss in self.ema_weights:
-                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[loss] + alpha * base_weights[loss]
-
+                    self.ema_weights[loss] = (1 - alpha) * self.ema_weights[
+                        loss
+                    ] + alpha * base_weights[loss]
+                # self.initialized = True # Cuidado: Se base_weights for Tensor, ema_weights vira Tensor
             # Normaliza as weights do EMA
             sum_ema = sum(self.ema_weights.values())
-            if sum_ema < 1e-8:
-                sum_ema = 1.0
-            normalized_ema_weights = {loss: w / sum_ema for loss, w in self.ema_weights.items()}
+
+            # Se ema_weights for Tensor, sum_ema será Tensor. Adicionar epsilon.
+            sum_ema = sum_ema + epsilon
+            normalized_ema_weights = {
+                loss: w / sum_ema for loss, w in self.ema_weights.items()
+            }  # Broadcasting se Tensor
             base_weights = normalized_ema_weights
+            # Se inicializou com tensores, aqui base_weights são tensores
+            self.initialized = (
+                True  # Marcar como inicializado após a primeira atualização/leitura
+            )
 
         # 5) Scheduler
         if config.epochs > 1:
@@ -284,20 +290,37 @@ class DynamicLossStrength:
 
         scheduled_factors = {}
         for loss, params in self.schedule_params.items():
-            scheduled_factors[loss] = params["start"] * (1 - frac) + params["end"] * frac
+            # params são floats, o resultado é float
+            scheduled_factors[loss] = (
+                params["start"] * (1 - frac) + params["end"] * frac
+            )
 
         # Multiplica cada base weight pelo fator do scheduler
-        weighted_weights = {loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights}
+        # Se base_weights for Tensor, o fator float faz broadcasting
+        weighted_weights = {
+            loss: base_weights[loss] * scheduled_factors[loss] for loss in base_weights
+        }
 
-        # Normaliza
-        sum_weighted = sum(weighted_weights.values())
-        if sum_weighted < 1e-8:
-            sum_weighted = 1.0
-
+        # Normaliza final
+        sum_weighted = _sum(weighted_weights) + epsilon
         final_weights = {loss: w / sum_weighted for loss, w in weighted_weights.items()}
 
+        # 6) Redução para escalar (se necessário)
+        # A loss final espera pesos escalares. Se estávamos no modo tensor,
+        # pegamos a média dos pesos no batch.
+        if is_tensor_mode:
+            final_weights_scalar = {
+                loss: float(torch.mean(w)) for loss, w in final_weights.items()
+            }
+        else:
+            final_weights_scalar = final_weights  # Já são floats
+
         # Retorna na ordem desejada
-        return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]
+        return (
+            final_weights_scalar["mse"],
+            final_weights_scalar["mae"],
+            final_weights_scalar["log_cosh"],
+        )
 
     def maybe_log_deltas(self, tensorboard, delta_regularizer, progress):
         if not hasattr(self, "progress") or not self.progress:
@@ -316,24 +339,29 @@ class DynamicLossStrength:
 
         current_norm, reference_norm = delta_regularizer.get_delta_norms()
         if current_norm is not None:
-            tensorboard.add_scalar("delta/current_norm", current_norm, self.progress.global_step)
+            tensorboard.add_scalar(
+                "delta/current_norm", current_norm, self.progress.global_step
+            )
         if reference_norm is not None:
-            tensorboard.add_scalar("delta/reference_norm", reference_norm, self.progress.global_step)
+            tensorboard.add_scalar(
+                "delta/reference_norm", reference_norm, self.progress.global_step
+            )
 
-        print(f"[DeltaPattern] Epoch {progress.epoch} | Current Δ: {current_norm:.4f} | Ref Δ: {reference_norm:.4f}")
+        print(
+            f"[DeltaPattern] Epoch {progress.epoch} | Current Δ: {current_norm:.4f} | Ref Δ: {reference_norm:.4f}"
+        )
 
 
 class DeltaPatternRegularizer:
-    def __init__(self, model: torch.nn.Module):
-        try:
-            collection = model.parameter_collection
-        except AttributeError:
+    def __init__(
+        self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection"
+    ):
+        if param_collection is None:
             raise ValueError(
-                "Modelo não possui 'parameter_collection' — "
-                "verifique se você atribuiu antes de instanciar."
+                "param_collection não pode ser None para DeltaPatternRegularizer."
             )
         self.model = model
-        self.param_collection: "NamedParameterGroupCollection" = collection
+        self.param_collection: "NamedParameterGroupCollection" = param_collection
         self.delta_log_by_module: Dict[str, Dict[str, float]] = {}
         self.initial_weights_run1: Dict[str, torch.Tensor] = (
             {}
@@ -352,14 +380,28 @@ class DeltaPatternRegularizer:
         )
 
     def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
-        """
-        Itera diretamente sobre o state_dict do unet_lora e retorna todos os pesos reais com nome completo.
-        NÃO depende de .named_parameters() para evitar perder buffers como alpha/dora_scale.
-        """
-        for name, tensor in self.model.unet_lora.state_dict().items():
-            if not isinstance(tensor, torch.Tensor):
+        """Iterates through tensors within the state_dicts of relevant LoRA wrappers."""
+        # INÍCIO ALTERAÇÃO - Iterar sobre múltiplos wrappers
+        wrappers_to_check = [
+            getattr(self.model, 'unet_lora', None),
+        ]
+        processed_keys = set() # Evita processar a mesma chave de diferentes wrappers (improvável mas seguro)
+
+        for wrapper in wrappers_to_check:
+            if wrapper is None:
                 continue
-            yield name, tensor, tensor.device
+            try:
+                # state_dict() do wrapper deve retornar chaves de módulos reais/dummies
+                wrapper_state_dict = wrapper.state_dict()
+                for key, tensor in wrapper_state_dict.items():
+                    # Verifica se é um tensor e ainda não foi processado
+                    if isinstance(tensor, torch.Tensor) and key not in processed_keys:
+                        # Assume que todos os tensores no state_dict são relevantes
+                        # Retorna tensor destacado (detach) para evitar problemas de grafo
+                        yield key, tensor.detach(), tensor.device
+                        processed_keys.add(key)
+            except Exception as e:
+                print(f"[DeltaPattern] Erro ao iterar state_dict para wrapper {getattr(wrapper, 'prefix', 'Unknown')}: {e}")
 
     def capture_weights(self):
         """Captura os pesos iniciais (usado no início da Run 1) e armazena em CPU."""

@@ -58,7 +58,6 @@ class GenericTrainer(BaseTrainer):
     parameters: list[Parameter]
 
     tensorboard: SummaryWriter
-    delta_pattern: DeltaPatternRegularizer
 
     grad_hook_handles: list[RemovableHandle]
 
@@ -587,10 +586,6 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         scheduler_step_counter = 0
-        self.delta_pattern = DeltaPatternRegularizer(self.model, self.parameters)
-        if self.config.delta_pattern_save_it:
-          print("[DeltaPattern] Capturando pesos iniciais para logging dos deltas por grupo (Run 1)")
-          self.delta_pattern.capture_weights()
 
         def wrap_scheduler_step(orig_step):
             def wrapped(*args, **kwargs):
@@ -793,6 +788,30 @@ class GenericTrainer(BaseTrainer):
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
+            # INÍCIO ALTERAÇÃO - Logar deltas e normas no fim da época
+            delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
+            if delta_instance is not None:
+              # Logar deltas do grupo se a opção estiver ativa
+              if self.config.delta_pattern_save_it:
+                    try:
+                        # Loga para a época que acabou de terminar
+                        delta_instance.log_group_deltas(train_progress.epoch - 1)
+                    except Exception as e:
+                        print(f"[DeltaPattern] Erro ao logar deltas do grupo na época {train_progress.epoch - 1}: {e}")
+                        traceback.print_exc()
+
+              # Logar normas totais para o TensorBoard
+              try:
+                  current_norm, reference_norm = delta_instance.get_delta_norms()
+                  if current_norm is not None:
+                      self.tensorboard.add_scalar("delta_pattern/current_total_delta_norm", current_norm, train_progress.global_step)
+                  if reference_norm is not None:
+                      self.tensorboard.add_scalar("delta_pattern/reference_delta_norm", reference_norm, train_progress.global_step)
+              except Exception as e:
+                    print(f"[DeltaPattern] Erro ao logar normas totais no TensorBoard: {e}")
+                    traceback.print_exc()
+            self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
+
             if self.commands.get_stop_command():
                 return
 
@@ -830,11 +849,18 @@ class GenericTrainer(BaseTrainer):
         elif self.model is not None:
             self.model.to(self.temp_device)
 
-        if self.delta_pattern is not None:
-          timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-          self.delta_pattern.save_group_deltas(
-              os.path.join(self.config.workspace_dir, "training_deltas", f"Training_Deltas_{timestamp}.json")
-   				 )
+        delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
+        if delta_instance is not None and self.config.delta_pattern_save_it:
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_dir = os.path.join(self.config.workspace_dir, "training_deltas") # Garante que o diretório existe
+                os.makedirs(output_dir, exist_ok=True)
+                save_path = os.path.join(output_dir, f"Training_Deltas_{timestamp}.json")
+                print(f"[DeltaPattern] Salvando deltas finais por grupo em: {save_path}")
+                delta_instance.save_group_deltas(save_path)
+            except Exception as e:
+                print(f"[DeltaPattern] Erro ao salvar deltas finais: {e}")
+                traceback.print_exc()
 
         self.tensorboard.close()
 

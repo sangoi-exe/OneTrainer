@@ -1,6 +1,7 @@
 from abc import ABCMeta
 from collections.abc import Callable
 import os
+import traceback
 
 from modules.module.AestheticScoreModel import AestheticScoreModel
 from modules.module.HPSv2ScoreModel import HPSv2ScoreModel
@@ -47,7 +48,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.tensorboard = None
         self.progress = None
         self.config = None
-        self.delta_pattern = None
         self.loaded_pattern_deltas = None
         self.loss_tracker = LossTracker(window_size=100, use_mad=False)
         self.dynamic_loss_strengthing = DynamicLossStrength()
@@ -449,6 +449,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = config
         self.progress = progress
         self.tensorboard = tensorboard
+        delta_instance: DeltaPatternRegularizer | None = getattr(model, 'deltas', None)
 
         if self.delta_pattern is None and (config.delta_pattern_save_it or config.delta_pattern_use_it):
             # Verifica se NamedParameterGroupCollection foi importado corretamente
@@ -572,10 +573,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     )
 
             # INÍCIO ALTERAÇÃO: Aplicação da penalidade Delta Pattern (Movido para depois dos outros weights)
-            if config.delta_pattern_use_it and self.delta_pattern is not None and self.delta_pattern.reference_deltas:
+            if config.delta_pattern_use_it and delta_instance is not None and delta_instance.reference_deltas:
+              try:
                 # Calcula a penalidade usando os pesos *atuais* do modelo
                 # e comparando o delta *acumulado atual* com o delta de referência
-                penalty = self.delta_pattern.compute_penalty(lambda_weight=config.delta_pattern_weight)
+                penalty = delta_instance.compute_penalty(lambda_weight=config.delta_pattern_weight)
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
@@ -583,19 +585,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
                 if self.tensorboard:
                     self.tensorboard.add_scalar("delta_pattern/penalty", penalty.item(), self.progress.global_step)
-                    # Opcional: Logar a norma do delta atual e do delta de referência
-                    current_delta_norm, ref_delta_norm = self.delta_pattern.get_delta_norms()
-                    if current_delta_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/current_total_delta_norm", current_delta_norm, self.progress.global_step
-                        )
-                    if ref_delta_norm is not None:
-                        self.tensorboard.add_scalar(
-                            "delta_pattern/reference_delta_norm", ref_delta_norm, self.progress.global_step
-                        )
-        # FIM ALTERAÇÃO
+              except Exception as e:
+                    print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")
+                    traceback.print_exc() # Loga o traceback para depuração
 
-        # Retorna a loss final (por item do batch)
         return losses
 
     def _flow_matching_losses(
