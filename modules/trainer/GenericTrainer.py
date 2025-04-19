@@ -25,7 +25,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
 from modules.util.memory_util import TorchMemoryRecorder
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -35,7 +35,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.utils.hooks import RemovableHandle
-from torch.utils.tensorboard.writer import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
@@ -750,11 +750,11 @@ class GenericTrainer(BaseTrainer):
                         # Report learning rate after potential scheduler step
                         self.model_setup.report_to_tensorboard(self.model, self.config, lr_scheduler, self.tensorboard)
 
-                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss.item(), train_progress.global_step)
+                        self.tensorboard.add_scalar("loss/train_step", accumulated_loss.mean().item(), train_progress.global_step)
                         ema_loss = ema_loss or accumulated_loss.item()
                         ema_loss = (ema_loss * 0.99) + (accumulated_loss.item() * 0.01)
                         step_tqdm.set_postfix({
-                            'loss': accumulated_loss,
+                            'loss': accumulated_loss.item(),
                             'smooth loss': ema_loss,
                         })
                         self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
@@ -787,7 +787,6 @@ class GenericTrainer(BaseTrainer):
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
-            # INÍCIO ALTERAÇÃO - Logar deltas e normas no fim da época
             delta_instance: DeltaPatternRegularizer | None = getattr(self.model, 'deltas', None)
             if delta_instance is not None:
               # Logar deltas do grupo se a opção estiver ativa

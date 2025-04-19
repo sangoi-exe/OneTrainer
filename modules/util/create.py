@@ -1020,11 +1020,9 @@ def create_optimizer(
                     # Adiciona o grupo do backup (com LRs corretos) à lista de grupos a serem carregados
                     param_groups.append(old_group)
 
-                    # // INÍCIO ALTERAÇÃO - Remover a sobrescrita de LR
                     # Remover as linhas abaixo para preservar os LRs do backup
                     # old_group['lr'] = new_group['lr']
                     # old_group['initial_lr'] = new_group['initial_lr']
-                    # // FIM ALTERAÇÃO
                 else:
                     # the group state was not saved, initialize with an empty group state
                     new_group = new_param_groups[new_group_index]

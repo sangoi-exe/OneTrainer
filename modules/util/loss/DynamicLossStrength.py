@@ -90,7 +90,7 @@ class LossTracker:
             return median_val, torch.clamp(
                 mad_val, min=1e-8
             )  # Retorna tensores escalares
-
+    @torch.no_grad()
     def compute_z_scores(
         self, mse_loss: Tensor, mae_loss: Tensor, log_cosh_loss: Tensor
     ) -> Union[Tuple[float, float, float], Tuple[Tensor, Tensor, Tensor]]:
@@ -180,7 +180,7 @@ class DynamicLossStrength:
                 if loss_type in schedule_params:
                     default_params[loss_type].update(schedule_params[loss_type])
         return default_params
-
+    @torch.no_grad()
     def adjust_weights(
         self,
         mse_z: Union[float, Tensor],
@@ -199,7 +199,7 @@ class DynamicLossStrength:
         4) Applying Exponential Moving Average (if enabled).
         5) Scheduling weight priorities over training epochs.
 
-        Args: # INÍCIO ALTERAÇÃO: Atualizar docstring
+        Args:
             mse_z (Union[float, Tensor]): Z-score(s) for MSE loss.
             mae_z (Union[float, Tensor]): Z-score(s) for MAE loss.
             log_cosh_z (float): Z-score for log-cosh loss.
@@ -345,7 +345,7 @@ class DynamicLossStrength:
 
 class DeltaPatternRegularizer:
     def __init__(
-        self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection"
+        self, model: torch.nn.Module, param_collection: "NamedParameterGroupCollection", penalty_metric: str = "cosine"
     ):
         if param_collection is None:
             raise ValueError(
@@ -369,14 +369,18 @@ class DeltaPatternRegularizer:
         self.reference_delta_norm: Optional[float] = (
             None  # Cache da norma L2 do delta de referência
         )
+        self.penalty_metric: str = penalty_metric.lower()
+        if self.penalty_metric not in {"mse", "cosine"}:
+            raise ValueError("penalty_metric deve ser 'mse' ou 'cosine'")
 
     def _iterate_params(self) -> Iterable[Tuple[str, torch.Tensor, torch.device]]:
         """Iterates through tensors within the state_dicts of relevant LoRA wrappers."""
-        # INÍCIO ALTERAÇÃO - Iterar sobre múltiplos wrappers
         wrappers_to_check = [
-            getattr(self.model, 'unet_lora', None),
+            getattr(self.model, "unet_lora", None),
         ]
-        processed_keys = set() # Evita processar a mesma chave de diferentes wrappers (improvável mas seguro)
+        processed_keys = (
+            set()
+        )  # Evita processar a mesma chave de diferentes wrappers (improvável mas seguro)
 
         for wrapper in wrappers_to_check:
             if wrapper is None:
@@ -392,7 +396,9 @@ class DeltaPatternRegularizer:
                         yield key, tensor.detach(), tensor.device
                         processed_keys.add(key)
             except Exception as e:
-                print(f"[DeltaPattern] Erro ao iterar state_dict para wrapper {getattr(wrapper, 'prefix', 'Unknown')}: {e}")
+                print(
+                    f"[DeltaPattern] Erro ao iterar state_dict para wrapper {getattr(wrapper, 'prefix', 'Unknown')}: {e}"
+                )
 
     def capture_weights(self):
         """Captura os pesos iniciais (usado no início da Run 1) e armazena em CPU."""
@@ -494,130 +500,68 @@ class DeltaPatternRegularizer:
 
     def compute_penalty(self, lambda_weight: float) -> torch.Tensor:
         """
-        Calcula a penalidade MSE entre o delta acumulado atual (current - initial_run2)
-        e o delta de referência (carregado da Run 1).
-        Retorna um tensor escalar no device do primeiro parâmetro do modelo.
+        Calcula penalidade entre delta atual (por módulo) e delta de referência.
+        Métrica definida em `self.penalty_metric` ("mse" ou "cosine").
         """
+        import warnings
+
+        # ── descobrir device/dtype ───────────────────────────────────────────
         try:
-            # INÍCIO ALTERAÇÃO: Obter device e dtype do modelo
-            first_param = next(self.model.parameters())
-            target_device = first_param.device
-            target_dtype = first_param.dtype  # Assume bf16 se o modelo estiver em bf16
-            # FIM ALTERAÇÃO
+            first_param = next(iter(self.param_collection.parameters()))
+            target_device, target_dtype = first_param.device, first_param.dtype
         except StopIteration:
-            target_device = torch.device("cpu")
-            target_dtype = torch.float32  # Fallback dtype
-            print(
-                "[DeltaPattern] Não foi possível determinar o device/dtype do modelo. Usando CPU/float32.",
-                UserWarning,
-            )
+            target_device, target_dtype = torch.device("cpu"), torch.float32
+            warnings.warn("[DeltaPattern] Parâmetros vazios; usando CPU/float32.")
 
+        # ── early‑exit se epoch > padrão carregado ───────────────────────────
         if hasattr(self, "max_epoch_loaded") and hasattr(self.model, "train_progress"):
-            current_epoch = self.model.train_progress.epoch
-            if (
-                self.max_epoch_loaded is not None
-                and current_epoch > self.max_epoch_loaded
-            ):
-                print(
-                    f"[DeltaPattern] Aviso: Epoch atual ({current_epoch}) excede o máximo registrado no padrão ({self.max_epoch_loaded}). Penalidade será ignorada."
-                )
+            if self.max_epoch_loaded is not None and self.model.train_progress.epoch > self.max_epoch_loaded:
+                return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
+        # ── pré‑condições ────────────────────────────────────────────────────
         if not self.reference_deltas or not self.initial_weights_run2:
             self.current_total_delta_norm = None
-            return torch.tensor(
-                0.0, device=target_device, dtype=target_dtype
-            )  # Usa dtype do modelo
-
-        try:
-            initial_run2_device = {
-                k: v.to(device=target_device, dtype=target_dtype, non_blocking=True)
-                for k, v in self.initial_weights_run2.items()
-            }
-            ref_delta_device = {
-                k: v.to(device=target_device, dtype=target_dtype, non_blocking=True)
-                for k, v in self.reference_deltas.items()
-            }
-        except Exception as e:
-            print(
-                f"[DeltaPattern] Erro ao mover/castar pesos iniciais/referência para {target_device}/{target_dtype}: {e}"
-            )
-            traceback.print_exc()
             return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
-        # INÍCIO ALTERAÇÃO: Acumular penalidade e deltas na GPU
-        total_penalty_gpu = torch.tensor(0.0, dtype=torch.float32, device=target_device)
-        total_elements = 0
-        current_deltas_gpu = {}  # Guarda deltas atuais na GPU para cálculo da norma L2
-        # FIM ALTERAÇÃO
-        num_params_matched = 0
-
         try:
-            # REMOVIDO: Cache redundante que estava dentro do try original
-            # target_device = next(self.model.parameters()).device
-            # initial_run2_device = { ... }
-            # ref_delta_device = { ... }
+            # ── preparar dict referência → módulo ────────────────────────────
+            ref_mod: Dict[str, torch.Tensor] = {}
+            for full_key, val in self.reference_deltas.items():
+                module_key = full_key.split("/", 1)[-1]  # remove "epoch_x/" se houver
+                ref_mod[module_key] = val.to(
+                    device=target_device, dtype=target_dtype, non_blocking=True
+                )
 
-          current_vec = torch.nn.utils.parameters_to_vector(
-              [p.detach().to(target_dtype) for _, p, _ in self._iterate_params()]
-          )
-          init_vec = torch.nn.utils.parameters_to_vector(
-              [self.initial_weights_run2[k].to(target_dtype) for k, _, _ in self._iterate_params()]
-          )
-          ref_vec = torch.nn.utils.parameters_to_vector(
-              [self.reference_deltas[k] for k in self.reference_deltas]
-          ).to(target_dtype)
+            # ── deltas atuais por módulo ─────────────────────────────────────
+            cur_mod = self._get_current_module_deltas(target_device, target_dtype)
 
-          current_delta = current_vec - init_vec
-          penalty = torch.nn.functional.mse_loss(current_delta.float(), ref_vec.float())
-          self.current_total_delta_norm = torch.norm(current_delta.float(), p=2).item()
-          final_penalty = (lambda_weight * penalty).to(dtype=target_dtype)
-          return final_penalty
+            common_keys = [k for k in ref_mod if k in cur_mod]
+            if not common_keys:
+                self.current_total_delta_norm = 0.0
+                return torch.tensor(0.0, device=target_device, dtype=target_dtype)
+
+            ref_vec = torch.stack([ref_mod[k].float() for k in common_keys])
+            cur_vec = torch.stack([cur_mod[k].float() for k in common_keys])
+
+            # ─────────── INÍCIO ALTERAÇÃO CHATGPT ───────────
+            if self.penalty_metric == "cosine":
+                cos_sim = torch.nn.functional.cosine_similarity(cur_vec, ref_vec, dim=0, eps=1e-8)
+                penalty = 1.0 - cos_sim  # distância angular
+            else:  # "mse"
+                penalty = torch.nn.functional.mse_loss(cur_vec, ref_vec)
+            # ──────────── FIM ALTERAÇÃO CHATGPT ────────────
+
+            self.current_total_delta_norm = torch.norm(cur_vec, p=2).item()
+            return (lambda_weight * penalty).to(dtype=target_dtype)
 
         except Exception as e:
-            print(
-                f"[DeltaPattern] Erro durante compute_penalty ao iterar parâmetros: {e}"
-            )
+            print(f"[DeltaPattern] Erro compute_penalty: {e}")
             traceback.print_exc()
             self.current_total_delta_norm = None
             return torch.tensor(0.0, device=target_device, dtype=target_dtype)
 
-        if num_params_matched > 0:
-            # INÍCIO ALTERAÇÃO: Calcular norma L2 na GPU e depois mover para CPU
-            # Calcula a norma L2 total do delta *atual* usando os deltas na GPU
-            # self.current_total_delta_norm = self._calculate_total_norm(current_deltas_for_norm) # Modificado
-            current_norm_sq_gpu = torch.tensor(
-                0.0, dtype=torch.float64, device=target_device
-            )  # float64 para precisão
-            for delta_gpu in current_deltas_gpu.values():
-                delta_norm_sq = (
-                    torch.norm(delta_gpu.to(torch.float32), p=2).pow(2).double()
-                )
-                current_norm_sq_gpu += delta_norm_sq
-            self.current_total_delta_norm = torch.sqrt(
-                current_norm_sq_gpu
-            ).item()  # .item() move escalar final para CPU
-            # FIM ALTERAÇÃO
 
-            # Calcula a penalidade média pelos parâmetros comparados (ainda na GPU)
-            average_penalty_gpu = total_penalty_gpu / total_elements
-        else:
-            self.current_total_delta_norm = 0.0
-            if self.reference_deltas and self.initial_weights_run2:
-                print(
-                    "[DeltaPattern] Nenhum parâmetro correspondente encontrado...",
-                    UserWarning,
-                )  # Mensagem existente
-            average_penalty_gpu = torch.tensor(
-                0.0, device=target_device, dtype=torch.float32
-            )  # Penalidade média 0 na GPU
 
-        # Retorna a penalidade média ponderada, no device e dtype originais do modelo
-        final_penalty = (lambda_weight * average_penalty_gpu).to(
-            dtype=target_dtype
-        )  # Cast final para dtype do modelo
-        return final_penalty
-
-    # INÍCIO ALTERAÇÃO: Modificar _calculate_total_norm para aceitar device
     def _calculate_total_norm(
         self, weight_dict: Dict[str, Tensor], device: torch.device = torch.device("cpu")
     ) -> float:
@@ -625,7 +569,7 @@ class DeltaPatternRegularizer:
         if not weight_dict:
             return 0.0
         # Usa float64 para precisão na soma, no device especificado
-        total_norm_sq = torch.tensor(0.0, dtype=torch.float64, device=device)
+        total_norm_sq = torch.tensor(0.0, dtype=torch.float32, device=device)
         for tensor in weight_dict.values():
             # Garante que o tensor está no device correto e calcula a norma quadrada
             # Usa .float() para norm que pode não suportar bf16 diretamente
@@ -635,8 +579,6 @@ class DeltaPatternRegularizer:
                 .double()
             )
         return torch.sqrt(total_norm_sq).item()  # .item() move para CPU
-
-    # FIM ALTERAÇÃO
 
     def get_delta_norms(self) -> Tuple[Optional[float], Optional[float]]:
         """Retorna a norma L2 total cacheada do delta atual e do delta de referência."""
@@ -655,7 +597,6 @@ class DeltaPatternRegularizer:
         self.delta_log_by_module[epoch_key] = {}
         # do_tensorboard = hasattr(self, "tensorboard") and self.tensorboard is not None
 
-        # INÍCIO ALTERAÇÃO: iterar sobre parâmetros reais e agrupar por prefixo
         group_norms: Dict[str, float] = {}
         param_counts: Dict[str, int] = {}
 
@@ -671,7 +612,7 @@ class DeltaPatternRegularizer:
             # Define o prefixo de agrupamento (ajuste aqui para granularidade desejada)
             prefix = name.split(".")[
                 0
-            ]  # ou use um parser mais detalhado se quiser algo como 'up_blocks_2_resnets_1'
+            ]
 
             group_norms.setdefault(prefix, 0.0)
             param_counts.setdefault(prefix, 0)
@@ -683,7 +624,6 @@ class DeltaPatternRegularizer:
             count = param_counts[prefix]
             delta_norm = norm_sq**0.5 if count > 0 else 0.0
             self.delta_log_by_module[epoch_key][prefix] = delta_norm
-        # FIM ALTERAÇÃO
         # if do_tensorboard:
         #     self.tensorboard.add_scalar(f"delta/by_group/{prefix}", delta_norm, epoch)
 
@@ -696,3 +636,31 @@ class DeltaPatternRegularizer:
         with open(path, "w") as f:
             json.dump(self.delta_log_by_module, f, indent=2)
         print(f"[DeltaPattern] Delta por grupo salvo em {path}")
+
+    # ────────────── INÍCIO INSERÇÃO CHATGPT ──────────────
+    def _get_current_module_deltas(
+        self, target_device: torch.device, target_dtype: torch.dtype
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Calcula e retorna {prefixo_módulo: norma_L2_delta_atual} no device/dtype alvos.
+        """
+        deltas_sq: Dict[str, torch.Tensor] = {}
+
+        for name, current_param, _ in self._iterate_params():
+            if name not in self.initial_weights_run2:
+                continue
+            prefix = name.split(".")[0]
+
+            initial = self.initial_weights_run2[name].to(
+                device=target_device, dtype=target_dtype, non_blocking=True
+            )
+            delta = (current_param.detach().to(dtype=target_dtype) - initial).float()
+            deltas_sq.setdefault(
+                prefix,
+                torch.tensor(0.0, device=target_device, dtype=torch.float32),
+            )
+            deltas_sq[prefix] += torch.norm(delta, p=2).pow(2)
+
+        return {k: torch.sqrt(v) for k, v in deltas_sq.items()}
+    # ─────────────── FIM INSERÇÃO CHATGPT ───────────────
+

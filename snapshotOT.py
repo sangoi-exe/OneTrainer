@@ -226,10 +226,6 @@ ignore_file_patterns = [
     re.compile(r".*\.swp$"),
     re.compile(r"\.DS_Store$"),
 ]
-# --- FIM DAS CONFIGURAÇÕES ---
-
-# ... (Restante do script optimize_content, should_include_file, tree, __main__ MANTIDO COMO NA RESPOSTA ANTERIOR) ...
-
 
 def optimize_content(content, ext):
     # Sua função optimize_content (mantida como está)

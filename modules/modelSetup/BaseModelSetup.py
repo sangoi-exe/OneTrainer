@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
-from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
 
 
 class BaseModelSetup(

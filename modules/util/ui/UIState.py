@@ -206,7 +206,6 @@ class UIState:
                     # Precisamos de uma nova função de trace para lidar com a conversão string <-> list
                     var.trace_add("write", self.__set_list_str_var(obj, is_dict, name, var, obj.nullables[name]))
                     new_vars[name] = var
-                # // FIM ALTERAÇÃO
         else:
             iterable = obj.items() if is_dict else vars(obj).items()
 
@@ -262,14 +261,12 @@ class UIState:
                 elif var_type in (int, float):
                     var = self.__vars[name]
                     var.set("" if obj_var is None else str(obj_var))
-                # // INÍCIO ALTERAÇÃO
                 # Atualizar a StringVar quando o atributo da lista no objeto mudar
                 elif var_type is list or get_origin(var_type) is list:
                     if name in self.__vars: # Garante que a var foi criada
                         var = self.__vars[name]
                         list_str = ",".join(map(str, obj_var)) if obj_var is not None else ""
                         var.set(list_str)
-                # // FIM ALTERAÇÃO
         else:
             for name, obj_var in iterable:
                 if isinstance(obj_var, str):

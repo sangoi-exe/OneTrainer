@@ -180,7 +180,7 @@ class StableDiffusionXLLoRASetup(
 
         model.parameters = parameter_collection
         
-        from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+        from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
         model.deltas = DeltaPatternRegularizer(model, model.parameters)
 
         # Captura os pesos iniciais se a opção de salvar estiver ativa (Run 1)

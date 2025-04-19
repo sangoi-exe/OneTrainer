@@ -1,14 +1,16 @@
-import fnmatch
 import os
 import re
-
 import copy
 import math
+import fnmatch
+import traceback
+
+from typing import Any
+from datetime import datetime
 from abc import abstractmethod
 from collections.abc import Mapping
-from typing import Any
-from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import PeftType
+from modules.util.config.TrainConfig import TrainConfig
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
 
 import torch
@@ -32,75 +34,75 @@ class RuleSet:
         return None  # Return None if no pattern matches
 
 
-BLOCKID26 = [
-    "BASE",
-    "IN00",
-    "IN01",
-    "IN02",
-    "IN03",
-    "IN04",
-    "IN05",
-    "IN06",
-    "IN07",
-    "IN08",
-    "IN09",
-    "IN10",
-    "IN11",
-    "M00",
-    "OUT00",
-    "OUT01",
-    "OUT02",
-    "OUT03",
-    "OUT04",
-    "OUT05",
-    "OUT06",
-    "OUT07",
-    "OUT08",
-    "OUT09",
-    "OUT10",
-    "OUT11",
+BLOCK_IDS = [
+    "BASE",   # tudo o que não for UNet (Text Encoders, etc)
+    "IN00",   # input conv
+    "IN01",   # down_blocks_0
+    "IN02",   # down_blocks_1
+    "IN03",   # down_blocks_2
+    "IN04",   # down_blocks_3
+    "M00",    # mid_block
+    "OUT04",  # up_blocks_3
+    "OUT03",  # up_blocks_2
+    "OUT02",  # up_blocks_1
+    "OUT01",  # up_blocks_0
+    "OUT00",  # conv_out / saída
 ]
 
 KEY_TO_BLOCK_MAPPING = {
-    "lora_unet_conv_in": "IN00",
-    "lora_unet_time_embedding": "IN00",  # Often grouped with input conv
-    "lora_unet_down_blocks_0_resnets_0": "IN01",
-    "lora_unet_down_blocks_0_resnets_1": "IN02",
-    "lora_unet_down_blocks_0_downsamplers_0": "IN03",
-    "lora_unet_down_blocks_1_resnets_0": "IN04",
-    "lora_unet_down_blocks_1_attentions_0": "IN04",
-    "lora_unet_down_blocks_1_resnets_1": "IN05",
-    "lora_unet_down_blocks_1_attentions_1": "IN05",
-    "lora_unet_down_blocks_1_downsamplers_0": "IN06",
-    "lora_unet_down_blocks_2_resnets_0": "IN07",
-    "lora_unet_down_blocks_2_attentions_0": "IN07",
-    "lora_unet_down_blocks_2_resnets_1": "IN08",
-    "lora_unet_down_blocks_2_attentions_1": "IN08",
-    "lora_unet_down_blocks_2_downsamplers_0": "IN09",  # Often empty after this
-    "lora_unet_down_blocks_3_resnets_0": "IN10",  # XL specific?
-    "lora_unet_down_blocks_3_resnets_1": "IN11",  # XL specific?
-    "lora_unet_mid_block": "M00",  # Covers resnets and attentions
-    "lora_unet_up_blocks_0_resnets_0": "OUT03",  # Starts from OUT03 in many architectures
-    "lora_unet_up_blocks_0_attentions_0": "OUT03",
-    "lora_unet_up_blocks_0_resnets_1": "OUT04",
-    "lora_unet_up_blocks_0_attentions_1": "OUT04",
-    "lora_unet_up_blocks_0_resnets_2": "OUT05",
-    "lora_unet_up_blocks_0_attentions_2": "OUT05",
-    "lora_unet_up_blocks_0_upsamplers_0": "OUT05",
-    "lora_unet_up_blocks_1_resnets_0": "OUT06",
-    "lora_unet_up_blocks_1_attentions_0": "OUT06",
-    "lora_unet_up_blocks_1_resnets_1": "OUT07",
-    "lora_unet_up_blocks_1_attentions_1": "OUT07",
-    "lora_unet_up_blocks_1_resnets_2": "OUT08",
-    "lora_unet_up_blocks_1_attentions_2": "OUT08",
-    "lora_unet_up_blocks_1_upsamplers_0": "OUT08",
-    "lora_unet_up_blocks_2_resnets_0": "OUT09",
-    "lora_unet_up_blocks_2_resnets_1": "OUT10",
-    "lora_unet_up_blocks_2_resnets_2": "OUT11",
-    "lora_unet_up_blocks_2_upsamplers_0": "OUT11",  # Often grouped with last resnet
-    "lora_unet_conv_out": "OUT11",  # Usually considered part of the last block
-    # Text Encoder (Example prefix, adjust if needed)    "lora_te1_": "BASE",  # Text Encoder 1
-    "lora_te2_": "BASE",  # Text Encoder 2 (XL)
+    "lora_unet_conv_in":                    "IN00",
+    "lora_unet_time_embedding":             "IN00",
+
+    "lora_unet_down_blocks_0_resnets_0":    "IN01",
+    "lora_unet_down_blocks_0_resnets_1":    "IN01",
+    "lora_unet_down_blocks_0_downsamplers_0":"IN01",
+
+    "lora_unet_down_blocks_1_resnets_0":    "IN02",
+    "lora_unet_down_blocks_1_attentions_0": "IN02",
+    "lora_unet_down_blocks_1_resnets_1":    "IN02",
+    "lora_unet_down_blocks_1_attentions_1": "IN02",
+    "lora_unet_down_blocks_1_downsamplers_0":"IN02",
+
+    "lora_unet_down_blocks_2_resnets_0":    "IN03",
+    "lora_unet_down_blocks_2_attentions_0": "IN03",
+    "lora_unet_down_blocks_2_resnets_1":    "IN03",
+    "lora_unet_down_blocks_2_attentions_1": "IN03",
+    "lora_unet_down_blocks_2_downsamplers_0":"IN03",
+
+    "lora_unet_down_blocks_3_resnets_0":    "IN04",
+    "lora_unet_down_blocks_3_resnets_1":    "IN04",
+
+    "lora_unet_mid_block":                  "M00",
+
+    "lora_unet_up_blocks_0_resnets_0":      "OUT01",
+    "lora_unet_up_blocks_0_attentions_0":   "OUT01",
+    "lora_unet_up_blocks_0_resnets_1":      "OUT01",
+    "lora_unet_up_blocks_0_attentions_1":   "OUT01",
+    "lora_unet_up_blocks_0_resnets_2":      "OUT01",
+    "lora_unet_up_blocks_0_attentions_2":   "OUT01",
+    "lora_unet_up_blocks_0_upsamplers_0":   "OUT01",
+
+    "lora_unet_up_blocks_1_resnets_0":      "OUT02",
+    "lora_unet_up_blocks_1_attentions_0":   "OUT02",
+    "lora_unet_up_blocks_1_resnets_1":      "OUT02",
+    "lora_unet_up_blocks_1_attentions_1":   "OUT02",
+    "lora_unet_up_blocks_1_resnets_2":      "OUT02",
+    "lora_unet_up_blocks_1_attentions_2":   "OUT02",
+    "lora_unet_up_blocks_1_upsamplers_0":   "OUT02",
+
+    "lora_unet_up_blocks_2_resnets_0":      "OUT03",
+    "lora_unet_up_blocks_2_resnets_1":      "OUT03",
+    "lora_unet_up_blocks_2_resnets_2":      "OUT03",
+    "lora_unet_up_blocks_2_upsamplers_0":   "OUT03",
+
+    "lora_unet_up_blocks_3_resnets_0":      "OUT04",
+    "lora_unet_up_blocks_3_resnets_1":      "OUT04",
+
+    "lora_unet_conv_out":                   "OUT00",
+
+    # Text Encoders e afins
+    "lora_te1_":                            "BASE",
+    "lora_te2_":                            "BASE",
 }
 
 
@@ -371,7 +373,6 @@ class PeftBase(nn.Module):
                     else:
                         self.alpha.copy_(alpha_tensor)
                 self.alpha.requires_grad_(False)
-                # FIM ALTERAÇÃO
 
                 keys_to_remove = list(relevant_keys.keys())
                 for key in keys_to_remove:
@@ -396,8 +397,6 @@ class PeftBase(nn.Module):
                 raise NotImplementedError("Should never be called on a dummy module.")
 
         return Dummy
-        # FIM ALTERAÇÃO
-
 
 class LoHaModule(PeftBase):
     """Implementation of LoHa from Lycoris."""
@@ -562,59 +561,23 @@ class DoRAModule(LoRAModule):
         # Note: initialize_weights is called by super() if orig_module exists
 
     def initialize_weights(self):
-        if self._initialized:
-            return
-        if self._orig_module is None:
-            return
+        super().initialize_weights()
 
-        # 1. Initialize LoRA components first
-        super().initialize_weights()  # Calls create_layer, inits lora_down/up
-        if not self._initialized:
-            return  # Stop if LoRA init failed
+        orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
 
-        # 2. Initialize DoRA specific scale
-        # Use float32 for norm calculation stability, then cast back
-        orig_weight = get_unquantized_weight(
-            self.orig_module, torch.float32, self.train_device
+        # Thanks to KohakuBlueLeaf once again for figuring out the shape
+        # wrangling that works for both Linear and Convolutional layers. If you
+        # were just doing this for Linear, it would be substantially simpler.
+        self.dora_num_dims = orig_weight.dim() - 1
+        self.dora_scale = nn.Parameter(
+            torch.norm(
+                orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
+                dim=1, keepdim=True)
+            .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
+            .transpose(1, 0)
+            .to(device=self.orig_module.weight.device)
         )
-        eps = torch.finfo(orig_weight.dtype).eps if self.norm_epsilon else 0.0
 
-        # Calculate norm based on layer type (more explicit version from modified file)
-        if isinstance(self.orig_module, nn.Conv2d):
-            # Norm per output filter (output channel dim 0)
-            norm = (
-                torch.linalg.vector_norm(
-                    orig_weight, ord=2, dim=(1, 2, 3), keepdim=True
-                )
-                + eps
-            )
-        elif isinstance(self.orig_module, nn.Linear):
-            # Norm per output neuron (output channel dim 0) -> weight dims are (out, in)
-            norm = (
-                torch.linalg.vector_norm(orig_weight, ord=2, dim=1, keepdim=True) + eps
-            )
-            # Alternative for Linear (like original): norm per column (input feature)
-            # norm = torch.linalg.vector_norm(orig_weight, ord=2, dim=0, keepdim=True) + eps
-            # Let's stick to norm per output neuron, seems more common for magnitude scaling
-        else:
-            # Fallback or should not happen due to initial checks
-            print(
-                f"Warning: Using generic L2 norm for unsupported layer type {type(self.orig_module)} in DoRA init for {self.prefix}"
-            )
-            norm = (
-                torch.linalg.vector_norm(orig_weight.flatten(), ord=2) + eps
-            )  # Norm of flattened tensor
-            # Reshape might be needed depending on how scale is used, but this is fallback
-            norm = norm.reshape(1 for _ in orig_weight.dim())  # Make it broadcastable
-
-        # Create scale Parameter on the correct device and dtype
-        self.dora_scale = Parameter(
-            norm.to(
-                device=self.orig_module.weight.device,
-                dtype=self.orig_module.weight.dtype,
-            )
-        )
-        # self._initialized is already True from super().initialize_weights()
         del orig_weight
 
     def check_initialized(self):
@@ -625,84 +588,32 @@ class DoRAModule(LoRAModule):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
-        # que aplica dropout no input e calcula norma corretamente
-        if self.op is None:  # If the original layer was not supported
-            print(
-                f"Warning: Skipping DoRA forward for {self.prefix} (unsupported layer type). Returning original output."
-            )
-            # Still need to apply dropout if it's part of the DoRA spec
-            return self.orig_forward(
-                self.dropout(x)
-            )  # Apply dropout as per DoRA paper mention
 
-        # Get components
         A = self.lora_down.weight
         B = self.lora_up.weight
-        # Calculate LoRA delta, use float32 for intermediate calcs if needed
-        lora_dtype = A.dtype
-        orig_weight = get_unquantized_weight(
-            self.orig_module, lora_dtype, self.train_device
-        )
-
-        # Calculate the LoRA modification scaled by alpha/rank
-        lora_delta_w = self.make_weight(A, B) * (self.alpha.item() / self.rank)
-
-        # Calculate the adapted weight matrix W' = W + deltaW
-        adapted_weight = orig_weight + lora_delta_w
-
-        # Calculate the norm of the adapted weight matrix W'
-        # Use float32 for stability, detach for backprop as per paper
-        adapted_weight_f32 = adapted_weight.to(torch.float32)
-        eps = torch.finfo(adapted_weight_f32.dtype).eps if self.norm_epsilon else 0.0
-
-        if isinstance(self.orig_module, nn.Conv2d):
-            norm = (
-                torch.linalg.vector_norm(
-                    adapted_weight_f32.detach(), ord=2, dim=(1, 2, 3), keepdim=True
-                )
-                + eps
-            )
-        elif isinstance(self.orig_module, nn.Linear):
-            norm = (
-                torch.linalg.vector_norm(
-                    adapted_weight_f32.detach(), ord=2, dim=1, keepdim=True
-                )
-                + eps
-            )  # Per output neuron
-            # norm = torch.linalg.vector_norm(adapted_weight_f32.detach(), ord=2, dim=0, keepdim=True) + eps # Per input feature (alternative)
-        else:
-            # Fallback - should not happen
-            norm = (
-                torch.linalg.vector_norm(adapted_weight_f32.detach().flatten(), ord=2)
-                + eps
-            )
-            norm = norm.reshape(1 for _ in adapted_weight_f32.dim())
-
-        # Normalize the adapted weight and scale by DoRA magnitude
-        # Ensure norm is on the correct device and dtype before division
-        norm = norm.to(device=adapted_weight.device, dtype=adapted_weight.dtype)
-        final_weight = self.dora_scale * (adapted_weight / norm)
-
-        # Apply dropout to input x as mentioned in DoRA implementations
-        x_dropout = self.dropout(x)
-
-        # Perform the original operation with the final DoRA weight
-        output = self.op(
-            x_dropout,
-            final_weight,
-            self.orig_module.bias,  # Use original bias
-            **self.layer_kwargs,
-        )
-
-        del (
-            orig_weight,
-            lora_delta_w,
-            adapted_weight,
-            adapted_weight_f32,
-            norm,
-            final_weight,
-        )  # Memory cleanup
-        return output
+        orig_weight = get_unquantized_weight(self.orig_module, A.dtype, self.train_device)
+        WP = orig_weight + (self.make_weight(A, B) * (self.alpha / self.rank))
+        del orig_weight
+        # A norm should never really end up zero at any point, but epsilon just
+        # to be safe if we underflow or something. Also, as per section 4.3 of
+        # the paper, we treat the norm as a constant for the purposes of
+        # backpropagation in order to save VRAM (to do this, we detach it from
+        # the gradient graph).
+        eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
+        norm = WP.detach() \
+                 .transpose(0, 1) \
+                 .reshape(WP.shape[1], -1) \
+                 .norm(dim=1, keepdim=True) \
+                 .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
+                 .transpose(0, 1) + eps
+        WP = self.dora_scale * (WP / norm)
+        # In the DoRA codebase (and thus the paper results), they perform
+        # dropout on the *input*, rather than between layers, so we duplicate
+        # that here.
+        return self.op(self.dropout(x),
+                       WP,
+                       self.orig_module.bias,
+                       **self.layer_kwargs)
 
 DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()
@@ -855,6 +766,7 @@ class LoRAModuleWrapper:
         # Cria módulos PEFT (agora usará as regras)
         self.lora_modules = self._initialize_peft_modules(orig_module)
         print(f"[LoRA INFO] LoRAModuleWrapper '{self.prefix}' initialized with {len(self.lora_modules)} PEFT modules.")
+        self.generate_keys_by_block_file()
 
     def _should_include_module(self, original_module_name: str, potential_peft_prefix_with_dot: str) -> bool:
         """Checks if a module should be included based on its original name and potential PEFT prefix,
@@ -953,11 +865,9 @@ class LoRAModuleWrapper:
                 try:
                     # Atualiza log para mostrar rank/alpha aplicados e a regra
                     log_msg = (
-                    # INÍCIO ALTERAÇÃO - Log usa nome original e prefixo PEFT corrigido
                     f"[LoRA CREATE] {self.klass.__name__} for: '{original_layer_name}' " # Loga o nome original
                     f"({rule_applied}: Rank={rank_to_use}, Alpha={alpha_to_use}) "
                     f"| PEFT Prefix: {peft_module_prefix_for_constructor}" # Loga o prefixo PEFT final
-                    # FIM ALTERAÇÃO
                 )
                 #print(log_msg)  # Mantém o log para feedback
 
@@ -979,7 +889,6 @@ class LoRAModuleWrapper:
         print(f"  - Created: {modules_created_count} PEFT modules.")
         print(f"  - Skipped (Filter): {modules_skipped_filter} Linear/Conv2d modules.")
         print(f"  - Skipped (Type): {modules_skipped_type} non-Linear/Conv2d modules.")
-        #self.generate_keys_by_block_file()
         return lora_modules
 
     def load_state_dict(self, state_dict: dict[str, Tensor]):
@@ -1273,8 +1182,13 @@ class LoRAModuleWrapper:
                 return KEY_TO_BLOCK_MAPPING[map_prefix]
         return "BASE"
 
-    def generate_keys_by_block_file(self, output_filename="unetKeysByBlock_generated.txt"):
+    def generate_keys_by_block_file(self):
         """Generates a text file with all managed PEFT keys organized by UNet block."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"unetKeysByBlock_{timestamp}.txt"
+        
+        print(f"[LoRA DEBUG] Vai gerar key file com {len(self.lora_modules)} módulos:")
+        
         if not self.lora_modules:
             print("Warning: No LoRA/DoRA/LoHa modules found. Key file not generated.")
             return
@@ -1297,8 +1211,7 @@ class LoRAModuleWrapper:
             except Exception as e:
                 print(f"Error getting state_dict for module with prefix {module_prefix_with_dot}: {e}")
 
-        final_block_ids = set(BLOCKID26) | all_found_block_ids
-        sorted_block_ids = sorted(list(final_block_ids), key=lambda x: ("0" if x == "BASE" else "1") + x)
+        sorted_block_ids = BLOCK_IDS[:]  # respeita exatamente 1 input, 4 down, 1 mid, 4 up, 1 output
 
         output_lines = []
         for block_id in sorted_block_ids:
@@ -1317,6 +1230,8 @@ class LoRAModuleWrapper:
 
             with open(output_filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(output_lines).strip())
-            print(f"Successfully generated key file '{output_filename}'")
+            abs_path = os.path.abspath(output_filename)
+            print(f"Successfully generated key file '{output_filename}' at '{abs_path}'")
         except Exception as e:
             print(f"Error writing key file '{output_filename}': {e}")
+            traceback.print_exc()

@@ -18,7 +18,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter  # Adicionado para type hint
 from modules.util.TrainProgress import TrainProgress  # Adicionado para type hint
 from modules.util.config.TrainConfig import TrainConfig  # Adicionado para type hint
-from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
+from modules.util.loss.DynamicLossStrength import LossTracker, DynamicLossStrength, DeltaPatternRegularizer
 
 from typing import TYPE_CHECKING
 
@@ -338,97 +338,79 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         target: Tensor,
         device: torch.device,
         tensorboard: SummaryWriter,
-        gamma: float,
+        gamma: float,                      # mantém o parâmetro CLI como “piso” do reward
     ):
         """
-        Função Sangoi Loss Weighting com reescalonamento [0,1] -> [gamma, 1].
-        Se combined_weight_raw > 1, fica 1. Se < 0 (em teoria não deveria), fica 0.
-        """
+        Função Sangoi Loss Weighting (versão 2025‑04‑19).
+        • Equilibra dificuldade de acordo com a SNR usando estratégia *Min‑SNR‑γ*.
+        • Aplica currículo linear: γ_start → γ_end ao longo das épocas.
+        • Bonifica boa predição via exp(‑MAPE) independentemente da SNR.
+        • Normaliza reward final para o intervalo [gamma, 1].
 
+        Retorna:
+            Tensor com multiplicadores de loss (shape = batch).
+        """
         self.tensorboard = tensorboard
         progress = self.progress
-        config = self.config
+        config    = self.config
+        eps       = 1e-8
 
-        # 1) Cálculo do snr "padrão"
-        snr = self.__snr(timesteps, device)  # (batch, ...)
-        epsilon = 1e-8
+        # ------------------------------------------------------------------
+        # 1) SNR por timestep (fora do grafo para não vazar gradiente)
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            snr = self.__snr(timesteps, device)          # shape = (batch, …)
+        snr = snr + eps                                  # evita divisão / log 0
 
-        # 2) Cálculo do MAPE (já presente)
-        # 2) Blend MAPE + MSPE (peso 50/50)
-        abs_percent_error = torch.abs((target - predicted) / (target + epsilon)).clamp(min=0, max=1)
-        sq_percent_error = abs_percent_error**2
-        blended_error = 0.5 * abs_percent_error + 0.5 * sq_percent_error
-        mape = blended_error.mean(dim=[1, 2, 3])
+        # ------------------------------------------------------------------
+        # 2) Métrica de qualidade da predição  →  MAPE “blendado”
+        # ------------------------------------------------------------------
+        abs_percent_error = ((target - predicted).abs() / (target.abs() + eps)).clamp_(0, 1)
+        sq_percent_error  = abs_percent_error ** 2
+        blended_error     = 0.5 * abs_percent_error + 0.5 * sq_percent_error
+        mape              = blended_error.mean(dim=[1, 2, 3])          # (batch,)
+        mape_reward       = 1.0 - mape                                 # quanto maior, melhor
 
-        # -----------------------------------------------------------------------
-        # CÁLCULO DO FATOR DE PROGRESSO
-        # -----------------------------------------------------------------------
-        # Se total_epochs = N, progress.epoch vai de 0 até N-1 (ou 1 até N, depende do trainer).
-        # Ajuste conforme o comportamento real do seu `progress.epoch`.
-        total_epochs = config.epochs
-        current_epoch = progress.epoch  # verifique se vai de 0 a N-1 ou 1 a N
-        # Fazemos um clamp para evitar divisões por zero em caso de 1 época só:
-        if total_epochs <= 1:
-            alpha = 1.0
-        else:
-            alpha = current_epoch / float(total_epochs - 1)  # varia de 0 até 1
+        # ------------------------------------------------------------------
+        # 3) Currículo → γ_start (início)  →  γ_end (fim)
+        # ------------------------------------------------------------------
+        total_epochs  = max(config.epochs, 1)
+        alpha         = progress.epoch / float(total_epochs - 1) if total_epochs > 1 else 1.0
+        gamma_start, gamma_end = 2.0, 5.0                              # ajuste livre
+        gamma_curr    = gamma_start + (gamma_end - gamma_start) * alpha
 
-        # -----------------------------------------------------------------------
-        # CRIANDO DOIS "EXTREMOS" DE PESO PARA O SNR
-        # -----------------------------------------------------------------------
-        # A ideia é que no início do treino (alpha ~ 0),
-        # queremos enfatizar cenários de SNR baixo como "mais difíceis".
-        # No fim do treino (alpha ~ 1), enfatizamos cenários de SNR alto como "mais difíceis".
-        #
-        # Aqui vai um exemplo de forma de interpolar:
-        # snr_weight_low_first  => enfatiza SNR BAIXO como "mais difícil"
-        # snr_weight_high_first => enfatiza SNR ALTO  como "mais difícil"
-        #
-        # Você pode escolher a fórmula que fizer mais sentido para o seu caso.
-        #
-        # Exemplo de uma forma simples:
-        #  - Se snr estiver alto, snr_weight_low_first deve ser PEQUENO.
-        #  - Se snr estiver baixo, snr_weight_low_first deve ser MAIOR.
-        #
-        # Uma abordagem é usar: snr_weight_low_first = log(1 + 1/(snr+eps)),
-        # pois, para snr grande, 1/(snr+eps) ≈ 0, resultando em log(1)≈0 (cenário "fácil").
-        # E para snr pequeno, 1/(snr+eps) é grande, resultando em log(...) maior (cenário "difícil").
-        #
-        # Por outro lado, snr_weight_high_first = log(1 + snr)
-        # faz o contrário: para snr grande, o log é grande; para snr pequeno, o log é pequeno.
-        #
-        # Depois, interpolamos linearmente entre esses dois extremos pelo fator alpha.
+        # ------------------------------------------------------------------
+        # 4) Peso de dificuldade  →  Min‑SNR‑γ
+        #     w(t) = min(SNR, γ) / SNR      (≈1 nos passos difíceis, <1 nos fáceis)
+        # ------------------------------------------------------------------
+        scenario_snr_weight = torch.minimum(snr, snr.new_full((), gamma_curr)) / snr  # (batch,)
 
-        snr_weight_low_first = torch.log(1.0 + 1.0 / (snr + epsilon))  # enfatiza SNR baixo
-        snr_weight_high_first = torch.log(snr + 1.0)  # enfatiza SNR alto
+        # ------------------------------------------------------------------
+        # 5) Reward bruto = qualidade × dificuldade
+        # ------------------------------------------------------------------
+        raw_reward = torch.exp(-mape_reward) * scenario_snr_weight      # (batch,)
 
-        # Interpolação linear:
-        # alpha=0 => weight = snr_weight_low_first
-        # alpha=1 => weight = snr_weight_high_first
-        scenario_snr_weight = (1.0 - alpha) * snr_weight_low_first + alpha * snr_weight_high_first
-        mape_reward = 1 - mape
-        raw_reward = torch.exp(-mape_reward * scenario_snr_weight)
-        # Ex: pode dar valores na casa de 0.08, 0.2, 1.1, etc.
+        # ------------------------------------------------------------------
+        # 6) Normalização final  →  [gamma, 1]
+        # ------------------------------------------------------------------
+        reward_floor     = gamma                                        # CLI --loss_weight_strength
+        clamped_reward   = raw_reward.clamp_(0.0, 1.0)
+        reward           = reward_floor + (1.0 - reward_floor) * clamped_reward
 
-        # 2) Clampar para [0, 1]
-        clamped_reward = torch.clamp(raw_reward, min=0.0, max=1.0)
-
-        # 3) Reescalar [0,1] para [gamma,1]
-        reward = gamma + (1.0 - gamma) * clamped_reward
-
-        # Logging no TensorBoard
-        tensorboard.add_scalar("sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/4reward", reward.mean().item(), progress.global_step)
-        tensorboard.add_scalar("sangoi/alpha", alpha, progress.global_step)
-        tensorboard.add_scalar(
-            "sangoi/scenario_snr_weight_mean",
-            scenario_snr_weight.mean().item(),
-            progress.global_step,
-        )
-
+        # ------------------------------------------------------------------
+        # 7) TensorBoard (opcional)
+        # ------------------------------------------------------------------
+        if tensorboard is not None:
+            step = progress.global_step
+            tensorboard.add_scalar("sangoi/alpha",                float(alpha),                   step)
+            tensorboard.add_scalar("sangoi/gamma_curr",           float(gamma_curr),              step)
+            tensorboard.add_scalar("sangoi/mape_reward_mean",     float(mape_reward.mean()),      step)
+            tensorboard.add_scalar("sangoi/scenario_snr_weight",  float(scenario_snr_weight.mean()), step)
+            tensorboard.add_scalar("sangoi/reward_mean",          float(reward.mean()),           step)
+        
+        # multiplicador aplicado à loss (shape = batch)
         return reward
+
 
     def _diffusion_losses(
         self,
@@ -446,6 +428,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.config = config
         self.progress = progress
         self.tensorboard = tensorboard
+        
         delta_instance: DeltaPatternRegularizer | None = getattr(model, 'deltas', None)
 
         loss_weight = batch["loss_weight"]
@@ -520,7 +503,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         self.progress.global_step,
                     )
 
-            # INÍCIO ALTERAÇÃO: Aplicação da penalidade Delta Pattern (Movido para depois dos outros weights)
             if config.delta_pattern_use_it and delta_instance is not None and delta_instance.reference_deltas:
               try:
                 # Calcula a penalidade usando os pesos *atuais* do modelo
@@ -529,10 +511,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
                 # Adiciona a penalidade à loss média do batch
                 # 'losses' tem shape (batch_size), 'penalty' é um escalar no device correto
+                self.tensorboard.add_scalar("delta/loss_b4_delta", losses.mean().item(), self.progress.global_step)
                 losses += penalty  # Adiciona o escalar à loss de cada item do batch
+                self.tensorboard.add_scalar("delta/loss_after_delta", losses.mean().item(), self.progress.global_step)
+                self.tensorboard.add_scalar("delta/penalty", penalty.item(), self.progress.global_step)
 
-                if self.tensorboard:
-                    self.tensorboard.add_scalar("delta_pattern/penalty", penalty.item(), self.progress.global_step)
               except Exception as e:
                     print(f"[DeltaPattern] Erro ao calcular/aplicar penalidade: {e}")
                     traceback.print_exc() # Loga o traceback para depuração

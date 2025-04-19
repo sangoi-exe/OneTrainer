@@ -17,7 +17,7 @@ from torch import Tensor
 from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionXLPipeline, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from modules.util.loss.dynamic_loss_strength import DeltaPatternRegularizer
+from modules.util.loss.DynamicLossStrength import DeltaPatternRegularizer
 
 
 class StableDiffusionXLModelEmbedding:
